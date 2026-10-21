@@ -175,7 +175,7 @@
   <div class="note good">
     <b>全专家上卡是可能的。</b> GPU1 已经全驻留；GPU0 只差 865 个冷专家（1.58 GiB）。
     把 32K KV 放 host 省 0.43 GiB，再把预留/边距收紧约 1.2 GiB，或把一部分热 Q4 降为 Q3，
-    GPU0 也能全驻留。旧 autotune 按 Q4 blob 估算所有槽，少算了约 2,300–2,500 槽/卡；
+    GPU0 也能全驻留。旧 autotune 按 Q4 blob 估算所有槽，少算了约 2,000–2,500 槽/卡；
     现在按每个 blob 的真实 Q4/Q3 格式算。
   </div>
 </section>

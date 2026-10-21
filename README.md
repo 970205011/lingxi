@@ -107,7 +107,7 @@ V100 的发射能力给出 320~505 GB/s 的现实区间。再往上只有两条�
 这张表由新增的 `lingxi-bench vram-budget <artifact> <arena> 24 32768` 逐项打印：
 权重来自 catalog 逐张量、专家槽来自 arena **逐个 blob 的 Q4/Q3 格式**、KV/GDN/预留/边距
 按代码常量，不加载权重、不分配显存。混档槽数也在这里修正了：旧 autotune 用缺省 Q4
-blob（2.49 MB）估算所有槽，会把 Q3 槽算大，**每卡少算约 2,300~2,500 个槽**。
+blob（2.49 MB）估算所有槽，会把 Q3 槽算大，**每卡少算约 2,000~2,500 个槽**。
 
 **全专家驻留的边界**：
 
@@ -415,6 +415,7 @@ unsafe 只允许出现在 lingxi-kernels。设计与调试纪律见 ARCHITECTURE
 | 文档 | 内容 |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 架构硬约束、模块边界、验证分级 |
+| [docs/intro.html](docs/intro.html) | 一页简介（V100 视角、显存账、与 strata 对照） |
 | [docs/FORMAT.md](docs/FORMAT.md) | `.lingxi` / `.ninfer` 容器与数值格式手册（模型转换必读） |
 | [docs/decode-speed-profile.md](docs/decode-speed-profile.md) | decode 逐项性能剖面与 A/B 记录 |
 | [docs/speedup-audit.md](docs/speedup-audit.md) | 优化项逐条审计（含被证伪项） |

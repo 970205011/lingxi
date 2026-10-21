@@ -97,20 +97,42 @@ smaller model. The ledger for both paths is written down in the docs; no optimis
 4.6 GB ÷ 900 GB/s = 5.1 ms/token = **196 tok/s**, the physical floor on V100 (at 100% bandwidth
 efficiency); the measured 26.7 ms corresponds to **172 GB/s effective bandwidth (19%)**.
 
-**Capacity ledger** (artifact headers + measurements):
+**Capacity ledger** (artifact headers + per-item `vram-budget`; not a total-minus-arena subtraction):
 
 | Item | Value |
 |---|---|
 | Total experts | 24,576 (48 layers × 512) |
-| One Q4G64 expert blob | 2,611,200 B (2.49 MiB) |
+| One Q4G64 blob | 2,611,200 B (2.49 MiB) |
+| One Q3G128 blob (mix64 cold experts) | 1,920,000 B (1.83 MiB) |
 | All experts in Q4G64 | 59.8 GiB (arena file 60.25 GiB) |
 | Mixed-precision arena (hot Q4 + cold Q3) | 46.39 GiB (−23%) |
-| Device slots | 7000 slots = 17.0 GiB; 9000 slots = 21.9 GiB |
-| Non-arena footprint | ≈9.4 GiB (all dense + KV/state + MTP 1.3 GiB + workspace, measured by subtraction) |
-| KV | 24 KB/token: 32K ≈ 786 MB, 256K ≈ 6.3 GB (split evenly across two GPUs) |
+| Q4-only device slots | 7000 slots = 17.0 GiB; 9000 slots = 21.9 GiB |
+| Non-expert fixed footprint (32K, autotune ledger) | GPU0 **10.3 GiB** = weights 5.8 + KV 0.43 + GDN 0.05 + reserve 3.0 + margin 1.0; GPU1 **7.3 GiB** = 3.4 + 0.43 + 0.05 + 2.4 + 1.0 |
+| Device expert slots (mix64, 32K) | GPU0 **11,423** (Q4 1536 + Q3 9,887/10,752); GPU1 **12,288** (all resident) |
+| KV (logical / device window) | logical 24 KB/token: 32K ≈ 786 MB, 256K ≈ 6.3 GB; with `LINGXI_QSA_PAGED=1` the device keeps only a 32K window (0.43 GiB/card in the autotune ledger), the rest lives in the host pinned block pool |
 | Indexer | 3 KB/token: 256K ≈ 786 MB, plus 1/4 for pooled |
 | GDN/PLE session state | ≈113 MB per session, independent of context length |
 | PLE table | bf16 95.4 GiB (host) / FP8 51.2 GB (/dev/shm) |
+
+The table is printed by the new `lingxi-bench vram-budget <artifact> <arena> 24 32768`:
+weights come from the catalog tensor by tensor, expert slots from each arena blob's actual
+Q4/Q3 format, and KV/GDN/reserve/margin from code constants — no weights are loaded and no
+VRAM is allocated. This also fixes the mixed-arena slot estimate: the old autotune used the
+default Q4 blob (2.49 MB) for every slot, over-sizing Q3 slots and **undercounting by about
+2,000–2,500 slots per card**.
+
+**The boundary for full expert residency**:
+
+- GPU1 already holds all of its 12,288 experts (23.0 GiB, fully resident).
+- GPU0 is short by **865 cold experts (1.58 GiB)**. Moving the 32K KV to host saves 0.43 GiB;
+  tightening reserve/margin by about 1.2 GiB, or demoting some hot Q4 experts to Q3, lets GPU0
+  hold everything too.
+- At 256K the logical KV is **3.5 GiB per card**; `LINGXI_QSA_PAGED=1` must keep only a 32K
+  resident window, otherwise KV crowds out expert slots. Paging is already implemented as a
+  block table + host pinned block pool + LRU sink/prefetch; not all KV has to live in VRAM.
+- To be honest: short-prompt hit rate is already **100%**; full residency mainly helps long-tail
+  and diverse traffic. It will not turn 33 ms/token into 10 ms. The real speed gap is prefill
+  tensor cores and host scheduling, discussed below.
 
 **Measured VRAM peaks** (nvidia-smi / startup banners):
 
