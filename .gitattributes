@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+*.rs text
+*.cu text
+*.cuh text
+*.py text
+*.sh text
+*.toml text
+*.md text
+*.yml text
+*.yaml text
+
+dist/lingxi-bench-* binary
+*.cubin binary
+*.gz binary
+*.npz binary
+*.ninfer binary
+*.lingxi binary

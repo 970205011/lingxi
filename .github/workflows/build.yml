@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential git python3
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (release, sm_70 cubins)
+        env:
+          QE_NVCC: /usr/local/cuda/bin/nvcc
+          QE_CUDA_ARCH: sm_70
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
+
+      - name: Check docs links
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          def clean(text):
+              text = re.sub(r'```.*?```', '', text, flags=re.S)
+              text = re.sub(r'`[^`]*`', '', text)
+              return text
+          bad = []
+          for p in ['README.md', 'README.en.md'] + glob.glob('docs/*.md'):
+              base = os.path.dirname(p)
+              text = clean(open(p, encoding='utf-8').read())
+              for m in re.finditer(r'\[[^\]]*\]\(([^)#]+)(?:#[^)]*)?\)', text):
+                  t = m.group(1).strip()
+                  if t.startswith(('http://', 'https://', 'mailto:', 'file:')) or not t:
+                      continue
+                  if ' ' in t or '\t' in t:
+                      continue
+                  if not os.path.exists(os.path.normpath(os.path.join(base, t))):
+                      bad.append((p, t))
+          for p, t in bad:
+              print(f'broken link: {p} -> {t}')
+          sys.exit(1 if bad else 0)
+          PY
