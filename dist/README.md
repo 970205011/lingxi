@@ -6,12 +6,16 @@ Prefer those over the binary committed here; the committed one was built on glib
 | Item | Value |
 |---|---|
 | File | `lingxi-bench-v0.1.0-linux-x86_64-sm70` |
-| Source commit | `6c4caf3` (public `open-source` branch) |
-| Built | 2026-10-21 |
+| Source commit | `c923563` (public `open-source` branch) |
+| Built | 2026-10-22 |
 | Rust | 1.99.1 |
 | nvcc | CUDA 12.9 compiler, kernels target `sm_70` |
 | glibc | built on glibc 2.41; requires **glibc >= 2.39** |
 | SHA256 | see `SHA256SUMS` |
+
+This build includes the mix-aware `vram-autotune` (Q4/Q3 slots counted separately) and the
+`vram-budget` subcommand. On the 2×V100 production box it allocates 11,423 slots on GPU0 and
+all 12,288 on GPU1 at 32K context.
 
 All CUDA kernels are embedded into the binary as `sm_70` cubins; no separate `.cubin`
 files are needed. The binary links `libc` / `libm` / `libgcc_s` dynamically and loads
