@@ -116,6 +116,7 @@ unsafe is allowed only in `lingxi-kernels`.
 - [docs/speedup-audit.md](docs/speedup-audit.md) — optimization audit (including falsified ideas)
 - [docs/PLAN.md](docs/PLAN.md) / [docs/PLAN_NEXT.md](docs/PLAN_NEXT.md) — engineering decision record
 - [docs/strata-0.2.2-v100.md](docs/strata-0.2.2-v100.md) — same-machine Strata 0.2.2 comparison
+- [docs/CODE_MAP.md](docs/CODE_MAP.md) — module map and phased refactor plan
 - [docs/BACKLOG.md](docs/BACKLOG.md) — backlog and known issues
 - [docs/HANDOVER.md](docs/HANDOVER.md) — operations and troubleshooting
 - [docs/ASSETS.md](docs/ASSETS.md) — asset inventory and regeneration commands

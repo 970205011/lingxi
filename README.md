@@ -106,6 +106,7 @@ crates/
 - [docs/speedup-audit.md](docs/speedup-audit.md) — 优化项审计（含被证伪项）
 - [docs/PLAN.md](docs/PLAN.md) / [docs/PLAN_NEXT.md](docs/PLAN_NEXT.md) — 工程决策记录
 - [docs/strata-0.2.2-v100.md](docs/strata-0.2.2-v100.md) — 同机 Strata 0.2.2 对比实测
+- [docs/CODE_MAP.md](docs/CODE_MAP.md) — 模块地图与分阶段重构计划
 - [docs/BACKLOG.md](docs/BACKLOG.md) — 待办与已知问题
 - [docs/HANDOVER.md](docs/HANDOVER.md) — 运维与排障
 - [docs/ASSETS.md](docs/ASSETS.md) — 资产清单与再生命令
