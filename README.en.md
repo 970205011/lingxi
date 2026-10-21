@@ -345,9 +345,22 @@ benchmark median is **104.5** and the real agent-task median is **159.2**. It ru
 production configuration is **3.3 GB/token** by the same accounting, with a real-corpus dual-GPU
 steady state of **54.1 tok/s**. Comparing 200.8 peak with 54.1 steady overstates the gap; on
 medians it is 104.5 vs 54.1 ≈ **1.9×**, of which about **1.3×** comes from more aggressive
-quantization (fewer bytes) and the remaining **1.5×** mainly from the speculative chain: strata
-runs an 8-deep chain at 93–99% runtime acceptance, while our MTP head collapses to 0.57 at
-position 1 and accepts only about 3.1 tokens per round.
+quantization (fewer bytes) and the remaining **1.5×** from speculative-chain depth, host
+scheduling, and kernel efficiency: strata runs an 8-deep chain at 63–78% acceptance on real text
+(93–99% on repetitive output), while our MTP head collapses to 0.57 at position 1 and accepts only
+about 3.1 tokens per round.
+
+Current upstream V100 community runs put the peak in context: one card with IQ3_XXS decodes at
+**54–72 tok/s**, Q2_0 at **76.4**, IQ2_XS at **71.2**, UD-IQ4_XS at **26.3**; a V100 + RTX 4070
+layer split reaches **75–85**. Our dual-V100 Q4 result of 54.1 is therefore in the same class as
+strata's single-V100 IQ3_XXS, and 200.8 is a tuned peak, not a typical V100 number.
+
+The real gap is **prefill**: strata reads a 32K prompt at about **1,200–1,600 tok/s** on a V100,
+while our 33K cold prefill takes 278.7 s ≈ **118 tok/s**, roughly 10× slower. The main reasons are
+its FP16 tensor-core prompt attention (+15–18%) and grouped expert GEMM (+10%), whereas our prefill
+is still FP32 SIMT compute-bound. The other structural difference is quantization: a 2-bit file
+leaves almost all experts resident, with only about 0.7 experts per layer coming from CPU/PCIe;
+our Q4 mixed arena still moves about 20% of the experts.
 
 The 26.8 ms per token also decomposes: expert H2D **7.0 ms (26%)** (routing-timing-bound; can
 only be overlapped, not removed), real kernels **11.6 ms (43%)**, host **3.4 ms (13%)**,
