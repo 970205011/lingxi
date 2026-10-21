@@ -37,6 +37,36 @@ TTFT is the first content/reasoning delta; steady rate is completion tokens divi
 
 Approximate prompt reading from the two cold runs: **~690 tok/s at 4K**, **~1,080 tok/s at 14K**.
 
+## Second run with the v2 production flags
+
+The repository's `# 双 V100 跑 176B MoE` deployment notes list the V100-specific switches that
+were missing from the first run. We rebuilt/restarted with:
+
+`STRATA_SM70_TABLE=1`, `STRATA_SELECT_SIMT=1`, `--layer-split 24`, `--trim-stage-weights`,
+`--pipeline-windows 2`, `--lookup-chain 4`, `--prefill auto`, `--short-read 32`, `--spec 4`,
+`--spec-min-p 0.80`, `--mtp-hnorm stream`, `--host-core last`, `--kv k8v4`,
+`--kv-resident 32768`, `--max-context 32768`, `--ple-io ram`, `--mmap-experts`.
+
+| Prompt | TTFT | Total | Output | Steady |
+|---|---:|---:|---:|---:|
+| Short, run 1 | 0.122 s | 0.975 s | 62 | 72.8 tok/s |
+| Short, run 2 | 0.120 s | 0.972 s | 62 | 72.8 tok/s |
+| 4K cold | 3.613 s | 5.607 s | 128 | 64.2 tok/s |
+| Same 4K, cache hit | 0.124 s | 2.118 s | 128 | 64.2 tok/s |
+| 14K cold | 8.346 s | 9.731 s | 128 | 92.4 tok/s |
+
+The v2 flags cut cold-prefill TTFT by about **40%** (4K 6.0 → 3.6 s, 14K 13.5 → 8.3 s) and improve
+total wall time on long prompts. Decode in this run was lower (64–92) than the first run
+(85–110), most likely because `--spec-min-p 0.80` rejects more drafts and the short prompt
+generated a different reasoning length. The two runs are not directly comparable per-token; the
+useful result is the prefill bandwidth, which is reproducible.
+
+**The 200.8 tok/s peak from the deployment notes was not reproduced on this box.** The best local
+decode observed was 92–110 tok/s (IQ3_XXS, 2×V100); the notes' 200 is a peak sample with a
+different quantization (IQ3_S) and a different host. What is reproducible and large is the
+prefill gap: Strata reads 4K/14K prompts in 3.6–8.3 s, while lingxi takes 28.7 s for 4.2K and
+278.7 s for 33K.
+
 ## Lingxi reference (same box)
 
 | Metric | lingxi (Q4/Q3 mix) | Strata 0.2.2 (IQ3_XXS) |

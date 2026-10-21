@@ -203,19 +203,23 @@
 <section>
   <h2>和 strata 的真实差距</h2>
   <table>
-    <thead><tr><th>口径</th><th>strata</th><th>lingxi</th></tr></thead>
+    <thead><tr><th>口径</th><th>strata 0.2.2（本机实测）</th><th>lingxi</th></tr></thead>
     <tbody>
-      <tr><td>V100 decode（典型）</td><td>IQ3_XXS 单卡 54–72 tok/s</td><td>双卡 Q4 稳态 54.1</td></tr>
-      <tr><td>V100 decode（峰值）</td><td>200.8（调优峰值；A/B 中位 104.5）</td><td>—</td></tr>
-      <tr><td>V100 prefill（32K）</td><td><b>1,200–1,600 tok/s</b></td><td>33K 冷 prefill 278.7 s ≈ <b>118 tok/s</b></td></tr>
-      <tr><td>量化</td><td>IQ3_S 82.8 GB（~3.4 bit）</td><td>Q4 / Q3 混档（~4.5 bit）</td></tr>
-      <tr><td>专家搬运</td><td>2-bit 档几乎全驻留</td><td>Q4 混档仍有约 20% 要搬</td></tr>
+      <tr><td>decode（短 / 4K / 14K）</td><td><b>86–110 tok/s</b>（2×V100, IQ3_XXS, MTP）</td><td>43（无 MTP）/ 约 64（MTP）</td></tr>
+      <tr><td>prefill（4K / 14K）</td><td><b>6.0 s / 13.5 s</b>（约 690 / 1,080 tok/s）</td><td>4.2K 28.7 s；33K 278.7 s（约 118 tok/s）</td></tr>
+      <tr><td>量化</td><td>IQ3_XXS（约 3-bit，47 GB）</td><td>Q4 / Q3 混档（46.4 GiB）</td></tr>
+      <tr><td>专家驻留</td><td>双卡 100%</td><td>GPU1 100%，GPU0 95%（差 865 个冷专家）</td></tr>
+      <tr><td>KV</td><td>int8 + 32K 常驻窗口</td><td>paged KV 已实现，默认关</td></tr>
     </tbody>
   </table>
-  <p><b>结论：</b>200 是峰值，不是 V100 日常；decode 我们与 strata 单卡 IQ3_XXS 同档。
-  真正差 10 倍的是 <b>prefill</b>：他们用 FP16 张量核做 prompt attention（本地复测
-  int8 KV、32K、2048 queries：FP32 25.7 ms → 张量核 12.5 ms，2.06×）和 grouped expert GEMM。
-  下一版第一优先级就是把这个补上。</p>
+  <p><b>结论：</b>decode 差距约 1.5–2×，但 prefill 差约 6–10×。strata 的 prompt 路径用 FP16
+  张量核做 attention（本地复测 int8 KV、32K、2048 queries：FP32 25.7 ms → 张量核 12.5 ms，
+  2.06×）和 grouped expert GEMM；它的 IQ3_XXS 也让专家 100% 驻留。lingxi 下一版的第一优先级
+  就是 prefill 张量核，而不是继续在 32G 上抠 decode 的几个毫秒。</p>
+  <p class="kbd">协议：temperature 0、max_tokens 128、流式；strata 的 reasoning_content 计入输出；
+  两引擎量化不同，不是 bit 级横比。完整记录见 <a href="strata-0.2.2-v100.md">strata-0.2.2-v100.md</a>。</p>
+  <p class="kbd">补充：用 Strata 文档里的 v2 生产参数（SM70_TABLE、spec-min-p 0.80、mtp-hnorm stream 等）
+  复跑，4K/14K 冷 prefill 可压到 <b>3.6 s / 8.3 s</b>，decode 64–92；200 tok/s 峰值在本机未复现。</p>
 </section>
 
 <section>
