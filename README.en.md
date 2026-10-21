@@ -358,9 +358,11 @@ strata's single-V100 IQ3_XXS, and 200.8 is a tuned peak, not a typical V100 numb
 The real gap is **prefill**: strata reads a 32K prompt at about **1,200–1,600 tok/s** on a V100,
 while our 33K cold prefill takes 278.7 s ≈ **118 tok/s**, roughly 10× slower. The main reasons are
 its FP16 tensor-core prompt attention (+15–18%) and grouped expert GEMM (+10%), whereas our prefill
-is still FP32 SIMT compute-bound. The other structural difference is quantization: a 2-bit file
-leaves almost all experts resident, with only about 0.7 experts per layer coming from CPU/PCIe;
-our Q4 mixed arena still moves about 20% of the experts.
+is still FP32 SIMT compute-bound. We rebuilt strata 0.2.2 locally and ran its
+`qsa_prompt_attn_parity` on a V100 (int8 KV, 32K context, 2048 queries): **FP32 25.7 ms/chunk →
+tensor cores 12.5 ms (2.06×)**, with a 2.3e-6 error against FP64. The other structural difference
+is quantization: a 2-bit file leaves almost all experts resident, with only about 0.7 experts per
+layer coming from CPU/PCIe; our Q4 mixed arena still moves about 20% of the experts.
 
 The 26.8 ms per token also decomposes: expert H2D **7.0 ms (26%)** (routing-timing-bound; can
 only be overlapped, not removed), real kernels **11.6 ms (43%)**, host **3.4 ms (13%)**,

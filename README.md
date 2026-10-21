@@ -320,7 +320,9 @@ V100 的日常水平。
 真正拉开差距的是 **prefill**：strata 在 V100 上 32K prompt 约 **1,200~1,600 tok/s**，
 我们 33K 冷 prefill 278.7 s ≈ **118 tok/s**，差约 10 倍。主因是他们用 FP16 张量核做
 prompt attention（+15~18%）和 grouped expert GEMM（+10%），而我们的 prefill 仍是
-FP32 SIMT 算力受限。另一个结构性差异是量化：2-bit 档让专家几乎全驻留，CPU/PCIe
+FP32 SIMT 算力受限。本地用 strata 0.2.2 的 `qsa_prompt_attn_parity` 在 V100 上复测
+（int8 KV、32K、2048 queries）：**FP32 25.7 ms/chunk → 张量核 12.5 ms（2.06×）**，
+与 FP64 误差 2.3e-6。另一个结构性差异是量化：2-bit 档让专家几乎全驻留，CPU/PCIe
 每层只剩约 0.7 个专家要搬；我们 Q4 混档仍有约 20% 的专家要搬。
 
 单 token 的 26.8 ms 也能拆开：专家 H2D **7.0 ms（26%）**（路由时序决定，只能重叠
