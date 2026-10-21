@@ -1,0 +1,570 @@
+# lingxi 推理框架总体设计——strata × ninfer 优势综合方案
+
+> 事实源：
+> - strata 源码（已读透，详见 [strata-mtp-expert-cache-plan.md](docs/strata-mtp-expert-cache-plan.md)）；
+> - ninfer C++ fork 源码（`$DATA/ninfer-dev`，已拉出 892 个源码文件对照阅读，
+>   含其自己的 STRATA_RESEARCH.md，
+>   属互相参考关系，fork 已转录过 strata 的槽位/profile 思想并按 V100 现实做了关键修正）；
+> - lingxi 现有架构约束 [ARCHITECTURE.md](ARCHITECTURE.md)（硬约束，本文不违反）。
+>
+> 一句话：**ninfer 给「能不能跑起来」的工程骨架（产物、专家 arena、分页 KV、调度、HTTP），
+> strata 给「能不能跑快」的算法部件（profile 热度、lookahead、suffix/MTP Controller），
+> lingxi 保持自己的灵魂——ids 解耦、离线零转换、bit 级确定性和 Rust 的模块纪律。**
+
+# 1. 三引擎事实卡
+
+| 维度 | strata | ninfer（灵犀 C++ fork） | lingxi（本项目，目标框架） |
+|---|---|---|---|
+| 语言 | C++/CUDA + Python server | C++/CUDA + 内嵌 HTTP | **Rust/cudarc**，unsafe 只在 kernels crate |
+| 主模型 | 另厂 MoE | Qwen3.8-27B dense + qwen4_exp MoE（端口进行中） | qwen4_exp：48 层混合（12 QSA / 36 GDN），512 选 10 MoE，hc=4，PLE |
+| 专家精度 | Q8_0（draft Q8_0，主模型 gguf 全档量化 MMQ） | BF16 原样镜像为主，备 W4/W5/W6/W8（Q4G64…）混档 | 同 ninfer 注册表，**离线产出 kernel 直接消费的镜像**（铁律 0.6） |
+| 专家 miss 怎么算 | **CPU 池 AVX512 + GPU 双路径**，舍入不同，temp=0 也会漂移（issue #152）；byte-identical 需一串开关 | **只搬字节、永远 GPU 同一套核算**（moe_expert_cache.cuh L8-18），命中与否逐位一致 | **继承 ninfer 这条**：不做 CPU 专家池；缓存只解决「字节在哪」，不引入第二条舍入路径 |
+| 调度并发 | 单/少请求，验证窗内 T 列并行 | **连续批处理**：decode 合批（权重每轮只读一次）、单 prefill lane、FIFO 队首保护 + persistent backfill 准入、KV 预算准入 | 先单流贪心跑对，再按 ninfer 同款模型实现合批；**不提前抽象**（单流都没对先不写调度框架） |
+| KV | 分页 + FP16/Q8/Q4 + >64K 降 RAM | paged KV + **host KV arena 降级/恢复** + TBQ4（262K 实测可用）+ StateImage 前缀快照 | QSA 仅 12 层需要 KV（占比小）；GDN 36 层持递归 state；先 bf16，后续可借 TBQ4 |
+| 投机 | MTP + suffix trigram + Controller E[提交]/ms + 在线 EMA | MTP + DFlash2（27B 模型实测 57~59 t/s，接受率 0.52） | 按 strata 方案先 M0→M3（见专家方案文档 §3.1）；DFlash2 不做（需要训练管线） |
+| 长上下文 | 一般 | YaRN + MRoPE 像素轴保护，全路径无降级 | 本模型纯文本、max_pos 262144，RoPE 表已生成；YaRN/MRoPE 先不做（需要时从 ninfer 转录） |
+| 服务 | Python OpenAI/Anthropic | **C++ 内嵌三套协议**：OpenAI Chat + Responses API + Anthropic Messages，SSE | axum 只做 OpenAI Chat Completions + SSE（YAGNI），Responses/Anthropic 排后 |
+| sm 目标 | sm_75 起，sm_70 实验性 | **sm_70 V100 一等公民**（本家和我们同硬件） | sm_70，cuBLAS bf16 tensor core + 自研小核；无 fp4 指令 |
+| 存储假设 | SSD、大内存 | SSD；qwen4 专家 arena 60GiB mmap | **机械盘**、79GB RAM、PCIe x8——三层存储更依赖离线镜像与预取设计 |
+| 验证文化 | scalar 参考+pinned llama.cpp oracle+负对照，env 门控手术 | bit 级对拍文化（C 系列每条独立验证）；故障静默回退教训深（C8） | T0–T3 分级（[ARCHITECTURE.md](ARCHITECTURE.md) §6）+ env 门控 + 每个新核配 golden |
+
+# 2. 各自真正的强项（剔除表象后的清单）
+
+## 2.1 ninfer 强在「工程骨架已经在同硬件上被生产验证过」
+
+1. **专家 arena 镜像格式 Q4EARN1**（moe_expert_arena.h）：
+   72B 头 + routed/shared 两张 16B 索引 + slot 对齐 blob 区；**每个 blob 自带字节数与格式字**，
+   读侧强制校验「tag 与字节数一致」（挡「Q4 的标签、BF16 的长度」这类貌似合理的垃圾）；
+   缺席条目 -1 支持稀疏 arena。转换期一次落盘、启动直接 mmap，**运行时零反量化**——与我们铁律 0.6 同构。
+2. **mmap + `cudaHostRegisterReadOnly` 零拷贝直读**（C8 修复，8→21~26 tok/s）：
+   只读 mmap 必须用 ReadOnly 注册；失败静默回退 gather 路径并打日志。
+   启动用 `fadvise` 按 GB 预热页缓存（机械盘冷启动 5 分钟 fault-in 的教训）。
+3. **ExpertSlotCache 的工程细节**（同文件）：pinned staging 环把 pageable 1.5ms 小拷贝降到 0.35ms；
+   聚合 gather（32 个 miss blob 拼成两发 H2D + 一个设备侧 scatter 核）；
+   per-call scratch 与 persistent LRU 双模式；**call_pin 保证本 call 在用的槽不被自己驱逐**；
+   fill 后 verify_slot 字节读回是上线唯一凭据。
+4. **三层 KV 体系**：device paged pool（paged_kv_cache.cpp）
+   → host pinned KV arena，device→host demote / host→device 逐页恢复完整实现；
+   StateImage 前缀快照（shared 前缀/多轮命中）；TBQ4（WHT-d256 + Lloyd-Max 4bit）质量 A/B 过。
+5. **连续批处理调度**（scheduler.h）：
+   FIFO 队首保护 + epoch/protection 机制，队首被资源阻塞时才借让出资源给 persistent backfill；
+   prefill 单 lane、decode 多 lane 合批（`ordinary_decode_batch`，权重每轮只读一次，4 路近线性 3.5×）；
+   KV 容量准入（kv_capacity.cpp）与
+   materialization planner。
+6. **完整服务层**：OpenAI Chat / Responses API / Anthropic Messages 三套请求-状态机 + SSE +
+   请求校验/操作日志（`src/serve/`），可直接照抄协议语义（不是代码）。
+7. **env 门控手术纪律**：所有高风险机制（resident/pin/route dump/量化档）默认关、env 开，
+   默认路径行为字节不变，出问题可逐开关回退——与我们的确定性改造打法完全一致。
+
+## 2.2 strata 强在「算法部件：让缓存和投机真的有命中率/接受率」
+
+1. **STRP profile 与十折留一测量**：出厂先验（24576 对全排名）；
+   实测「按专家热度 0.6447 vs 按层整组 0.0456」决定了必须行级 hit/miss 拆分；
+   全局到达顺序计数器 2.97% 命中率的失败教训 → per-layer admission。
+2. **自适应换入换出**：usage 衰减计数、候选/受害者迟滞门限、独立 adapt stream 窗口间换入、
+   event 落地+校验后才翻 residency 表、换出先回 host 镜像。
+3. **RouterLookahead**：host bf16 router 提前一层预测路由预热页面。
+4. **MTP 验证窗 + 接受循环**：窗口 T=k+1 主模型一次过、最长前缀接受、输出永远由验证决定；
+   MTP 层独立 K/V、<2051 cell dense 注意力；接受率 0.89/0.86/0.85 有实测。
+5. **SuffixDrafter**：零权重 trigram（~20B/token），重复语料极便宜。
+6. **Controller**：none/suffix/MTP 按 E[提交 token]/耗时 选路，5% 迟滞，EMA 在线学接受率，
+   参数先验/cost 全部实测标定。
+7. **确定性自觉**：split reduction 固定树、multi_exact（T 列 == T 次单列 bit 级）、
+   STATE_HASH 跨请求状态哈希校验、byte-identical 开关组合。
+
+## 2.3 lingxi 自己必须保的灵魂（两套 C++ 都没有的东西）
+
+1. **lingxi-ids 唯一契约**：跨模块只传 id，换模型/换 kernel 只改注册表（铁律 1）。
+2. **单向依赖 + 一个模块一件事**（铁律 2/4）：ninfer 的 qwen4 launcher 单文件 857 行、
+   缓存/路由/量化/探针全混在一起——我们把它拆成 ids/plan/kernels/model/driver/server 横向层。
+3. **离线零转换**（铁律 0.6）：Q4EARN1 风格镜像 + 按 kernel 访问模式预排布，运行时只读只算。
+4. **T0–T3 结构验证**：ninfer/strata 的 bit 纪律靠人盯注释；我们把它固化成 bench 子命令与分级门禁。
+5. **Rust 安全边界**：unsafe 集中 kernels；状态所有权让「call_pin 式生命周期保护」
+   大概率能由借用检查在编译期承担一部分，而不是运行时向量+注释。
+
+# 3. 目标架构：部件从哪来、长在哪个 crate
+
+严格落在 [ARCHITECTURE.md](ARCHITECTURE.md) §1 的依赖方向上；
+新增职责**优先新增模块**，不膨胀现有模块。
+
+```
+lingxi-ids       （契约：补 ExpertId/ProfileId/DraftKind/SessionId 等身份，零算法）
+lingxi-artifact  （ninfer v2 容器读取器，已有；增加专家 arena 镜像 Q4EARN1 读取能力
+                  或新 lingxi-expert-arena crate——见 §3.4）
+lingxi-plan      （把 profile/arena/槽位摊成 Span）
+lingxi-kernels   （新增：dense 因果注意力（MTP）、设备侧槽位 scatter、（后续）grouped GEMM）
+lingxi-model     （mtp.rs 新增；moe.rs 改 hit/miss 行集拆分；前向不做 IO 不做调度）
+lingxi-driver    （专家缓存运行时、KV/state、连续批处理、draft/verify、Controller）
+lingxi-server    （OpenAI Chat + SSE；分词）
+lingxi-bench     （golden/trace/命中率/接受率/对拍，旁路）
+```
+
+## 3.1 权重与专家存储三层（综合 ninfer 镜像 + strata 热度）
+
+- **盘（机械盘）**：ninfer v2 产物（模型权重）+ Q4EARN1 兼容的专家 arena 镜像
+  （BF16 原样 blob + per-blob 格式字；读侧几何/字节强校验）。
+  离线转换器一次产出；PLE 102GB 外表维持 mmap。
+- **内存（79GB RAM）**：arena 整段 mmap + `cudaHostRegisterReadOnly`；
+  启动 fadvise 预热；被自适应换出的专家回紧凑 host 镜像（strata exchange buffer，
+  在我们这天然就是 arena 内原位，无需另建——镜像已含全量专家）。
+- **显存（32GB）**：等大专家槽 arena（同层专家同形，不需要 strata VMM 分段）；
+  residency[48*512]→槽；pinned staging 环 + 聚合 gather H2D（ninfer 实测参数先照搬：
+  环深 8、聚合 32）；fill→**verify_slot 字节校验**→翻表，三步不省。
+- **放什么进槽**：第一层先用 STRP 风格 profile 预填（**per-layer 名额**，
+  不许用全局到达顺序）；槽位数由自己的 routing trace 十折留一曲线定，不抄 7168。
+  第二层再上 strata usage 衰减自适应（独立 stream、窗口间换入、迟滞门限）。
+- **hit/miss 行集拆分**：host 路由（[moe.rs](crates/lingxi-model/src/moe.rs)
+  已有 `sel_rows`）在调核前切行；hit 走槽内权重，miss 走 PCIe 直读 pin 住的 blob 上卡算；
+  **两路径同一 GPU 核、同一 bf16 舍入**，输出按 router 原序 scatter 加权（现有
+  `scatter_add_rows` 可复用）。不做 strata 的 CPU 池——确定性优先。
+- 细节顺序与门禁见 [strata-mtp-expert-cache-plan.md](docs/strata-mtp-expert-cache-plan.md) §3.2 E0–E2；
+  其中 arena 文件格式/staging/聚合/gather/verify 的**实现以 ninfer 已验证代码为蓝本转录为 Rust**，
+  不重新发明。
+
+## 3.2 KV 与状态：按我们的架构特点裁剪
+
+- GDN 36 层：递归 state + conv state（step 路径已对拍逐位一致），容量小、随会话常驻；
+  长会话/换出时借 ninfer StateImage 思路整体快照到 host。
+- QSA 12 层：paged KV（先 bf16）；多会话后引入 device page pool → host arena 降级/恢复；
+  TBQ4 作为容量档选项（ninfer 已在同硬件 A/B 验证），但必须走我们的 T2/T3 门禁再默认开启。
+- PLE：仅层 1，hist 状态已实现；ngram 表 mmap 直读（ninfer 的 PleReader issue/collect
+  把盘延迟藏进 embedding+layer0 的手法后续转录）。
+- 前缀共享：单会话先不做；多会话时上 ninfer 的 checkpoint 链思路（radix 塌缩成单链，
+  我们对话型负载大概率够用）。
+
+## 3.3 批处理与调度（ninfer 模型，分两步）
+
+- **第一步（单会话正确）**：保持现有 driver 单流；专家缓存先让单流 decode 可用。
+- **第二步（多会话吞吐）**：转录 ninfer 调度的核心结构而非框架：
+  decode lane 合批（权重每轮只读一次是近线性的来源）、单 prefill lane、
+  FIFO 队首保护 + backfill 准入、按 KV 预算准入新请求；最大并发默认 4、硬顶 8 先照搬。
+  Rust 侧落点 `lingxi-driver::scheduler` 新模块；lane 状态用所有权表达，
+  不把 ninfer 那套 64 位 epoch 校验原样搬（那是 C++ 缺少别名保护的补偿）。
+
+## 3.4 投机解码（strata 算法，ninfer 实测数据做先验）
+
+路线与门禁已在专家方案文档 §3.1 定死（M0 验证窗 → M1 suffix → M2 MTP 层+dense 核+golden →
+M3 Controller），不重复。补充两点 ninfer 侧实证：
+
+- MTP 在同硬件 27B 上的真实接受率约 0.52、长上下文 1K:2.34 / 8K:1.60 接受长度——
+  Controller 的先验/cost 不要只信 strata 的 0.86，要**机上自校准**（strata 自己也是实测标定）。
+- 确定性红线：验证窗 T 列与 T 次单列必须逐位等价（multi_exact 原则）；
+  我们 step 路径已证 t=5 空状态整段 step 与 layer_forward 逐位相同，这条已经提前满足一半，
+  接 MTP 后要把「窗口批量形状」也纳入同一对拍。
+
+## 3.5 服务层
+
+- `lingxi-server`：axum，只做 OpenAI Chat Completions（含 SSE chunk）+ 分词
+  （tokenizer.json 离线随产物/模型目录）；不做计算不做调度（铁律）。
+- 协议语义、SSE 事件序列、请求校验字段以 ninfer `src/serve/openai_*` 为蓝本。
+- 离线依赖问题（cargo 缓存仅 44 crate）：axum/tokio 走 vendored 或本地 registry 镜像解决，
+  不引重量级框架，hyper+tokio 足够。
+
+## 3.6 模块/文件落点一览
+
+| 新能力 | 落点（Rust） | 蓝本来源 |
+|---|---|---|
+| arena 镜像读（Q4EARN1 兼容） | 新 crate `lingxi-expert-arena`（纯 host、零 CUDA，符合依赖分层）或 lingxi-artifact 内子模块 | ninfer moe_expert_arena.h |
+| STRP profile 读写 | `lingxi-model::expert_profile` 或 plan 层（纯数据） | strata expert_cache + make_profile.py |
+| 专家槽缓存/预取/换入 | `lingxi-driver::expert_cache`（stream/event/host 环） | ninfer moe_expert_cache.cuh + strata adapt |
+| routing trace 采集 | moe.rs 加 env 开关 dump；bench 子命令聚合 | ninfer ROUTE_DUMP/ROUTE_STATS 门控 |
+| MoE hit/miss 拆分 | lingxi-model/moe.rs 改造（纯行集逻辑，无 IO） | strata dst_index + ninfer GPU-only |
+| MTP 前向/dense 注意力 | lingxi-model/mtp.rs + lingxi-kernels 新核 | strata mtp.hpp；golden 对拍 |
+| draft/verify/Controller/suffix | lingxi-driver 新模块 spec/controller/suffix | strata spec/* |
+| paged KV / host KV 降级 | lingxi-driver::kv（后做） | ninfer paged_kv_cache/host_kv_arena |
+| 合批调度 | lingxi-driver::scheduler（后做） | ninfer scheduler.h 模型 |
+| HTTP/SSE | lingxi-server | ninfer openai_* 语义 |
+
+# 4. 路线图（与当前实际进度对齐）
+
+| 阶段 | 内容 | 来自 | 状态 |
+|---|---|---|---|
+| P0 | 48 层 prefill + 贪心 decode 主干 bit 级对拍（step/forward 已逐位一致，端到端 argmax 排查中） | lingxi | **进行中** |
+| P1 | routing trace + 十折留一命中率；arena 镜像（先 BF16）；槽缓存 + verify + HostRegisterReadOnly；hit/miss 拆分；单流 decode 服务化门槛 | ninfer+strata | 下一阶段 |
+| P2 | MTP M0–M3 + suffix（见专家方案文档） | strata | P1 后可并行启动 M0/M1 |
+| P3 | OpenAI Chat + SSE + 分词 | ninfer 协议 | 依赖 P1（无缓存 decode 不可用） |
+| P4 | 自适应换入 + RouterLookahead；多会话 paged KV/StateImage；TBQ4 容量档 | strata+ninfer | 有真实流量后 |
+| P5 | decode 合批调度（4 lane 起步） | ninfer | P4 后按吞吐数据决定 |
+| P6 | 长上下文（YaRN 转录）/Q4G64 专家核/VMM（若需要） | ninfer | 按需 |
+
+# 5. 明确不做
+
+| 项 | 原因 |
+|---|---|
+| CPU 专家池（strata 式 AVX 核） | 引入第二条舍入路径，破坏 bit 级确定性；Rust 侧无 CPU GEMM 基建；PCIe 直读+预取先够用 |
+| DFlash2/块扩散草稿 | 需要训练蒸馏管线，超出推理框架范围 |
+| Responses API / Anthropic 协议首版 | YAGNI，OpenAI Chat 覆盖当前需求 |
+| VMM 分段 arena | 同层专家同形，固定槽即可 |
+| 全局到达顺序填槽 | strata 实测 2.97% 命中率，反面教材 |
+| 照搬 7168 槽/4105 槽等任何数值 | 精度、槽字节、硬件全不同，全部用自己 trace 重标 |
+| 在单流正确性未过门提前写调度抽象 | ninfer 调度是被 27B 生产负载逼出来的；我们没有负载前抽象必错 |
+| 把 ninfer launcher 式大文件搬进 Rust | 违反铁律 2；按 §3.6 拆模块转录 |
+
+# 6. 贯穿性工程纪律（两套参照共同的血泪，写进验收）
+
+1. **env 门控手术**：缓存/预取/量化/自适应全部默认关，开关打开才生效，默认路径逐字节不变。
+2. **静默回退必须打日志**（C8：注册失败静默回退让零拷贝「看起来在跑」）。
+3. **fill 必 verify**；读镜像必校验格式字+字节数+边界三重。
+4. **多流拷贝 event 未落地不许翻 residency 表**；本 call 在用槽驱逐免疫（Rust 尽量用所有权表达）。
+5. **新 kernel 先对 HF/scalar golden 再接线**；批量形状 vs 单列形状必须有 bit 级或容差对拍
+   （multi_exact 原则）。
+6. **性能参数机上标定**：trace 命中率、接受率 EMA、cost model，先验只用于冷启动。
+7. T3 端到端贪心中若遇到 bf16 router 并列翻转，按 [ARCHITECTURE.md](ARCHITECTURE.md)
+   T2 附注处理：逐行归因到并列翻转，不把混沌当 bug，也不把真 bug 塞进「混沌」里蒙混。
+
+
+---
+
+# 提速手段全盘点（2026-10-16）
+
+> 这份文档回答一组具体质疑，并给出一张**按收益排序的总表**。
+> 逐块实测数据在 `decode-speed-profile.md` §8.5~§8.7；原始日志在 `docs/bench-logs/`。
+> **口径**：单流；生产 env（三档 W4 + arena 7000 槽 + 整段 pin）；
+> GPU0 = 42:00.0（x16 gen3）；目标 = **单流 200 tok/s**。
+
+---
+
+## 0. 先把"为什么投机反而变慢"算清楚：**行经济账**
+
+这是本盘点的核心。所有"要不要投机 / 投机多长 / 树还是链"的问题都由它决定。
+
+**两个实测锚点**
+| 口径 | 每轮 | 行数 | 产出 token | 行/token | ms/token | tok/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 顺序（`bench.sh` p10，干净） | 26.8 ms | 1 | 1 | **1.00** | **26.8** | **37.3** |
+| 投机 kd=6（`LINGXI_MTP_SPEC=6`） | 218 ms | 7 | 3.57 | **1.96** | **61.0** | **16.4** |
+
+**决定性不等式**：投机要赢，必须
+```
+  产出 token/轮          顺序每行成本
+  ────────────  ≥  ────────────────────
+    行/轮              投机第 k+1 行的成本
+```
+- 左边（实测）= **0.51**（3.57 token ÷ 7 行）
+- 右边（实测）≈ **1.16**（218/7 = 31.1 ms/行 ÷ 26.8 ms/行）
+- **⇒ 0.51 < 1.16，投机必亏。左边要追上右边，kd=6 时需要 `acc+1 ≥ 8.1`，
+  也就是 6 个草稿**全部**命中。**
+
+**为什么投机第 k+1 行反而比顺序的第 1 行贵？**（这与 §8.4 的 `cost(t)=18.2+7.07t`
+"行成本随 t 下降"直觉相反，原因是**FWD_BENCH 测不到 DMA**）
+
+| 成分（每行） | 顺序 t=1 | 投机 t=7 | 说明 |
+| --- | --- | --- | --- |
+| 稠密权重读一遍（摊销） | 18.2 ms | 2.6 ms | **这才是投机唯一真正的杠杆** |
+| 随 t 涨的非专家工作 | ~0 → | 4.0 ms | GDN 递推 36 步、QSA 逐行、逐元素核、多出来的 launch |
+| 专家 GEMV | 6.8 µs/层 → 0.33 ms | 0.66 ms | 唯一专家数随行数涨 |
+| **专家 H2D（PCIe）** | **~7 ms** | **~14.1 ms** | 草稿 token 全是新 token ⇒ miss 率翻倍 |
+| 合计 | **26.8** | **31.1** | |
+
+⇒ **投机确实把 18.2 ms 的权重摊销掉了，但付出的代价是"DMA 翻倍 + 4 ms 的随 t 工作"，
+两头相抵还倒亏。**
+
+**⇒ 结论：`消灭专家 H2D` 不是"优化之一"，而是"投机的门票"。**
+DMA 不归零，投机在任何 k 上都不可能赢（下一节的 k 扫描会把这一点量化）。
+
+---
+
+## 1. "为什么必须贪心投机？" —— **不是我们选的，是判据逼的**
+
+我们的产品输出是**贪心（temperature=0）+ 要求可复现**（首 token 11751、固定流
+`13,561,6511,314,9564,369,19241,13` 逐位一致）。在这个前提下：
+
+**要 bit 复现，接受判据只能是 `草稿 == 主干 argmax`。** 没有第二种合法判据 ——
+否则"草稿说 A、主干说 B"时你若接受 A，输出就不是主干的贪心路径了。
+
+**但"草稿侧"完全不必是 top-1。** 三条放宽路线，附代价：
+
+| 路线 | 怎么做 | 判据还成立吗 | 在我们机器上的代价（关键） |
+| --- | --- | --- | --- |
+| **A. 多候选树**（Medusa / SpecInfer 式 tree attention） | 每位吐 b 个候选，一次主干前向验证一棵树，接受最长命中路径 | ✅ 仍逐位复现（接受路径上每个 token 都等于主干 argmax） | **树的每个节点 = 一行**。我们 **每行 7.07 ms + 每行 ~14 ms 的 DMA**（草稿行几乎都是新专家）⇒ **树比链更亏**。除非 DMA 归零。 |
+| **B. 放宽接受判据**（主干 argmax 落在草稿 top-m 就收） | 改一行代码 | ❌ **输出不再是主干贪心**，等于换了个采样策略 | 需用户拍板。**只在对"逐位复现"没要求的场景可选**（例如 agent 工具调用里 JSON/参数名高度确定的位置）。 |
+| **C. 真采样投机**（temp>0，按 `min(1, p_target/p_draft)` 收） | 标准 spec decoding | ❌ 输出不确定 | 采样下接受率**通常更高**（不需要 argmax 相等），但与本项目"可复现"的定位冲突。 |
+
+**⇒ 我的判断**：A/B/C 都不该是当前的优先项，理由见第 0 节 ——
+**在"每行要付 14 ms DMA"的现状下，"每位多吐候选"只会让每行更贵。**
+先把行成本打下来（第 0 节的不等式右边降到 < 0.5），再谈树。
+
+**唯一值得马上做的"非贪心"思考**：`kd=1` 的投机（draft 1 个、验证 2 行）在
+p=0.958 时是 **20.0 tok/s**、p=0.76 时 **17.9 tok/s** —— 也都不如顺序 37.3。
+**⇒ 长度不是问题，"行太贵"才是问题。**
+
+---
+
+## 2. 投机长度：**用实测接受率扫一遍，最优 k 取决于 p**
+
+成本模型（由 §8.4 的 FWD_BENCH 拟合 + 本轮 DMA 实测拼出，量级可信、绝对值 ±10%）：
+```
+R(k)  = 18.2 + 7.07·(k+1)     ← 主干（无 DMA，FWD_BENCH 拟合）
+      + 14.1·(k+1)            ← 主干 DMA（kd=6 实测 98.6 ms / 7 行）
+      + 37.6                  ← MTP 机器（草稿 15.4 + 重放 18.8 + 提交 3.4）
+tok(k) = 1 + Σ_{i=1..k} pⁱ      ← 1 是奖励 token（免费）
+```
+（自检：k=6 时 R=204 ms、tok=3.57，与实测 218 ms / 3.57 相符。）
+
+| k | tok(k) p=0.76 | tok/s | tok(k) p=0.958 | tok/s |
+| --- | --- | --- | --- | --- |
+| 1 | 1.76 | 17.9 | 1.96 | 20.0 |
+| 2 | 2.34 | 19.6 | 2.88 | 24.1 |
+| 3 | 2.78 | **19.8** | 3.75 | 26.5 |
+| 4 | 3.11 | 19.2 | 4.59 | 28.4 |
+| 6 | 3.57 | 17.5 | 6.18 | 30.3 |
+| 8 | 3.82 | 15.5 | 7.50 | 30.5 |
+| 12 | 4.02 | 12.6 | 10.53 | **31.7** |
+| 16 | 4.13 | 9.9 | 13.07 | 31.5 |
+
+- **p 用实测值**：单步 MTP top-1 命中 **0.958**（23/24）；但自喂链实测只收 2.57/6 ⇒ **p_eff ≈ 0.76**。
+- **⇒ 现在的 p=0.76 下，最优是 k=3，只有 19.8 tok/s —— 连顺序的 37.3 都不到。**
+- **⇒ 即使 p=0.958，最优也在 k≈12，只有 31.7 tok/s —— 仍然不如顺序。**
+- **⇒ "变长度"该做，但它救不了命**：变长度只在 p 高、且行便宜时才有意义。
+  （好消息：**变长度本身很便宜** —— 每轮按最近两个窗口的接受率选 k，几行代码。）
+
+**⇒ 这条扫描给出一句结论**：**在行成本结构不变的前提下，投机在任何 k、任何 p 上都不赢。**
+
+---
+
+## 3. 我们**漏掉**的三条（本轮新想到，且都不需要 P2P）
+
+### 3.1 ★★★ **把 MTP 机器整体搬到 GPU1（草稿引擎在另一块卡）**
+
+- **为什么可行**：P2P 死了（§8.7），但**草稿机不需要 P2P** ——
+  它只需要从 GPU0 拿主干的 `h`（每行 `dim=10240` bf16 = **20 KB**），
+  再把 k 个 **token id（每轮几十字节）** 送回 GPU0。**走 host 中转，实测 34.0 µs/次**
+  （§8.7.2；这是"已 被验证安全"的普通 DMA 路，不碰 IOMMU 故障路径）。
+- **收益一**：把 **草稿 15.4 + MTP 重放 18.8 = 34.2 ms/轮** 从 GPU0 的临界路径上拿掉。
+- **收益二（更值钱）**：MTP 产物 **5,214,309,888 B = 4.86 GiB**，在**投机路径里**必须常驻 GPU0，
+  折算 ≈ **2100 个专家槽**（每槽 2.49 MiB）。搬到 GPU1 ⇒ 投机时 GPU0 的槽 7000 → ~9100，
+  hit 93% → 更高 ⇒ 直接削第 0 节不等式右边的大头（DMA）。
+  （注：生产 `talk` 路径不加载 MTP，所以这条只对"投机模式"生效 —— 而那正是我们要用的模式。）
+- **代价**：每轮多 7 次 host 中转（6 步草稿 + 1 次灌 h）× 34 µs ≈ **0.24 ms/轮**。
+- **净**：**≈ −34 ms/轮 + 0.24 ms/轮 ⇒ 218 → 184 ms（+18%）**，且给 DMA 松绑。
+- **实现量**：中。`mtp_step` 已经在 `lingxi-bench` 里是一个独立闭包；
+  要把它换成"在 device=1 的 context 上跑同一套 kernel"。风险点：两套 `Kernels`
+  要各自绑定自己的 context（`Kernels::load(1)`），别让 stream/context 串味。
+
+### 3.2 ★★★ **静态"钉"热专家**（离线路由直方图）
+
+我上一轮只考虑了"**加槽**"（受 32 GB 限制，9500 槽直接 OOM ⇒ 死路）。
+**但"钉"是另一件事**：不改容量，改**准入/淘汰策略**。
+
+- 现状：全局 LRU，7000 槽、命中 **93%**、驻留 6774/7000（§8.6.3）。
+- 机会：**用一段真实语料离线统计每层的路由直方图**，把每层最热的 N 个专家
+  **钉住不再淘汰**（例如每层 100 个 × 48 层 = 4800 槽钉死），剩 2200 槽做 LRU。
+  理由：路由是重尾的；LRU 会在**草稿 token 带来的新专家洪峰**里把热专家挤出去
+  （这正是投机轮 miss 率翻倍的原因）。
+- 判据：`talk 200` 的稳态命中率（`LINGXI_ARENA_STATS=1`）。
+  若 93% → 96%，则 DMA 7 ms → ~4 ms/token（−11%）。
+- **成本极低**：一次离线统计（跑几百 token 记路由）+ 一个 `pinned: bool` 表。
+- **副产品**：这份直方图还能回答"**要不要给每层预取**"，以及第 3.3 节。
+
+### 3.3 ★★ **专家按层"预取 + 双缓冲"**（KTransformers 的做法，我们没做）
+
+现状：`load_hits` 在**需要时**同步搬。而我们其实**能提前知道一部分**：
+- **同一层内**：`swap` 无解（要等路由）。
+- **但跨层**：本 token 第 i 层的专家集合 与 token 内**下一行**第 i 层的专家集合
+  在草稿链里高度相关（草稿就是同一段文本的延伸）。**用第 j 行的路由去预取第 j+1 行
+  同层的专家**，可以在主干前向的"前 40% 计算时间"里偷偷搬。
+- 判据：命中率的提升 × 搬过来的字节。**先离线用路由 trace 估**（同一个直方图工具），
+  别直接改代码。
+
+---
+
+## 4. 模型 / 原始模型的区别 · 排列 · 预先计算
+
+### 4.1 我们已经踩清的两处**原始模型 ↔ 我们产物**的差异（别再重复踩）
+
+| 差异 | 内容 | 影响 |
+| --- | --- | --- |
+| **`wplus`** | 本模型族把 RMSNorm 的 gamma 存成 `γ−1`，转换时 `+1` 还原；且**必须 round-half-even**（截断会让每个 gamma 差 1 ulp，约 25% 元素） | MTP 接受率 0 → 0.958 的根因之一 |
+| **`qkv` 行序** | `query_key_gate_value` 的排布是 `[q \| k \| gate \| v]`，且 q 段是**真置换**（不是简单拼接） | 同一个根因的另一半 |
+- **⇒ 可复用的工具**：`tools/convert/hf2lingxi.py`（自带"gamma 必须全为正"+"qkv 必须是真置换"两道自检）；
+  `tools/golden/mtp_fix_stem_norm.py`（幂等修 stem norm）。
+- **⇒ 方法论教训（值得反复用）**：**凡"比实现"的对拍，先问参照物是否独立**。
+  §3.56/§3.57 的"白盒通过"是循环论证（拿同一份错误权重去比 Rust）。
+
+### 4.2 **排列（layout）还有多少可挖**
+
+| 想法 | 值不值 | 依据 |
+| --- | --- | --- |
+| Q4 group 沿 k 排成"一个 warp 一次读 128 B"的连续布局 | **已经做了** | `dequant_ops.cu`：`c0 = lane*8` ⇒ lane 间连续 4 字节、整 warp 一个 group 的 32 B |
+| 把稠密权重按"一行一 block 的 128-bit 读"重排 | **已经做了** | `gemv_bf16_row8_epi` / `use_row8` |
+| **把每层的稠密权重打成一个连续大 blob**（现在张量散在 234 GB 容器里） | **中等收益** | 减少每张量一次独立 H2D/页表/预取的开销；但要改容器格式 + 转换器。**先量"每张量一次的开销"有多少** |
+| 专家 blob 里砍掉 fp16 scale 平面（占 6%） | 小 | k=2560 时 scale 只占 102400/1740800 B |
+| 把 Q4 的 nibble 顺序按"LUT 友好"重排 | 无 | LUT 已经按 byte→float2 |
+
+### 4.3 **预先计算（off-line）能拿到的**
+
+| 项 | 现在 | 可预计算成 | 收益 |
+| --- | --- | --- | --- |
+| RoPE 的 cos/sin | 已预计算表 | — | 已做 |
+| PLE 的 ngram 哈希 | 已有 95 GiB 表在 RAM | — | 已做（且实测 `SKIP=ple` **零差别**） |
+| **路由直方图** | 没有 | 每层每专家的频次 | **驱动 3.2 / 3.3 / 变长度 k** ← 最高价值 |
+| **GR 的 3 个 rmsnorm 折进 mix_down** | 3 个独立小核 | DeepGEMM 的 prenorm 寄生技巧（把 `reduce(x²)` 寄生在投影 GEMM 的 A 读通路上） | 省 GR 每块 ~2 次 HBM 往返；§6 已记，**没做** |
+| **把 `moe_shared` / `router` 转 Q4** | bf16（每 token 0.6 GB） | W4G64 | 字节 −75% ⇒ 但 Q4 是 ALU 限（实测 320 vs bf16 780 GB/s）⇒ **先量**，预计小赚或不亏 |
+| **专家 W3G64（自研 3 bit，非 IQ3 系）** | Q4 | 3 bit | 字节 −25% ⇒ DMA −25%、GEMV 更快。**用户已定"不用 IQ3 系列"，W3G64 不是 IQ3 —— 需拍板** |
+
+---
+
+## 5. "小模型草稿 + 大模型验证"以及其它可借鉴没借鉴的
+
+### 5.1 用户提过的"小模型加速、大模型验证"= 经典 speculative decoding
+
+我们现在的 MTP 就是它的等价物（"模型自带的草稿头"）。**但有一个变体我们没试，而且很适合这台机器**：
+
+**在 GPU1 上跑一个独立的小草稿模型**（例如同族的小模型，Q4 后 2~4 GB，GPU1 装得下）。
+- 接受率通常比"单层 MTP 自喂链"高（草稿是一个**完整模型**，不是一层的自喂）
+- **成本完全不占 GPU0**（GPU1 现在 100% 空闲），跨卡只传 token id（host 中转 34 µs）
+- **和 3.1 是同一个槽位**：先用 MTP 验证"搬草稿到 GPU1"这条管线，
+  再把 MTP 换成真小草稿模型。**先做 3.1，再做 5.1。**
+
+### 5.2 其它可借鉴、我们没借鉴的
+
+| 方案 | 一句话 | 在本机的可行性 |
+| --- | --- | --- |
+| **Prompt-lookup decoding**（从上下文里找 n-gram 当草稿） | 零模型成本、零显存 | **agent 场景特别有效**（工具调用/重复 JSON/代码补全）。可与我们已有的 20 M ngram 表结合。**低成本、值得试** |
+| **Lookahead decoding / Jacobi 迭代** | 不用草稿模型，并行迭代 | 每行成本高 ⇒ 同第 0 节，暂缓 |
+| **Self-speculative（跳层）** | 草稿用主干自己的前 N 层 | 我们已有 MTP，收益重叠 |
+| **EAGLE（特征级草稿头）** | 用主干倒数第二层特征 + 小头 | **MTP 架构上就是它** |
+| **KTransformers：专家在 CPU + 只搬命中专家** | 我们**已经在做**（arena 直读） | 可借鉴它的**双缓冲预取**（→3.3）与**按层去重** |
+| **llama.cpp `--n-cpu-moe` / `-ot`** | 把专家 offload 到 CPU/内存 | 等价物就是我们的 arena |
+| **vLLM PagedAttention** | 分页 KV | 单流不需要 |
+| **CUDA Graph 扩大覆盖** | 少 launch | **实测零收益（§8.6.2）⇒ 否决** |
+| **Marlin / ExLlama 把 dequant 折进 tensor core** | sm_80+ 的 mma | **V100（sm_70）没有对应的 int4 mma ⇒ 不可用** |
+| **DeepGEMM** | sm90/sm100 | 不可用；只借了 3 处思想（§6） |
+| **`dp4a`（sm_61+ 的 int8 点积）** | W4**A8** 才能用 | 需把激活量化到 int8 ⇒ **破坏 W4A16 的精度承诺**，与用户定下的路线冲突 |
+
+---
+
+## 6. 总表：按"每 ms 收益 ÷ 风险"排序
+
+| # | 手段 | 预期收益（单流） | 风险 | 工作量 | 依赖 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **MTP 机器搬到 GPU1**（3.1） | **−34 ms/轮（+18% 投机）+ 释放 1860 槽** | 低（只走已验证的 host 中转） | 中 | — |
+| 2 | **静态钉热专家**（3.2） | DMA 7 → 4 ms/token（**+11% 顺序**） | 低 | **小**（离线统计 + 一个小表） | 路由 trace |
+| 3 | **专家 H2D 与常驻 GEMV 重叠** | ≤3.3 ms/token（+12%） | 中（第二条 stream + hit/miss 分组） | 中 | — |
+| 4 | **host 侧 MoE 提速**（512 次 `exp` 的 softmax + Vec/上传复用） | ~3.4 ms/token（+13%） | 低（但 softmax 要**逐位复现**） | 小 | — |
+| 5 | **草稿链接受率 0.76 → 0.9+** | 产出 **+75%**（成本不变） | 中（要查自喂链的 KV/state 接线） | 中 | — |
+| 6 | 变长度 k（自适应） | 用 p=0.76 时 k=3 比 k=6 好 +13% | 极低 | **极小** | #5 |
+| 7 | 把 `talk` 接上投机环路 | 0（但**让权威尺子量得到投机**） | 低 | 小 | — |
+| 8 | 每层稠密权重打成一个 blob | 待量 | 中（改容器 + 转换器） | 大 | 先量 |
+| 9 | `moe_shared`/`router` 转 Q4 | 待量（可能小赚） | 低 | 小 | — |
+| 10 | 专家 W3G64（3 bit） | DMA/GEMV −25% | 中（精度） | 大 | **用户拍板** |
+| 11 | 多候选树 / 采样投机 / 放宽判据 | **当前为负**（第 1 节） | — | — | 需 DMA 先归零 |
+
+**已否决（别再试）**：扩 CUDA Graph 覆盖（零收益）、加槽 >8000（OOM 且更慢）、
+稠密 Q4 加预取（六形状全平/更慢）、双卡专家常驻（P2P 被 IOMMU 挡 + 全量装不下）、
+DeepGEMM / Marlin（sm_70 不支持）、`dp4a`（要 W4A8，破坏精度路线）。
+
+---
+
+## 7. **到 200 tok/s 的完整条件**（把第 0 节的不等式反过来解）
+
+用 `R(k) = 18.2 + 7.07(k+1) + DMA(k+1) + MTP机器`，目标 200 tok/s：
+
+| 需要 | 现在 | 目标 | 对应手段 |
+| --- | --- | --- | --- |
+| 专家 H2D（DMA） | 14.1 ms/行 | **≈0** | #2 钉热专家（可到 93%→96-98%）+ 命中率高到 99%（**单卡做不到 100%**） |
+| MTP 机器 | 37.6 ms/轮 | **≈0.5 ms/轮** | **#1 搬到 GPU1** |
+| 主干每行（无 DMA） | 25.3 ms（t=1）→ 9.7 ms（t=7） | **≈2.5 ms** | 内核效率（Q4 专家核 375/245 → 700+；稠密 366~523 → 700） |
+| 接受率 p | 0.76（链） / 0.958（单步） | **≈0.95（链）** | #5 + 5.1（GPU1 上跑真小草稿模型） |
+| k | 6 | 10~12（自适应） | #6 |
+
+**四项都做到 ⇒ ~200 tok/s。** 缺任何一项都不行：
+- 只做 #1+#2+#4+#5+#6（不改内核）⇒ 大约 **35~40 tok/s**；
+- 再叠 #3 ⇒ 大约 **45~50 tok/s**；
+- 要到 200 必须**同时**把"每行 25.3/9.7 ms 打到 ~2.5 ms"（内核效率 3~4×），
+  这是唯一没有捷径的一步。
+
+**⇒ 诚实结论**：**200 tok/s 是可达的，但需要"主机侧结构性改动（#1/#2）+ 内核效率 3~4×"
+两件事同时完成**；单靠任何一件都只能到 50 tok/s 量级。
+本盘点的**最高性价比起手**：~~#2（钉热专家）与 #1（MTP 搬到 GPU1）~~
+→ **已被 §9 更新**：第一优先是 **§9.5 的"修自喂链第 1 位"（0 额外行、产出 +58%）**，
+然后才是 #2（钉热专家，+11%）与 #1（MTP 搬到 GPU1，+18%）。
+
+---
+
+## 9. MTP 接受率的真相：**top-N × 上下文 × 链上位置**（2026-10-16 实测）
+
+这一节推翻了我之前用"单 prompt、24 token、只看 top-1"得出的结论。三件事都被实测证伪/修正：
+
+### 9.1 **接受率强依赖上下文（"不同专家"）**——不能用一个 prompt 代表全部
+
+`mtp-accept <主干> <MTP> <prompt> 120`，单步覆盖（真值落在草稿 top-N 里的比例，n=119）：
+
+| prompt | top-1 | top-2 | top-3 | top-5 | top-8 | top-10 | top-20 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `def quicksort(arr):`（代码） | **0.958** | 0.992 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| `The capital of France is`（英文散文） | 0.950 | 0.992 | 0.992 | 1.000 | 1.000 | 1.000 | 1.000 |
+| `请用一句话解释量子纠缠`（中文） | **0.765** | 0.840 | 0.891 | 0.933 | 0.958 | 0.975 | 0.975 |
+| `Once upon a time, in a small village by the sea,`（叙事） | **0.639** | 0.824 | 0.849 | 0.899 | 0.941 | 0.950 | 0.975 |
+
+- **同一颗草稿头，top-1 从 0.639 到 0.958 —— 差 1.5 倍。** 之前记的"0.906/0.958"只代表那一个 prompt。
+- 规律：**结构化/高可预测的上下文（代码、常识续写）≈0.95；自由叙事/跨语言 ≈0.64~0.77**。
+- ⇒ 以后报接受率**必须报上下文**，并且最好按场景（agent 工具调用 vs 长文）分开统计。
+
+### 9.2 **top-N：草稿分布基本是对的，差的是 argmax**
+
+- 在"好"的上下文上：**top-2 就 0.992、top-5 就 1.000** ⇒ 一颗几乎完美的草稿头。
+- 在"差"的上下文上收益更大：叙事 `top-1 0.639 → top-8 0.941 → top-10 0.950`（相对 +47%）。
+- **top-10/20 在中文上饱和在 0.975** ⇒ 剩 2.5% 是**分布本身错**（模型能力上限，再宽也拿不回）。
+
+### 9.3 **链上逐位：第 0 位很好，第 1 位是坏的**（`LINGXI_MTP_SPEC=6`，29 轮）
+
+`LINGXI_MTP_SPEC=6 mtp-accept ... 120` 新加的逐位表（分母 = **走到该位的轮数** ⇒ 条件接受率）：
+
+| 链上位置 j | 走到 | top-1 | top-2 | top-3 | top-5 | top-8 | top-10 | top-20 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **0**（主干 h + pending） | 29 | **0.97** | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| **1**（自喂：MTP 层输出 + 上一步草稿） | 28 | **0.57** | 0.71 | 0.75 | 0.82 | 0.89 | 0.89 | 0.89 |
+| 2 | 16 | 0.94 | 0.94 | 0.94 | 0.94 | 0.94 | 0.94 | 0.94 |
+| 3 | 15 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| 4 | 15 | 0.73 | 0.80 | 0.87 | 0.87 | 0.93 | 0.93 | 1.00 |
+| 5 | 11 | 0.64 | 0.64 | 0.64 | 0.64 | 0.64 | 0.64 | 0.82 |
+
+**⇒ 三条结论：**
+1. **第 0 位 ≈ 单步能力（0.97 vs 单步 0.95）⇒ 主干侧喂 h/token 的口径是对的。**
+2. **第 1 位塌到 0.57，而且 top-20 也只有 0.89** ⇒ 这**不是 argmax 差一两位**，
+   是**自喂那一步的状态本身就偏了**（"分布错"而不是"排序错"）。
+   —— 这是当前**最值钱的单个 bug**：它把链接受率从 ~5.2/6 压到 3.17/6。
+3. **逐位是"非单调"的（0.97→0.57→0.94→1.00→0.73→0.64）** ⇒ 不是"误差累积"，
+   而是**某一步的接线问题**（累积应单调下降）。用户"长度可能也不一样"的判断成立。
+
+### 9.4 对"树/多候选草稿"的裁决：**证据支持、但本机成本否决**
+
+- 证据面：宽度 2 就能把叙事从 0.639 拉到 0.824、宽度 8 到 0.941 ⇒ **树确实有空间**。
+- 成本面（决定性）：一轮的**行数**（= 主干要处理的行）
+  - 链宽 1（现状，kd=6）：**7 行**
+  - 完整 2 叉树深 6：`Σ2^j = 126 行`
+  - 8 叉树深 6：天文数字
+  而每行成本 ≈ **7.07 ms + ~14 ms（DMA）** ⇒ 126 行 ≈ 2.6 s/轮。
+  **⇒ 树在本机是"拿 18× 的行数换 1.6× 的产出"，必亏。**
+- **⇒ 唯一可行的多候选形态是"浅层窄树"**：只在第 0~2 层分 2~4 叉（多 3~7 行 = +40~100% 成本），
+  换第 1 位从 0.57→0.89。**性价比远不如先把第 1 位的接线 bug 修掉**（0 额外行）。
+
+### 9.5 ⇒ 由此更新的优先级
+
+1. **★ 修第 1 位（自喂）的接线** —— 0 额外行，链接受率 3.17/6 → 期望 ~5/6（产出 **+58%**）。
+   诊断入口已备好：`LINGXI_MTP_H=mixed`（换 h 来源）、`LINGXI_MTP_GMIX=1`（换 mixer）、
+   `LINGXI_MTP_ALIGN=last`（换 token 对齐）——**三个开关各跑一次 120 token，看第 1 位动没动**。
+2. **按场景分别报接受率**（agent/代码 vs 长文），别再拿单一数字下结论。
+3. 浅层窄树（2~4 叉、只在前 3 层）—— 等 1 做完再看还有多少空间。
+4. 树的完整版 —— **等"每行成本"降到 ~2.5 ms 再谈**（见 §7）。
+
+---
+
+## 10. 文件落盘说明
+
+| 文件 | 位置 | 性质 |
+| --- | --- | --- |
+| **本文档** | `docs/speedup-audit.md` | 落盘（/data = sdb）✅ |
+| 逐块实测原账 | `docs/decode-speed-profile.md` §8.5~§8.7 | 落盘 ✅ |
+| 跨卡探针源码 | `tools/gpu/gpu_peer_probe.cu` | 落盘 ✅ |
+| 原始日志（KTS 逐层 / 命中率曲线 / P2P） | `docs/bench-logs/*.log.gz`（5 个，~24 KB） | 落盘 ✅ |
+| 本轮临时草稿日志 | 测试机 `/tmp/*.log` | 按用户要求留在 tmp（**不删**） |
+
+<!-- 维护提示：新增提速实验后，把"预期收益/风险/工作量"补进第 6 节总表，
+     并把被否决的写进行末的否决清单（附件：decode-speed-profile.md §7 否决登记）。 -->
+
+
+---
+
+根据第一篇文档：ninfer 的 DFlash2 投机解码在 27B 模型上的接受率是多少？只回答数字。

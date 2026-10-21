@@ -1,0 +1,15 @@
+[package]
+name = "lingxi-kernels"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[features]
+# GPU 相关测试/运行门控：默认不启用，`cargo test -p lingxi-kernels --features gpu`
+gpu = []
+
+[dependencies]
+lingxi-ids.workspace = true
+cudarc.workspace = true
+anyhow.workspace = true
+half.workspace = true

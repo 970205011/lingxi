@@ -1,0 +1,14 @@
+[package]
+name = "lingxi-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lingxi-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+lingxi-ids.workspace = true
+lingxi-model.workspace = true
+lingxi-driver.workspace = true

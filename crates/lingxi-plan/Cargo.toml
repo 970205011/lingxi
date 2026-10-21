@@ -1,0 +1,7 @@
+[package]
+name = "lingxi-plan"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lingxi-ids.workspace = true

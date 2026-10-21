@@ -1,0 +1,21 @@
+[package]
+name = "lingxi-bench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lingxi-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+half.workspace = true
+memmap2 = "0.9"
+cudarc.workspace = true
+lingxi-ids.workspace = true
+lingxi-tokenize.workspace = true
+lingxi-artifact.workspace = true
+lingxi-model.workspace = true
+lingxi-kernels.workspace = true
+lingxi-driver.workspace = true

@@ -1,0 +1,48 @@
+# lingxi（灵犀）— 专用推理引擎 workspace
+# 铁律：模块之间只经由 lingxi-ids 通信；改 server 不重编 kernel；改 model 不碰 kernels。
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/lingxi-ids",
+    "crates/lingxi-tokenize",
+    "crates/lingxi-artifact",
+    "crates/lingxi-plan",
+    "crates/lingxi-kernels",
+    "crates/lingxi-model",
+    "crates/lingxi-driver",
+    "crates/lingxi-server",
+    "crates/lingxi-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+half = "2"
+log = "0.4"
+env_logger = "0.11"
+cudarc = { version = "0.19", features = ["cuda-12080", "cublas", "f16"] }
+lingxi-ids = { path = "crates/lingxi-ids" }
+lingxi-tokenize = { path = "crates/lingxi-tokenize" }
+lingxi-artifact = { path = "crates/lingxi-artifact" }
+lingxi-plan = { path = "crates/lingxi-plan" }
+lingxi-kernels = { path = "crates/lingxi-kernels" }
+lingxi-model = { path = "crates/lingxi-model" }
+lingxi-driver = { path = "crates/lingxi-driver" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

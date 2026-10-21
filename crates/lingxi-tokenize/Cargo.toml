@@ -1,0 +1,18 @@
+[package]
+name = "lingxi-tokenize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "lingxi_tokenize"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+# HF 官方分词库（Rust 原生，绑定 Python transformers 的 tokenizer.json 语义）。
+# 关掉 http/进度条等重特性：只从字节加载本地产物内的 tokenizer.json。
+# onig 必须开：0.20.4 关 onig 时其 onig.rs 模块门控有编译 bug；onig-sys 自带
+# oniguruma C 源码由 cc 编译，不依赖系统库。
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }

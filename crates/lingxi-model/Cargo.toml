@@ -1,0 +1,13 @@
+[package]
+name = "lingxi-model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+cudarc.workspace = true
+lingxi-ids.workspace = true
+lingxi-artifact.workspace = true
+lingxi-plan.workspace = true
+lingxi-kernels.workspace = true

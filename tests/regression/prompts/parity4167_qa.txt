@@ -1,0 +1,160 @@
+# 灵犀引擎提速 —— 交接文档
+
+> 写于 2026-10-15。承接本会话（目标：**单流 decode 提到 200 tok/s**）。
+> 与之配套的**详细证据档**是同目录的 `decode-speed-profile.md`（§3.1–§3.64 + §4 路线图 + §7 失败登记）——
+> 本文是"读完就能接手"的入口，细节一律回溯到那份。
+
+***
+
+## 0. 一句话现状
+
+**目标未达成。** 当前单流 **p10 ≈ 26.9 ms/token（≈37 tok/s；p50 29.1 ms ≈ 34 tok/s）**；首 token 恒 **11751**（判据绿）。
+本会话把 **t=2 前向砍掉 49%**、t=8 砍掉 21%、启动 40.1 s → **4.4 s**；
+2026-10-16 又交付两件：**① arena 锁页按介质判定（p10 +28%、p50 +290%）；② 查明并修好 MTP 0/n 的根因 —— 接受率 0/64 → 58/64 = 0.906。**
+
+> **⭐⭐ MTP 0/n 的真正根因（已定位、已复现、已修复）**
+>
+> **`$LINGXI_ASSETS/qwen4_exp.mtp.ninfer` 里 `mtp/embedding_norm` 与 `mtp/hidden_norm`
+> 漏了 wplus 的 `+1`。**
+>
+> 这个模型族的 safetensors 把 **RMSNorm 的 gamma 存成 `γ−1`**，ninfer 转换的 **`wplus` 步骤负责 +1 还原成 γ**；
+> 但转换器的 +1 名单**漏掉了 role 为 `MtpStemNorm` 的这两个张量**（层内的 `AttentionNorm`/`HyperConnectionNorm` 都加对了）。
+> 于是 MTP 的 **stem** 拿 `γ−1` 当 γ 用：**符号翻、量级差 ~3 倍** ⇒ 整条 MTP 算错 ⇒ 草稿全错（0/64）。
+>
+> **判据（一眼可辨，不必跑模型）**：gamma 必须全为正。修复前
+> `hidden_norm` mean=**−0.3284**（84% 为负）、`embedding_norm` mean=**−0.7642**（**100% 为负**）；
+> 补 `+1` 后变成 **+0.6703（0.3% 负）/ +0.2358（0% 负）** ⇒ 立刻是正常 gamma。
+>
+> **修复效果（两个 bug 叠加）**：`mtp-accept` 从 **0/64 = 0.000** →
+> 只修 ① 得 **58/64 = 0.906** → ①+② 全修得 **64/64 = 1.000**
+> （多 prompt 复核：`The capital of France is` 96/96、`1 2 3 4 5 6 7 8 9 10` 96/96、
+> `def fibonacci(n):` 85/96 = 0.885、`Write a short poem...` 78/96 = 0.812 ⇒ 实际 0.81~1.00）。
+>
+> **⚠️ 第二个 bug（同一产物）**：`mtp/layer/attention/query_key_gate_value` 的**行序也错了** ——
+> 它的行序**不是** `[q_proj;k_proj;v_proj]` 的真置换：在 q 段里插了一个 k 块
+> ⇒ **丢了 256 行 q、重复了 256 行 k**（q 的 256 个输出维用的是 k 的权重）。
+> 判据：**"行多重集必须等于 `[q;k;v]`"** —— 注意**逐行哈希反查抓不到它**（重复行照样每行都能命中，
+> 我一开始就被这个骗过去了）。正确行序 = `q(6144)|k(512)|gate(6144)|v(512)`，q/gate 按头去交织
+> （`q 段行 h*256+d ← q_proj[h*512+d]`，`gate 段 ← q_proj[h*512+256+d]`），
+> **已用主干产物（golden 金标准，layer 3）逐行验证**。
+>
+> **⇒ 结论**：**不要用 `mtp-pack` 抽的那份产物**（两个 bug 都在里面）。
+> 用仓库里的转换器从原始 safetensors 重新生成：
+> ```
+> python3 tools/convert/hf2lingxi.py mtp \
+>     --src $MODELS/nvfp4/Qwen3.8-Flash-Next \
+>     --out $LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer --strict
+> ```
+> （自带两道自检：**gamma 必须全为正**、**qkv 必须是真置换**。两条自检正好各抓一个 bug。）
+> 产物：`$LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer`。旧的那份 `$LINGXI_ASSETS/qwen4_exp.mtp.ninfer`
+> **保留未动**（未删除、未覆盖）。
+>
+> **为什么之前所有白盒都"通过"却查不出来**：三个 oracle（stem/attn/GR）以及所有对拍都**用同一份产物的权重**
+> 去比 Rust —— **是循环论证**，权重本身错了永远测不出来；而主干侧没有 stem norm，所以主干判据也照不到。
+>
+> **⚠️ 现有可用产物**：`$LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer`（= 原产物 + 2 个 stem norm 的 +1）。
+> `$LINGXI_ASSETS/qwen4_exp.mtp.ninfer` **仍是坏的**（未删除，也未覆盖；要换请显式改名）。
+> 重建脚本见 `tools/golden/mtp_fix_stem_norm.py`（幂等），完整 HF→ninfer 打包映射见 §5.5。
+>
+> **⇒ 但仍不是"能用"**：`mtp-accept` 只量**接受率**；要拿到吞吐，引擎里还必须有
+> **"草稿 k 个 → 一次主干前向验证 → 接受前缀"的投机环路**（lingxi 目前**没有**实现，这是下一步）。
+
+***
+
+## 1. 验收判据（改任何东西前后都要过）
+
+| 项       | 值                                                                                                                                                                 |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 首 token | **11751**                                                                                                                                                         |
+| 固定流贪心序列 | `13, 561, 6511, 314, 9564, 369, 19241, 13`                                                                                                                        |
+| 计时尺子    | `tools/golden/bench.sh <tag> <tokens> [R]`，**以 p10 为头条**（p50 只作参考）                                                                                                |
+| 构建      | `CARGO_TARGET_DIR=/dev/shm/lingxi-target cargo build --release -p lingxi-bench`，**只看退出码**；成功后必须 `cp /dev/shm/lingxi-target/release/lingxi-bench bin/lingxi-bench` |
+
+> ⚠️ 别用 `cargo build | grep | head && cp` —— `head` 退出码恒 0，会把**编译失败**吞掉并复制旧二进制（本会话真踩过，整轮结论作废）。
+
+### 1.1 ★ 速度现状（2026-10-16 实测更正）
+
+⚠️ **先纠正一个口径坑**：本文件原写的 "p10 ≈ 24.8 ms（40 tok/s）" **是"专家 arena 整段锁页"口径**
+（`bench.sh` 默认 `LINGXI_ARENA_PIN_GIB=64`）。把 pin 关掉（守 §2 铁律 1）后**会慢 28%、而且方差爆炸**：
+
+| 配置（`bench.sh`，200 token × 2 轮） | p10 | tok/s | p50 | p50 tok/s | 离散 |
+| --- | --- | --- | --- | --- | --- |
+| **`PIN_GIB=61`（整段 arena 锁页）** | **26,738 µs** | **37.4** | **29,002 µs** | **34.5** | 27% |
+| `PIN_GIB=0`（默认，分开源） | 34,441 µs | 29.0 | 113,967 µs | **8.8** | **139%** ⚠️ |
+| `PIN_GIB=0` + `LINGXI_ARENA_FIXED_EXPERTS=1` | 24,938 µs | 40.1 | — | — | 2.7% |
+| `PIN_GIB=0` + `LINGXI_ARENA_NOH2D=1`（不真拷） | 24,220 µs | 41.3 | — | — | 2.8% |
+
+**结论（三条）**：
+
+1. **专家 blob 的 H2D 就是那 ~28% 与 139% 方差的来源**：`NOH2D=1`（只记槽不真拷）与 `FIXED_EXPERTS=1`
+   两条独立消融都落到 ~24.5 ms / 41 tok/s、离散 2.7% ⇒ 与 host 路由、槽簿记无关，**就是拷贝本身**。
+2. **分开源（pageable）退化成"驱动 staging + 同步"**，所以又慢又抖；**整段锁页后 p10 37.4 / p50 34.5 tok/s**。
+   命中率实测只有 **85%**（且**只驻留 4442/7000 槽，没满**）⇒ 全是**首次触碰的 compulsory miss**
+   （~76 个/token × 2.6 MB ≈ 198 MB/token 过 PCIe），**不是容量淘汰**（加大槽数无效，与 §3.16.1 一致）。
+3. **🐞 新发现真 bug：`LINGXI_ARENA_PIN_GIB` 只支持"整段"**。给中间值（如 16）会在 decode 第 15 个 token
+   崩 `arena blob H2D: DriverError(CUDA_ERROR_INVALID_VALUE)` —— **同一 mmap 只注册一部分时，
+   落到注册区间之外的拷贝源会被拒**。⇒ 现状是"整段 pin 或完全不 pin，别给中间值"（代码应显式拦掉）。
+
+> ✅ **已落地（提交 `efb50d9`，判据绿）**：铁律 1 改成**按介质判定**（代码读 `/proc/mounts` 硬判）——
+> arena 在 **RAM（tmpfs/ramfs）** ⇒ 允许且**默认整段 pin**（`LINGXI_ARENA_PIN_GIB` 不设 = 整段）；
+> 非 RAM 介质 ⇒ **硬禁**（要关 pin 显式 `=0`）；**只接受「整段或 0」**，中间值启动即报错。
+> 实测（`bench.sh 200×2`，新默认）：**p10 26,934 µs = 37.1 tok/s，p50 29,124 µs = 34.3 tok/s**
+> —— 相对旧默认（29.0 / **8.8**）是 **p10 +28%、p50 +290%**。首 token 11751 判据仍绿。
+
+> **⇒ 当前基线（2026-10-16，新默认）**：**p10 26.9 ms = 37.1 tok/s**（p50 29.1 ms = 34.3 tok/s）。
+> 距 200 tok/s 还差 5.4×，后续只能靠：**① 内核吞吐（Q4/专家 GEMV 的 2× 空间）+ ② 投机解码**。
+
+***
+
+## 2. 环境与常用命令
+
+* 引擎在**宿主** **``** = **测试容器 的** **`$MODELS/lingxi`**（同一挂载）。一切容器操作走
+  `pct exec 141 -- bash -lc '...'`。
+
+* GPU：Tesla V100-PCIE-32GB（sm\_70），**容器内无 ncu/nvprof**（所以块账靠 SKIP/PROF/KTS 反推）。
+
+* 产物：`$MODELS/qwen4_exp-artifact/qwen4_exp.ninfer`（主干）；
+  MTP 小产物 `"$LINGXI_ASSETS/qwen4_exp.mtp.ninfer"`（27 张量 / 4.86 GiB，由 `mtp-pack` 生成）。
+
+* 常用 env：
+
+```bash
+export LINGXI_EXPERT_ARENA=/dev/shm/qwen4_exp.expert-arena.q4g64.bin
+export LINGXI_ARENA_SLOTS=7000                      # 设备槽数（17 GiB），9200 无增益
+export LINGXI_Q4_CACHE=/dev/shm/lingxi-q4cache      # W4 权重缓存：启动 40.1s → 4.4s
+# ★ 2026-10-17（P15-㉜）：双卡时 layer-split 已是**引擎默认**（lo=24，自动关 CUDA Graph），
+#    不再需要手设 LINGXI_LAYER_SPLIT/LINGXI_NO_GRAPHS。依据：真实中文语料 20.7 → 54.1 tok/s
+#    （+161%，每卡 arena 减半 ⇒ 专家 miss 崩塌）；bench 英文高命中语境 −7%。
+#    回归对照用 LINGXI_LAYER_SPLIT=0 显式关。
+# ★ 2026-10-17（P15-㉝）：长 prompt 单卡自动 prefill 分块（LINGXI_PREFILL_CHUNK，默认 2048，
+#    单卡逐位认证过）；split 下默认关（跨卡边界有确定性发散待查——256K 的前置 bug）。
+```
+
+### 铁律（血的教训，别破）
+
+1. **`机械盘`（6T 机械盘）单块持续读写 ≤15 分钟**，必须切块 + 歇息。
+   **专家 arena 的 pin 按「介质」判定**（2026-10-16 起由代码硬判，见 §1.1）：
+   * arena 在 **RAM（tmpfs/ramfs）** ⇒ ✅ 允许且**默认整段 pin**（不设 `LINGXI_ARENA_PIN_GIB` 即整段）——
+     分开源会慢 28% 且 p50 掉到 8.8 tok/s；
+   * arena 在**机械盘**上 ⇒ ❌ **硬禁**（曾导致盘固件假死、整机重启、`/dev/shm` 全丢），
+     要显式 `LINGXI_ARENA_PIN_GIB=0` 才能起来；
+   * **只支持「整段或 0」**：给中间值（如 16）启动即报错——部分 pin 会崩
+     `CUDA_ERROR_INVALID_VALUE`（同一 mmap 部分注册，区间外源被拒）。
+2. **禁止删除任何文件**（无用户逐条确认）。
+3. 进程主权三规矩：杀进程后**进程名单 + 显卡显存双查**确认死透；远程杀进程用**方括号技巧**防自杀；
+   **一台机器同一时刻只准一个会话指挥显卡**。
+4. 忘掉 `LINGXI_EXPERT_ARENA` 会掉进 `MmapExpertSource` 回退路 —— 实测**慢 15\~20 倍**
+   （曾让 decode 变成 1.8 s/token，被我误判成"代码回归"）。现已**改为硬报错**，要用得显式
+   `LINGXI_ALLOW_MMAP_FALLBACK=1`。
+
+***
+
+## 3. 本会话已落地（都已提交推送，判据绿）
+
+| 改动                    | 收益                                   | 说明/提交                                                                                  |
+| --------------------- | ------------------------------------ | -------------------------------------------------------------------------------------- |
+| **cuBLAS 请出前向热路径**    | **t=2: 74.7→37.9 ms（−49%）**；t=8 −21% | `gemm_bf16_nt` 在 `n=2` 极窄 N 上选到病态内核（单层 50→500 µs）。改成自家瘦长核                              |
+| **W4 三档（稠密投影 + 输出头）** | 单流 **−10%**（p10 27.6→24.8 ms）        | 数值影响标尺（§3.48）证明**贪心序列逐位不变**才转正                                                         |
+| **W4 权重按张量名缓存**       | 启动 **40.1 → 4.4 s
+
+根据上述文档：当前单流 p10 约等于多少 ms/token？只回答数字。

@@ -1,0 +1,32 @@
+/target
+**/*.cubin
+**/*.ptx
+*.npz
+*.lingxi
+*.qart
+*.ninfer
+*.niner
+*.safetensors
+*.expert-arena*.bin
+*.ple-table*.bin
+__pycache__/
+artifacts/
+.probe
+.env
+
+# 构建产物（make build 负责 cp 到 bin/ 供容器内运行）
+bin/
+
+# 部署运行时（pid / 日志）
+/run/
+*.log
+*.log.gz
+# 已归档的实测日志是公开证据，不受上面的通配影响
+!docs/bench-logs/*.log.gz
+
+# 本地实验草稿（tmp/ 下已入库的设计文档除外，见 git ls-files tmp/）
+/tmp/
+
+# 真实流量累计的专家频次表（运行时生成，不入库）
+docs/bench-logs/hist_live*.csv
+

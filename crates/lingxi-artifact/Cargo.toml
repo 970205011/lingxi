@@ -1,0 +1,11 @@
+[package]
+name = "lingxi-artifact"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2 = "0.9"
+lingxi-ids.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "lingxi-driver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+cudarc.workspace = true
+lingxi-ids.workspace = true
+lingxi-kernels.workspace = true
+lingxi-model.workspace = true
