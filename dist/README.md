@@ -1,5 +1,8 @@
 # Prebuilt binary (Tesla V100 / sm_70)
 
+CI-built binaries are attached to GitHub Releases (built on Ubuntu 22.04, glibc 2.35).
+Prefer those over the binary committed here; the committed one was built on glibc 2.41.
+
 | Item | Value |
 |---|---|
 | File | `lingxi-bench-v0.1.0-linux-x86_64-sm70` |

@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to attach the binary to (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (release, sm_70 cubins)
+        env:
+          QE_NVCC: /usr/local/cuda/bin/nvcc
+          QE_CUDA_ARCH: sm_70
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          BIN="lingxi-bench-v${VERSION}-linux-x86_64-sm70"
+          mkdir -p out
+          cp target/release/lingxi-bench "out/${BIN}"
+          strip "out/${BIN}"
+          {
+            echo "lingxi-bench ${VERSION}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "rust: $(rustc --version)"
+            echo "nvcc: $(/usr/local/cuda/bin/nvcc --version | tail -2 | head -1)"
+            echo "glibc: $(ldd --version | head -1)"
+            echo "target: x86_64 Linux, NVIDIA sm_70 (V100)"
+            echo "note: all CUDA cubins are embedded; libcuda/libcublas/libnvrtc are loaded at runtime"
+            echo "note: model artifacts are not included"
+          } > out/BUILD-INFO.txt
+          (cd out && sha256sum "$BIN" > SHA256SUMS)
+          tar -czf "out/${BIN}.tar.gz" -C out "$BIN" BUILD-INFO.txt SHA256SUMS
+          ls -lh out
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lingxi-bench-sm70
+          path: out/*.tar.gz
+
+      - name: Create or update GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: out/*.tar.gz
+          generate_release_notes: true
