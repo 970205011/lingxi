@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lingxi 灵犀 · V100 专用 Qwen3-Next 推理引擎</title>
+<style>
+  :root{
+    --bg:#080a10; --panel:#111725; --panel2:#0d1220; --line:#223049;
+    --txt:#e8eef8; --dim:#9fb0c9; --dim2:#6f819c;
+    --blue:#4f8cff; --orange:#ff9f43; --green:#3ddc97; --red:#ff5d7a;
+    --violet:#8b7cff; --warn:#ffcf5c;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; color:var(--txt); background:
+      radial-gradient(1100px 500px at 15% -10%, #12203a 0%, transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, #1b1630 0%, transparent 55%),
+      linear-gradient(180deg,#070910,#0a0d14 40%,#080a10);
+    font:15px/1.75 -apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:1120px;margin:0 auto;padding:44px 24px 90px}
+  .eyebrow{color:var(--blue);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+           letter-spacing:.16em;text-transform:uppercase}
+  h1{font-size:44px;line-height:1.15;margin:10px 0 8px;letter-spacing:-.02em}
+  h1 span{color:var(--dim);font-weight:400;font-size:26px;margin-left:8px}
+  .lede{font-size:17px;color:var(--dim);max-width:820px;margin:0 0 18px}
+  .lede b{color:var(--txt);font-weight:600}
+  .links{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 30px}
+  .links a{color:var(--txt);text-decoration:none;border:1px solid var(--line);
+           background:var(--panel2);padding:7px 12px;border-radius:999px;font-size:13px}
+  .links a:hover{border-color:var(--blue);color:#fff}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:26px 0 42px}
+  .stat{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
+        border-radius:14px;padding:18px 18px 14px}
+  .stat .k{font-size:28px;font-weight:700;letter-spacing:-.02em}
+  .stat .k small{font-size:13px;color:var(--dim);font-weight:400;margin-left:4px}
+  .stat .l{color:var(--dim);font-size:13px;margin-top:3px}
+  .stat.blue .k{color:var(--blue)} .stat.orange .k{color:var(--orange)}
+  .stat.green .k{color:var(--green)} .stat.violet .k{color:var(--violet)}
+  section{margin:54px 0}
+  h2{font-size:22px;margin:0 0 14px;padding-left:12px;border-left:4px solid var(--blue)}
+  h3{font-size:16px;margin:22px 0 8px;color:var(--txt)}
+  p{color:var(--dim)}
+  p b,li b{color:var(--txt);font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin:16px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+  .card .tag{font:11px/1 ui-monospace,Menlo,monospace;color:var(--blue);letter-spacing:.08em}
+  .card h4{margin:9px 0 6px;font-size:15px}
+  .card p{margin:0;font-size:13.5px;color:var(--dim)}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;
+        background:var(--panel2);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{color:var(--dim);font-weight:600;background:#0e1524}
+  tr:last-child td{border-bottom:0}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;
+       background:#0a1120;border:1px solid var(--line);padding:1px 5px;border-radius:6px;color:#cfe0ff}
+  pre{background:#070b14;border:1px solid var(--line);border-radius:12px;padding:16px;
+      overflow:auto;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#d8e6ff}
+  .note{border-left:3px solid var(--warn);background:#171408;padding:12px 14px;border-radius:0 10px 10px 0;
+        color:#e8d9a8;font-size:13.5px;margin:16px 0}
+  .good{border-left-color:var(--green);background:#0a1813;color:#b9f0d6}
+  .bad{border-left-color:var(--red);background:#1a0d12;color:#ffc3cf}
+  .bar{height:10px;border-radius:999px;background:#0a1120;border:1px solid var(--line);overflow:hidden;margin:6px 0 14px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--violet))}
+  .bar.g i{background:linear-gradient(90deg,var(--green),#1fa97a)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.two{grid-template-columns:1fr} h1{font-size:34px}}
+  .foot{color:var(--dim2);font-size:12.5px;border-top:1px solid var(--line);margin-top:60px;padding-top:18px}
+  .foot a{color:var(--dim);text-decoration:none}
+  .kbd{font:12px ui-monospace,Menlo,monospace;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">NVIDIA sm_70 · Tesla V100 · Qwen3-Next</div>
+  <h1>lingxi <span>灵犀</span></h1>
+  <p class="lede">
+    一个只为 <b>V100</b> 写的 Qwen3-Next 推理引擎。48 层、512 专家、每 token 激活 10 个，
+    在两张 32G 老卡上做到 <b>可交互</b>：单流 43 tok/s，MTP 投机约 64 tok/s，
+    256K 上下文可用，Apache-2.0 开源。
+  </p>
+  <div class="links">
+    <a href="https://github.com/970205011/lingxi">GitHub</a>
+    <a href="../README.md">README（中文）</a>
+    <a href="../README.en.md">README (English)</a>
+    <a href="FORMAT.md">产物格式</a>
+    <a href="decode-speed-profile.md">性能档案</a>
+  </div>
+</header>
+
+<section class="stats">
+  <div class="stat blue"><div class="k">43 <small>tok/s</small></div><div class="l">单流 decode（p10，双卡）</div></div>
+  <div class="stat orange"><div class="k">≈64 <small>tok/s</small></div><div class="l">MTP 投机（kd=5, min_p=0.7）</div></div>
+  <div class="stat green"><div class="k">256K</div><div class="l">上下文；前缀命中 TTFT 0.00s</div></div>
+  <div class="stat violet"><div class="k">83</div><div class="l">手写 CUDA 核（sm_70）</div></div>
+</section>
+
+<section>
+  <h2>为什么会有 lingxi</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="tag">HARDWARE</div>
+      <h4>V100 被主流栈留在 sm_80 门外</h4>
+      <p>没有 bf16 张量核、没有 FP4；int4 dp4a 在 Volta 上跑不过 4 路 FP32 FMA。
+      vLLM / TRT-LLM / FlashInfer / DeepGEMM 的底线都已是 sm_80。</p>
+    </div>
+    <div class="card">
+      <div class="tag">MODEL</div>
+      <h4>Qwen3-Next 不是上一代架构</h4>
+      <p>GDN 线性递推 + 每 4 层一次稀疏全注意力 + 512 专家 MoE + 95 GiB 外置 PLE 表
+      + 自带 MTP 头。llama.cpp 支持仍在完善；strata 能跑，但不是 V100 专用调优。</p>
+    </div>
+    <div class="card">
+      <div class="tag">ECONOMICS</div>
+      <h4>专家权重是生死线</h4>
+      <p>24,576 个专家，Q4G64 全量 59.8 GiB；每 token 触达 480 个专家（1.25 GB）。
+      没有驻留与搬运体系，decode 会被 PCIe 拖死。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>我们做了什么</h2>
+  <div class="grid">
+    <div class="card"><div class="tag">EXPERTS</div><h4>Q4G64 arena + LRU 槽 + 钉表</h4>
+      <p>热专家离线按真实流量钉进显存，在线重钉；整段锁页把 p50 从 8.8 提到 34.3 tok/s。</p></div>
+    <div class="card"><div class="tag">MIX</div><h4>逐槽混档 + GPTQ 备选</h4>
+      <p>热 Q4 / 冷 Q3，arena 60.3 → 46.4 GiB（−23%），端到端计时与全 Q4 打平。</p></div>
+    <div class="card"><div class="tag">MTP</div><h4>概率闸门 + 重放两刀</h4>
+      <p>min_p=0.7 停链、砍 head 重放、prob1 廉价近似；17.0 → 约 64 tok/s，输出逐 token 不变。</p></div>
+    <div class="card"><div class="tag">LONG CTX</div><h4>注意力三刀 + PLE 进内存</h4>
+      <p>稀疏注意力只 gather 选中块；QSA 选块 O(n) 基数选择；FP8 PLE 表进 /dev/shm。</p></div>
+    <div class="card"><div class="tag">SERVE</div><h4>前缀缓存 + 并发会话</h4>
+      <p>精确 / 智能两档；多轮第二轮 28.1s → 0.35s（81×），原样重发 0.16s（177×）。</p></div>
+    <div class="card"><div class="tag">VERIFY</div><h4>T1 / T2 / T3 + 4 gates</h4>
+      <p>每 kernel 对 torch、逐层 golden、端到端贪心逐位；任何重构 gates 全绿才合入。</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>显存账：每一 GiB 去哪了</h2>
+  <p>下面不是“总量减 arena”的反推，而是 <code>lingxi-bench vram-budget</code> 按 catalog
+  逐张量、按 arena 逐个 blob 格式算出来的；不加载权重，也不分配显存。</p>
+  <table>
+    <thead><tr><th>项</th><th>GPU0（layers 0–23 + emb/head）</th><th>GPU1（layers 24–47）</th></tr></thead>
+    <tbody>
+      <tr><td>设备总量</td><td class="num">31.7 GiB</td><td class="num">31.7 GiB</td></tr>
+      <tr><td>非专家权重</td><td class="num">5.8</td><td class="num">3.4</td></tr>
+      <tr><td>KV（32K 窗口）</td><td class="num">0.43</td><td class="num">0.43</td></tr>
+      <tr><td>GDN 状态</td><td class="num">0.05</td><td class="num">0.05</td></tr>
+      <tr><td>预留给 scratch / 图 / 投机</td><td class="num">3.0</td><td class="num">2.4</td></tr>
+      <tr><td>驱动 / 碎片边距</td><td class="num">1.0</td><td class="num">1.0</td></tr>
+      <tr><td><b>可给专家槽</b></td><td class="num"><b>21.4</b></td><td class="num"><b>24.4</b></td></tr>
+      <tr><td>Q4 槽 / Q3 槽</td><td class="num">1536 + 9,887</td><td class="num">1536 + 10,752</td></tr>
+      <tr><td>专家驻留</td><td class="num">11,423 / 12,288（差 865 个冷专家）</td><td class="num"><b>12,288 / 12,288（全部）</b></td></tr>
+    </tbody>
+  </table>
+  <div class="two">
+    <div>
+      <h3>GPU0 专家覆盖</h3>
+      <div class="bar"><i style="width:92.96%"></i></div>
+      <div class="kbd">11,423 / 12,288 · 92.96%</div>
+    </div>
+    <div>
+      <h3>GPU1 专家覆盖</h3>
+      <div class="bar g"><i style="width:100%"></i></div>
+      <div class="kbd">12,288 / 12,288 · 100%</div>
+    </div>
+  </div>
+  <div class="note good">
+    <b>全专家上卡是可能的。</b> GPU1 已经全驻留；GPU0 只差 865 个冷专家（1.58 GiB）。
+    把 32K KV 放 host 省 0.43 GiB，再把预留/边距收紧约 1.2 GiB，或把一部分热 Q4 降为 Q3，
+    GPU0 也能全驻留。旧 autotune 按 Q4 blob 估算所有槽，少算了约 2,300–2,500 槽/卡；
+    现在按每个 blob 的真实 Q4/Q3 格式算。
+  </div>
+</section>
+
+<section>
+  <h2>KV 为什么不必一直全在显存</h2>
+  <p><code>LINGXI_QSA_PAGED=1</code> 已经实现了块表 + host 锁页块池 + LRU 下沉/预取：
+  设备只保留 <code>LINGXI_QSA_WIN_TOKENS</code>（默认 32K）的常驻窗口，其余 KV 在 host。
+  短上下文时 KV 本来只有 0.43 GiB/卡，省不出多少；256K 时逻辑 KV 是 3.5 GiB/卡，
+  paging 能省约 3.1 GiB/卡，正好补专家槽。</p>
+  <table>
+    <thead><tr><th>上下文</th><th>逻辑 KV / 卡</th><th>设备常驻窗口</th><th>省下的显存</th></tr></thead>
+    <tbody>
+      <tr><td>32K</td><td class="num">0.43 GiB</td><td class="num">0.43 GiB（全量）</td><td class="num">0</td></tr>
+      <tr><td>256K</td><td class="num">3.5 GiB</td><td class="num">0.43 GiB（32K 窗口）</td><td class="num">≈3.1 GiB</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    代价不是零：稀疏注意力每个 token 仍要从 host 取选中的 KV 块，需要预取/重叠。
+    strata 的 <code>--kv-resident 32768</code> 是同一思路，长上下文实测速度基本不降；
+    前提是块池在锁页内存、预取能盖住 PCIe。
+  </div>
+</section>
+
+<section>
+  <h2>和 strata 的真实差距</h2>
+  <table>
+    <thead><tr><th>口径</th><th>strata</th><th>lingxi</th></tr></thead>
+    <tbody>
+      <tr><td>V100 decode（典型）</td><td>IQ3_XXS 单卡 54–72 tok/s</td><td>双卡 Q4 稳态 54.1</td></tr>
+      <tr><td>V100 decode（峰值）</td><td>200.8（调优峰值；A/B 中位 104.5）</td><td>—</td></tr>
+      <tr><td>V100 prefill（32K）</td><td><b>1,200–1,600 tok/s</b></td><td>33K 冷 prefill 278.7 s ≈ <b>118 tok/s</b></td></tr>
+      <tr><td>量化</td><td>IQ3_S 82.8 GB（~3.4 bit）</td><td>Q4 / Q3 混档（~4.5 bit）</td></tr>
+      <tr><td>专家搬运</td><td>2-bit 档几乎全驻留</td><td>Q4 混档仍有约 20% 要搬</td></tr>
+    </tbody>
+  </table>
+  <p><b>结论：</b>200 是峰值，不是 V100 日常；decode 我们与 strata 单卡 IQ3_XXS 同档。
+  真正差 10 倍的是 <b>prefill</b>：他们用 FP16 张量核做 prompt attention（本地复测
+  int8 KV、32K、2048 queries：FP32 25.7 ms → 张量核 12.5 ms，2.06×）和 grouped expert GEMM。
+  下一版第一优先级就是把这个补上。</p>
+</section>
+
+<section>
+  <h2>快速开始</h2>
+<pre>make build
+./start.sh
+./start.sh ./bin/lingxi-bench serve &lt;产物.lingxi 或 .ninfer&gt; 11434
+
+# 只看显存账，不加载权重
+./bin/lingxi-bench vram-budget &lt;artifact&gt; &lt;arena&gt; 24 32768
+
+curl http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"lingxi","messages":[{"role":"user","content":"The capital of France is"}]}'</pre>
+  <p>产物约 253 GB，不入库；从 HF checkpoint 重建见 <code>tools/convert/hf2lingxi.py</code>。
+  运行参数全部是环境变量，登记在 <code>crates/lingxi-model/src/probes.rs</code>。</p>
+</section>
+
+<div class="foot">
+  lingxi 灵犀 · Apache-2.0 ·
+  <a href="https://github.com/970205011/lingxi">github.com/970205011/lingxi</a><br>
+  数据来源：README、docs/decode-speed-profile.md、docs/FORMAT.md、本地 V100 实测。
+</div>
+
+</div>
+</body>
+</html>
