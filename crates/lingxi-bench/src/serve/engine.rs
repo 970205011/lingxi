@@ -104,6 +104,7 @@ pub fn run(
 ) -> Result<()> {
     let listener =
         TcpListener::bind(("0.0.0.0", port)).with_context(|| format!("[serve] 绑定 :{port} 失败"))?;
+    crate::serve::stats::init();
     // R2 检查点统一（2026-10-21）：paged 的不变量在启动期打响亮——dev 检查点已禁用
     // （save/restore 两头都有栅栏），前缀缓存一律落 Disk 档。
     if lingxi_model::flag("LINGXI_QSA_PAGED") {
@@ -256,6 +257,18 @@ fn handle(
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, "application/json", br#"{"ok":true}"#),
+        ("GET", "/stats") => respond(
+            &mut stream,
+            200,
+            "application/json",
+            crate::serve::stats::json().as_bytes(),
+        ),
+        ("GET", "/dashboard") => respond(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            crate::serve::stats::dashboard().as_bytes(),
+        ),
         ("GET", "/v1/models") => respond(
             &mut stream,
             200,
@@ -540,6 +553,15 @@ fn chat(
             Some(g) => (g.rounds, g.accepted, g.verified, g.disabled),
             None => (0, 0, 0, false),
         };
+        crate::serve::stats::record(
+            seq.ids.len().saturating_sub(prompt_tokens),
+            t_gen.elapsed().as_secs_f64(),
+            restored > 0,
+            eh,
+            em,
+            sr as u64,
+            sa as u64,
+        );
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -966,6 +988,18 @@ fn conn_loop_inner(
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, "application/json", br#"{"ok":true}"#),
+        ("GET", "/stats") => respond(
+            &mut stream,
+            200,
+            "application/json",
+            crate::serve::stats::json().as_bytes(),
+        ),
+        ("GET", "/dashboard") => respond(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            crate::serve::stats::dashboard().as_bytes(),
+        ),
         ("GET", "/v1/models") => respond(
             &mut stream, 200, "application/json",
             br#"{"object":"list","data":[{"id":"lingxi","object":"model","created":0,"owned_by":"lingxi"}]}"#,
@@ -1048,6 +1082,7 @@ struct Gen {
     hit_src: &'static str,
     cur: i64,
     n: usize,
+    t_start: std::time::Instant,
     detok: Detok,
     split: StreamSplitter,
     stop: StopFilter,
@@ -1198,6 +1233,15 @@ fn finish_gen(
     {
         let (eh, em, eu) = crate::arena_source::expert_track_finish();
         let (psink, ppref) = lingxi_model::qsa::paged_stats();
+        crate::serve::stats::record(
+            g.n,
+            g.t_start.elapsed().as_secs_f64(),
+            g.restored > 0,
+            eh,
+            em,
+            0,
+            0,
+        );
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1373,6 +1417,7 @@ fn setup_gen(
         hit_src,
         cur: first,
         n: 0,
+        t_start: std::time::Instant::now(),
         detok: Detok::new(),
         split: StreamSplitter::new(cfg.enable_thinking),
         stop: StopFilter::new(stops),

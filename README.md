@@ -80,6 +80,18 @@ curl http://127.0.0.1:11434/v1/chat/completions -H 'Content-Type: application/js
 `tools/convert/hf2lingxi.py`。全部运行参数是环境变量，登记在
 `crates/lingxi-model/src/probes.rs`。
 
+## 监控面板
+
+serve 自带一个零依赖的只读面板，不需要额外服务：
+
+```text
+http://127.0.0.1:11434/dashboard
+```
+
+它每 2 秒拉一次 `/stats`，显示平均/最近 tok/s、请求数、前缀命中率、专家缓存命中率、
+投机接受率、累计 token、运行时长，以及每张卡的显存占用和利用率。面板和 `/stats` 只读计数
+与硬件状态，**不包含 prompt 或输出内容**；生产环境可以只暴露 `/health`，不暴露面板。
+
 ## 项目结构
 
 ```

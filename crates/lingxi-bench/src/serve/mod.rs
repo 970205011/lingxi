@@ -9,6 +9,7 @@ pub(crate) mod cache;
 pub(crate) mod engine;
 pub(crate) mod proto;
 pub(crate) mod sessions;
+pub(crate) mod stats;
 
 pub use engine::{run, ServeOpts};
 

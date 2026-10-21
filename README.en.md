@@ -90,6 +90,19 @@ Artifacts (about 253 GB) are not checked in; specify the path with `LINGXI_ARTIF
 argument. Rebuilding from an HF checkpoint: `tools/convert/hf2lingxi.py`. All runtime parameters
 are environment variables registered in `crates/lingxi-model/src/probes.rs`.
 
+## Monitoring dashboard
+
+serve ships a zero-dependency, read-only dashboard:
+
+```text
+http://127.0.0.1:11434/dashboard
+```
+
+It polls `/stats` every 2 seconds and shows average/last tok/s, request count, prefix-cache hit
+rate, expert-cache hit rate, speculative acceptance, generated tokens, uptime, and per-GPU VRAM
+and utilization. The dashboard and `/stats` expose counters and hardware state only — **never
+prompts or output content**. In production you can expose only `/health` if you prefer.
+
 ## Project structure
 
 ```

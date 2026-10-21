@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>lingxi · live</title>
+<style>
+  :root{--bg:#080b12;--panel:#111827;--line:#22314a;--txt:#e7eef9;--dim:#8fa2bd;
+        --blue:#4f8cff;--green:#3ddc97;--orange:#ffb454;--violet:#a78bfa;--red:#ff5d7a}
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(900px 420px at 10% -10%,#13223d 0,transparent 60%),var(--bg);
+       color:var(--txt);font:14px/1.5 -apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif}
+  .wrap{max-width:1100px;margin:0 auto;padding:28px 20px 60px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  h1{font-size:22px;margin:0;letter-spacing:.02em}
+  h1 b{color:var(--blue)}
+  .sub{color:var(--dim);font:12px ui-monospace,Menlo,monospace}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);
+       box-shadow:0 0 8px var(--green);margin-right:6px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:22px 0}
+  .card{background:linear-gradient(180deg,var(--panel),#0d1421);border:1px solid var(--line);
+        border-radius:14px;padding:15px 16px}
+  .k{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .k small{font-size:12px;color:var(--dim);font-weight:400;margin-left:4px}
+  .l{color:var(--dim);font-size:12px;margin-top:3px}
+  .blue .k{color:var(--blue)} .green .k{color:var(--green)} .orange .k{color:var(--orange)}
+  .violet .k{color:var(--violet)}
+  h2{font-size:15px;color:var(--dim);font-weight:600;margin:28px 0 10px;letter-spacing:.04em}
+  .gpu{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:10px 0}
+  .gpu .top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+  .gpu .name{font-weight:600}
+  .gpu .num{color:var(--dim);font:12px ui-monospace,Menlo,monospace}
+  .bar{height:9px;border-radius:99px;background:#0a1120;border:1px solid var(--line);overflow:hidden;margin:10px 0 6px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--violet))}
+  .bar.util i{background:linear-gradient(90deg,var(--green),#19a974)}
+  .row{display:flex;gap:18px;color:var(--dim);font:12px ui-monospace,Menlo,monospace}
+  .foot{color:#5f718c;font-size:12px;margin-top:34px;border-top:1px solid var(--line);padding-top:14px}
+  a{color:var(--dim);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><b>lingxi</b> · live</h1>
+    <div class="sub"><span class="dot"></span><span id="state">connecting…</span></div>
+  </header>
+
+  <div class="grid">
+    <div class="card blue"><div class="k" id="avg">—<small>tok/s</small></div><div class="l">平均生成速度</div></div>
+    <div class="card green"><div class="k" id="last">—<small>tok/s</small></div><div class="l">最近一次请求</div></div>
+    <div class="card orange"><div class="k" id="reqs">—</div><div class="l">累计请求</div></div>
+    <div class="card violet"><div class="k" id="prefix">—<small>%</small></div><div class="l">前缀缓存命中</div></div>
+    <div class="card"><div class="k" id="expert">—<small>%</small></div><div class="l">专家缓存命中</div></div>
+    <div class="card"><div class="k" id="spec">—<small>%</small></div><div class="l">投机接受率</div></div>
+    <div class="card"><div class="k" id="tokens">—</div><div class="l">累计生成 token</div></div>
+    <div class="card"><div class="k" id="uptime">—</div><div class="l">运行时长</div></div>
+  </div>
+
+  <h2>GPU</h2>
+  <div id="gpus"></div>
+
+  <div class="foot">
+    只读计数与硬件状态，不含 prompt / 输出内容。
+    · <a href="/health">/health</a>
+    · <a href="/stats">/stats</a>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => (n ?? 0).toLocaleString();
+const dur = s => {
+  s = Math.max(0, s|0);
+  const h = (s/3600)|0, m = ((s%3600)/60)|0, x = s%60;
+  return h ? `${h}h ${m}m` : (m ? `${m}m ${x}s` : `${x}s`);
+};
+async function tick(){
+  try {
+    const r = await fetch('/stats', {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const s = await r.json();
+    $('state').textContent = 'live · ' + new Date().toLocaleTimeString();
+    $('avg').innerHTML = `${s.avg_tok_s ?? 0}<small>tok/s</small>`;
+    $('last').innerHTML = `${s.last_tok_s ?? 0}<small>tok/s</small>`;
+    $('reqs').textContent = fmt(s.requests);
+    $('prefix').innerHTML = `${s.prefix_hit_pct ?? 0}<small>%</small>`;
+    $('expert').innerHTML = `${s.expert_hit_pct ?? 0}<small>%</small>`;
+    $('spec').innerHTML = `${s.spec_accept_pct ?? 0}<small>%</small>`;
+    $('tokens').textContent = fmt(s.gen_tokens);
+    $('uptime').textContent = dur(s.uptime_secs);
+    const box = $('gpus');
+    box.innerHTML = '';
+    for (const g of (s.gpus || [])) {
+      const used = g.used_mib / 1024, total = g.total_mib / 1024;
+      const pct = total ? Math.min(100, used / total * 100) : 0;
+      const el = document.createElement('div');
+      el.className = 'gpu';
+      el.innerHTML = `<div class="top"><div class="name">GPU ${g.index} · ${g.name}</div>
+        <div class="num">${used.toFixed(1)} / ${total.toFixed(1)} GiB</div></div>
+        <div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
+        <div class="row"><span>util ${g.util_pct}%</span><span>mem ${pct.toFixed(1)}%</span></div>`;
+      box.appendChild(el);
+    }
+    if (!box.children.length) box.innerHTML = '<div class="gpu">nvidia-smi 不可用</div>';
+  } catch (e) {
+    $('state').textContent = 'offline · ' + e.message;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
