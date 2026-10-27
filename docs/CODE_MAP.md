@@ -13,12 +13,11 @@
 | `lingxi-kernels` | CUDA C++ → cubin + cudarc launch；唯一允许 unsafe 的地方 | ids |
 | `lingxi-model` | 前向、模型静态描述、角色推导、开关注册表 | ids, artifact, plan, kernels |
 | `lingxi-driver` | slot 池、准入、decode 循环、MTP、KV 预算 | model |
-| `lingxi-server` | HTTP/SSE、分词 | ids |
-| `lingxi-bench` | CLI、压测、golden 对拍、serve 引擎 | 全部 |
+| `lingxi-bench` | CLI、压测、golden 对拍、serve 引擎（HTTP/SSE + 监视面板，生产路径） | 全部 |
 
-## 2. 需要拆的热点
+## 2. 拆分热点（✅ 全部完成 2026-10-22——以下为原始立项记录，目标模块名以实际落地方案为准）
 
-| 文件 | 行数 | 问题 | 拆到 |
+| 文件 | 行数 | 问题 | 原拟拆到 |
 |---|---:|---|---|
 | `crates/lingxi-bench/src/main.rs` | 6261 | 所有子命令、talk/serve 装配、自动调优、MTP 探针挤在一个文件 | `cli/` + `cmd/*` |
 | `crates/lingxi-bench/src/arena_source.rs` | 1991 | 槽缓存、混档、预热/钉表、DMA/pin 混在一起 | `arena/{source,slot,prewarm,mix,pin}.rs` |
@@ -29,14 +28,18 @@
 
 ## 3. 分阶段
 
-### Phase 1 — CLI 骨架（先做）
+### Phase 1 — CLI 骨架（✅ 完成 2026-10-22，刀1/2a/2b/2c 四提交）
 
 1. `crates/lingxi-bench/src/vram.rs`：把 `autotune_arena_slots` 和 `vram-budget` 子命令搬出
-   `main.rs`；`main.rs` 只保留 dispatch。
-2. `crates/lingxi-bench/src/cli/`：`mod.rs` 负责解析；`cmd/verify.rs`、`cmd/bytes.rs`、
-   `cmd/vram.rs`、`cmd/talk.rs`、`cmd/serve_cmd.rs`、`cmd/mtp.rs` 各自一个入口函数。
-3. 验收：`cargo build --release`；`vram-budget` 输出与搬迁前逐字节一致；
-   `make regress` / `make gates` 全绿。
+   `main.rs`；`main.rs` 只保留 dispatch。 ✅
+2. `crates/lingxi-bench/src/cli/`：`mod.rs` 负责声明；`cmd/verify.rs`、`cmd/bytes.rs`、
+   `cmd/vram.rs`、`cmd/talk.rs`、`cmd/serve_cmd.rs`、`cmd/mtp.rs` 各自一个入口函数；
+   共享装配助手（flash_next_meta/layer_shape/load_endpoints/load_rope_tables/
+   build_layer/DeviceLayerCache/StreamingProvider/MmapExpertSource）集中在
+   `cli/common.rs`。 ✅
+3. 验收：`cargo build --release` 零警告；`vram-budget` 输出与搬迁前逐字节一致；
+   `make regress` / `make gates` 全绿；mtp-load 机械化冒烟跑通。 ✅
+   **成果：main.rs 6261 → 3060 行（−51%），全程只搬家不改行为。**
 
 ### Phase 2 — arena
 

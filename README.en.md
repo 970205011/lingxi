@@ -21,12 +21,14 @@ comes from a configuration that passed the bit-level criteria.
 | Scenario | Result |
 |---|---|
 | Single-stream decode (dual GPU, p10) | **43 tok/s** (23.2 ms/token) |
-| Decode + MTP (kd=5, min_p=0.7) | **about 64 tok/s** |
+| Decode + MTP (**kd=7**, min_p=0.7; English 200 tok) | **96 tok/s** (4.08 accepted/round, 39 rounds, round p50 58 ms) |
+| Same, code prompt 128 tok / Chinese prompt 128 tok | **85** / **62 tok/s** (Chinese acceptance 1.47/round; adaptive kd=7→3 + wall-clock cutoff) |
 | Dual-GPU layer split (real Chinese corpus vs single GPU) | 20.7 → **54.1 tok/s** (+161%) |
-| serve, short prompt, speculative | **89 tok/s** |
+| serve, short prompt, speculative | **89 tok/s** (cold); warm/multi-turn requests also get spec via budget routing (57-tok prompt + 200 tok: 3.2s wall ≈ 58 tok/s, vs 36 pure AR before) |
 | 875-token prefix + speculation | **38.4 vs 29.9 tok/s** |
 | 256K context decode + MTP | **59.1 tok/s** |
 | First token (4.2K prompt, dual-GPU threaded) | **28.7 s** (sequential 46.2 s) |
+| 4167-token prefill (default path) | **~10 s** (~425 tok/s; GPU busy ≈40%, remainder is structural dual-GPU waiting, see docs/BENCH.md) |
 | 23.7K-token cold prefill | 143.2 s (6.03 ms/token) |
 | 33K-token cold prefill (tuned) | 278.7 s (−17.3%) |
 | 256K-token cold prefill | 3436.9 s (57.3 min), peak 31.9/27.3 GiB, no OOM |
@@ -36,6 +38,12 @@ comes from a configuration that passed the bit-level criteria.
 Single-stream 200 tok/s is physically unreachable on V100: each token moves about 4.6 GB, and the
 900 GB/s peak gives a 196 tok/s theoretical floor at 100% bandwidth efficiency. Beyond that only
 concurrency (aggregating bandwidth) or a smaller model helps.
+
+**bf16 quality mode**: the default production tier uses Q4 weights (best VRAM). For maximum
+quality, `LINGXI_DENSE_Q4=0 LINGXI_DENSE_Q4_QSA=0 LINGXI_HEAD_Q4=0 ./start.sh ...` switches to
+full bf16 weights; VRAM footprint is larger and spec speed stays on par with Q4 (~96 tok/s,
+4.08 accepted/round). In the bf16 tier, `LINGXI_PROJ_TC=1` optionally enables the tensor-core
+projection kernel (lossy, off by default; see docs/BENCH.md).
 
 ## Capabilities
 
@@ -73,6 +81,7 @@ host or tightening the reserve lets GPU0 hold everything too. At 256K, use
 
 ```bash
 make build        # requires rustc + nvcc / CUDA 12.8
+./bin/lingxi-bench doctor <artifact> [arena] [port]   # preflight: GPU/artifact/arena/libs/port
 ./start.sh        # production launcher
 ./start.sh ./bin/lingxi-bench serve <artifact.lingxi or .ninfer> 11434
 make regress      # end-to-end criteria
@@ -113,11 +122,10 @@ crates/
   lingxi-kernels    CUDA C++ → cubin (build.rs invokes nvcc) + cudarc
   lingxi-model      forward logic + static model description + tensor roles + switches
   lingxi-driver     slot pool · admission · decode loop · MTP · KV budget
-  lingxi-server     HTTP/SSE (OpenAI-compatible) · tokenization
-  lingxi-bench      artifact inspection · benchmarks · golden comparison · serve engine
+  lingxi-bench      artifact inspection · benchmarks · golden comparison · serve engine (HTTP/SSE OpenAI-compatible + monitoring dashboard; production path)
 ```
 
-Dependencies flow one way with no cycles (ids → artifact/plan/kernels → model → driver → server);
+Dependencies flow one way with no cycles (ids → artifact/plan/kernels → model → driver → bench);
 unsafe is allowed only in `lingxi-kernels`.
 
 ## Documentation
@@ -125,15 +133,8 @@ unsafe is allowed only in `lingxi-kernels`.
 - [docs/intro.html](docs/intro.html) — one-page introduction
 - [ARCHITECTURE.md](ARCHITECTURE.md) — architecture constraints and module boundaries
 - [docs/FORMAT.md](docs/FORMAT.md) — `.lingxi` / `.ninfer` container and numeric formats
-- [docs/decode-speed-profile.md](docs/decode-speed-profile.md) — performance profile and all measurements
-- [docs/speedup-audit.md](docs/speedup-audit.md) — optimization audit (including falsified ideas)
-- [docs/PLAN.md](docs/PLAN.md) / [docs/PLAN_NEXT.md](docs/PLAN_NEXT.md) — engineering decision record
-- [docs/strata-0.2.2-v100.md](docs/strata-0.2.2-v100.md) — same-machine Strata 0.2.2 comparison
-- [docs/CODE_MAP.md](docs/CODE_MAP.md) — module map and phased refactor plan
-- [docs/BACKLOG.md](docs/BACKLOG.md) — backlog and known issues
-- [docs/HANDOVER.md](docs/HANDOVER.md) — operations and troubleshooting
-- [docs/ASSETS.md](docs/ASSETS.md) — asset inventory and regeneration commands
-- [docs/bench-logs/](docs/bench-logs/) — key measurement logs
+- [docs/BENCH.md](docs/BENCH.md) — measured performance (final numbers and per-kernel time budget)
+- [docs/CODE_MAP.md](docs/CODE_MAP.md) — module map
 
 ## License
 

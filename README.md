@@ -20,12 +20,14 @@ MoE 模型，在 2×V100 32G 上跑到可交互速度：单流 **43 tok/s**，MT
 | 场景 | 结果 |
 |---|---|
 | 单流 decode（双卡，p10） | **43 tok/s**（23.2 ms/token） |
-| decode + MTP 投机（kd=5, min_p=0.7） | **约 64 tok/s** |
+| decode + MTP 投机（**kd=7**, min_p=0.7；英文列举 200 tok） | **96 tok/s**（接受 4.08/轮、39 轮、轮 p50 58 ms） |
+| 同上，代码提示 128 tok / 中文提示 128 tok | **85** / **62 tok/s**（中文接受 1.47/轮；自适应 kd=7→3 + 墙钟关闸） |
 | 双卡层间切分（真实中文语料 vs 单卡） | 20.7 → **54.1 tok/s**（+161%） |
-| serve 短 prompt 投机 | **89 tok/s** |
+| serve 短 prompt 投机 | **89 tok/s**（冷请求）；**warm/多轮请求按预算选路也走投机**（57tok prompt + 200tok：wall 3.2s ≈ 58 tok/s，此前纯 AR 只有 36） |
 | 875 token 前缀 + 投机 | **38.4 vs 29.9 tok/s** |
 | 256K 上下文 decode + MTP | **59.1 tok/s** |
 | 首 token（4.2K prompt，双卡线程版） | **28.7 s**（顺序 46.2 s） |
+| 4167 token prefill（默认路径） | **~10 s**（≈425 tok/s；GPU busy ≈40%，余量为双卡结构性互等，见 docs/BENCH.md） |
 | 23.7K token 冷 prefill | 143.2 s（6.03 ms/token） |
 | 33K token 冷 prefill（调优后） | 278.7 s（−17.3%） |
 | 256K token 冷 prefill | 3436.9 s（57.3 min），峰值 31.9/27.3 GiB，未 OOM |
@@ -34,6 +36,11 @@ MoE 模型，在 2×V100 32G 上跑到可交互速度：单流 **43 tok/s**，MT
 
 单流 200 tok/s 在 V100 上物理不可达：每 token 需搬约 4.6 GB，900 GB/s 峰值给出 196 tok/s
 的理论地板（要求 100% 带宽效率）。再往上只能靠多请求并发聚合带宽，或换更小的模型。
+
+**bf16 质量模式**：默认生产档是 Q4 权重（显存最优）。追求最高质量时可用
+`LINGXI_DENSE_Q4=0 LINGXI_DENSE_Q4_QSA=0 LINGXI_HEAD_Q4=0 ./start.sh ...` 切到全 bf16
+权重档；显存占用更大，spec 速度与 Q4 档基本持平（约 96 tok/s，接受 4.08/轮）。
+bf16 档下还可选 `LINGXI_PROJ_TC=1` 打开张量核投影（有损档，默认关，见 docs/BENCH.md）。
 
 ## 能力
 
@@ -63,6 +70,7 @@ MoE 模型，在 2×V100 32G 上跑到可交互速度：单流 **43 tok/s**，MT
 
 ```bash
 make build        # 需要 rustc + nvcc / CUDA 12.8
+./bin/lingxi-bench doctor <artifact> [arena] [port]   # 开箱预检：GPU/产物/arena/库/端口
 ./start.sh        # 生产启动器
 ./start.sh ./bin/lingxi-bench serve <产物.lingxi 或 .ninfer> 11434
 make regress      # 端到端判据
@@ -90,7 +98,8 @@ http://127.0.0.1:11434/dashboard
 
 它每 2 秒拉一次 `/stats`，显示平均/最近 tok/s、请求数、前缀命中率、专家缓存命中率、
 投机接受率、累计 token、运行时长，以及每张卡的显存占用和利用率。面板和 `/stats` 只读计数
-与硬件状态，**不包含 prompt 或输出内容**；生产环境可以只暴露 `/health`，不暴露面板。
+与硬件状态，**不包含 prompt 或输出内容**。生产环境若不想暴露，`LINGXI_NO_DASHBOARD=1`
+让两个路由直接 404（引擎照常服务，计数照记）；或者网络层只放行 `/health`。
 
 ## 项目结构
 
@@ -102,11 +111,10 @@ crates/
   lingxi-kernels    CUDA C++ → cubin（build.rs 调 nvcc）+ cudarc
   lingxi-model      前向逻辑 + 模型静态描述 + 张量角色 + 开关注册表
   lingxi-driver     slot 池 · 准入 · decode 循环 · MTP · KV 预算
-  lingxi-server     HTTP/SSE（OpenAI 兼容）· 分词
-  lingxi-bench      产物检查 · 压测 · golden 对拍 · serve 引擎
+  lingxi-bench      产物检查 · 压测 · golden 对拍 · serve 引擎（HTTP/SSE OpenAI 兼容 + 监视面板；生产路径）
 ```
 
-依赖方向单向无回环（ids → artifact/plan/kernels → model → driver → server），unsafe 只允许
+依赖方向单向无回环（ids → artifact/plan/kernels → model → driver → bench），unsafe 只允许
 出现在 `lingxi-kernels`。
 
 ## 文档
@@ -114,15 +122,8 @@ crates/
 - [docs/intro.html](docs/intro.html) — 一页简介
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 架构硬约束与模块边界
 - [docs/FORMAT.md](docs/FORMAT.md) — `.lingxi` / `.ninfer` 容器与数值格式
-- [docs/decode-speed-profile.md](docs/decode-speed-profile.md) — 性能剖面与全部实测
-- [docs/speedup-audit.md](docs/speedup-audit.md) — 优化项审计（含被证伪项）
-- [docs/PLAN.md](docs/PLAN.md) / [docs/PLAN_NEXT.md](docs/PLAN_NEXT.md) — 工程决策记录
-- [docs/strata-0.2.2-v100.md](docs/strata-0.2.2-v100.md) — 同机 Strata 0.2.2 对比实测
-- [docs/CODE_MAP.md](docs/CODE_MAP.md) — 模块地图与分阶段重构计划
-- [docs/BACKLOG.md](docs/BACKLOG.md) — 待办与已知问题
-- [docs/HANDOVER.md](docs/HANDOVER.md) — 运维与排障
-- [docs/ASSETS.md](docs/ASSETS.md) — 资产清单与再生命令
-- [docs/bench-logs/](docs/bench-logs/) — 关键实测日志
+- [docs/BENCH.md](docs/BENCH.md) — 性能实测（最终数字与内核层时间账）
+- [docs/CODE_MAP.md](docs/CODE_MAP.md) — 模块地图
 
 ## License
 

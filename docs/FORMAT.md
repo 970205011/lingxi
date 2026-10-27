@@ -3,7 +3,7 @@
 > 2026-10-19。目的：让**没有参与过本项目的人**能把一个新模型转换进来、并理解引擎消费的
 > 每一份二进制。所有公式均与代码逐字核对过（引用文件+行号）；发现与实现不符请以代码为准并改本文件。
 >
-> 读者画像：做模型转换的人读 §1–§4 + §7；改内核的人读 §3 + §5；排障的人读 §8。
+> 读者画像：做模型转换的人读 – + ；改内核的人读  + ；排障的人读 。
 
 ---
 
@@ -21,7 +21,7 @@
 - **打开时的硬校验**（`Artifact::open`，同文件 L206-255）：
   - `bytes` 必须严格等于 `lingxi_ids::try_encoded_size(format, layout, shape)`（不等即拒）；
   - 对象按 offset 单调不重叠、各自按 alignment 对齐、`offset+bytes ≤ payload 长`；
-  - format/layout 字符串必须在注册表内（§3 的两个枚举）。
+  - format/layout 字符串必须在注册表内（ 的两个枚举）。
 - Python 同款实现：`tools/convert/hf2lingxi.py` L64-L118（`NinferWriter` / `read_ninfer`）。
 
 ## 2. 张量命名规范（canonical 名字 → 角色）
@@ -119,12 +119,12 @@ GPU 契约 `dequant_ops.cu` 文件头 L1-7）。
 布局：`header | routed index [n_layers×n_experts × 16B] | shared index [n_layers × 16B]
 | pad → slot_align | data`。`ArenaBlobRef = {i64 offset(相对 data 起点), i32 bytes, i32 format}`；
 **offset < 0 = 该专家缺席**；format 码：0=BF16、1=Q4G64、2=Q5G64、3=Q6G64、4=W8G32
-（⇒ 同一 arena 允许按专家混精度——P1 之后引擎侧核已支持 Q4G64，混精度档见 PLAN_NEXT §6.2）。
+（⇒ 同一 arena 允许按专家混精度——P1 之后引擎侧核已支持 Q4G64，混精度档见 PLAN_NEXT ）。
 
 ### 单个 blob 内部
 
 - routed blob = `[gate_up][down]`：gate_up `[2×n_ff, n_in]`、down `[n_in, n_ff]`，
-  各按 §3 的 row-split-k128 布局排；**`gu_bytes + down_bytes == ref.bytes`**（校验强制）。
+  各按  的 row-split-k128 布局排；**`gu_bytes + down_bytes == ref.bytes`**（校验强制）。
 - 段几何（`matrix_layout`）：scale 平面偏移 = `align_up(base_bytes,256) [+ align_up(high,256)]`；
   本模型实测：gu [1280,2560] → payload 1,740,800 B；dn [2560,640] → 870,400 B；
   **routed blob = 2,611,200 B ≈ 2.49 MiB**。
@@ -173,12 +173,12 @@ GPU 契约 `dequant_ops.cu` 文件头 L1-7）。
 逐字节兼容（`crates/lingxi-artifact/src/lib.rs` L3 复用铁律）。我们的主产物就是 ninfer-dev
 产线转换的，本引擎是它的兼容读取方——**继续用 NINFER 容器可以白嫖 ninfer 工具链的读取/校验**。
 
-ninfer 引擎读不了我们的产物，**不是容器问题，是内容层**：角色表只认本文 §2 的 qwen4 命名
+ninfer 引擎读不了我们的产物，**不是容器问题，是内容层**：角色表只认本文  的 qwen4 命名
 （`text/ple/*`、`gdn/*`、MTP 27 项）、wplus +1 约定、PLE 表寻址都是 lingxi 自己的约定。
 所以分层命名：
 
 - **容器**：NINFER v2（与上游互操作）；
-- **内容约定**："lingxi 模型目录约定"（= 本文 §2/§6/§7）。
+- **内容约定**："lingxi 模型目录约定"（= 本文 //）。
 - **文件后缀**：上游纯 ninfer 产物用 `.ninfer`；按 lingxi 内容约定生成/读取的产物用
   `.lingxi`。读取器按 magic 识别、不依赖后缀；`.lingxi` 只是让人和工具一眼知道
   "容器是 NINFER v2，内容是 lingxi 约定"。现有 253 GB 主产物沿用 `.ninfer` 名字，

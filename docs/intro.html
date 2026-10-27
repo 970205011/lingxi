@@ -89,7 +89,7 @@
     <a href="../README.md">README（中文）</a>
     <a href="../README.en.md">README (English)</a>
     <a href="FORMAT.md">产物格式</a>
-    <a href="decode-speed-profile.md">性能档案</a>
+    <a href="">性能档案</a>
   </div>
 </header>
 
@@ -217,7 +217,7 @@
   2.06×）和 grouped expert GEMM；它的 IQ3_XXS 也让专家 100% 驻留。lingxi 下一版的第一优先级
   就是 prefill 张量核，而不是继续在 32G 上抠 decode 的几个毫秒。</p>
   <p class="kbd">协议：temperature 0、max_tokens 128、流式；strata 的 reasoning_content 计入输出；
-  两引擎量化不同，不是 bit 级横比。完整记录见 <a href="strata-0.2.2-v100.md">strata-0.2.2-v100.md</a>。</p>
+  两引擎量化不同，不是 bit 级横比。</p>
   <p class="kbd">补充：用 Strata 文档里的 v2 生产参数（SM70_TABLE、spec-min-p 0.80、mtp-hnorm stream 等）
   复跑，4K/14K 冷 prefill 可压到 <b>3.6 s / 8.3 s</b>，decode 64–92；200 tok/s 峰值在本机未复现。</p>
 </section>
@@ -241,7 +241,7 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 <div class="foot">
   lingxi 灵犀 · Apache-2.0 ·
   <a href="https://github.com/970205011/lingxi">github.com/970205011/lingxi</a><br>
-  数据来源：README、docs/decode-speed-profile.md、docs/FORMAT.md、本地 V100 实测。
+  数据来源：README、、docs/FORMAT.md、本地 V100 实测。
 </div>
 
 </div>
