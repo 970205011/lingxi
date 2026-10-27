@@ -2919,6 +2919,10 @@ fn run() -> Result<()> {
                 tables1: None,
                 experts1: None,
                 ep: None,
+                twopass_hi_on0: None,
+                twopass_lo_on1: None,
+                twopass_rmoe_hi1: None,
+                twopass_rmoe_lo0: None,
             };
 
             println!("driver prefill：{n_layers} 层流式（机械盘约 20 分钟）…");

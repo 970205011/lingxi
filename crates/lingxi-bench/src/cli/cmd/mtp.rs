@@ -437,6 +437,11 @@ pub fn accept(args: &[String]) -> Result<()> {
         tables1: ls_tables.as_ref(),
         experts1: ls_experts.as_deref(),
         ep: ep_ctx.as_ref(),
+        // two-pass 镜像只接在 talk 路径（mtp 的 prefill 走既有编排）
+        twopass_hi_on0: None,
+        twopass_lo_on1: None,
+        twopass_rmoe_hi1: None,
+        twopass_rmoe_lo0: None,
     };
     let hc_for_build: Option<Arc<crate::host_cache::HostCache>> = Some(host_cache.clone());
     let build = {

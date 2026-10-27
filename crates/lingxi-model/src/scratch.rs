@@ -516,6 +516,91 @@ pub fn cross_copy(
     cross_copy_staged(k_from, src, k_to, dst, 0)
 }
 
+// ───────────── 跨卡裸指针状态搬运（路线 A two-pass 的层状态交接）─────────────
+//
+// `cross_copy*` 只收 bf16 的 `CudaSlice`；two-pass 交接要拷**任意设备缓冲的任意区间**
+// （bf16 的 kn/v/rk/pooled 行区间 + f32 的 s_all）⇒ 这里走裸 `CUdeviceptr`。
+// 同一 PCIe 路径，单独一组每卡锁页 staging（按 f32 计长，4 字节粒度）。
+#[derive(Default)]
+struct XferSideRaw {
+    ctx: usize,
+    pin: Option<cudarc::driver::PinnedHostSlice<f32>>,
+}
+
+thread_local! {
+    static XFER_RAW: RefCell<[XferSideRaw; 2]> =
+        RefCell::new([XferSideRaw::default(), XferSideRaw::default()]);
+}
+
+/// **跨卡裸指针字节搬运**（全同步：D2H(源卡流序) + 源卡 sync + host 交叉 +
+/// H2D(目标卡流序) + 目标卡 sync）。`src`/`dst` 是**字节地址**（`CUdeviceptr`）。
+/// 逐位性：全程纯字节拷贝，不经任何运算 ⇒ 位精确（逐位条件 ①）。
+/// 为什么不异步化：交接是 48 层 × 数 MiB 的串行小拷贝（合计 ~150 MiB，PCIe ~11 GB/s
+/// ⇒ 约 20 ms），逐发同步的开销（每次 ~20 µs）合计 ~2 ms，不值得复杂化。
+pub fn cross_copy_raw(
+    k_from: &Kernels,
+    src: u64,
+    k_to: &Kernels,
+    dst: u64,
+    bytes: usize,
+) -> Result<()> {
+    anyhow::ensure!(bytes % 4 == 0, "跨卡裸拷贝要求 4 字节对齐（实际 {bytes}）");
+    anyhow::ensure!(src != 0 && dst != 0, "跨卡裸拷贝遇到空指针");
+    let nf = bytes / 4;
+    XFER_RAW.with(|c| -> Result<()> {
+        let mut x = c.borrow_mut();
+        let key_of = |k: &Kernels| k.ctx.cu_ctx() as usize;
+        for k in [k_from, k_to] {
+            let key = key_of(k);
+            let i = match x.iter().position(|s| s.ctx == key) {
+                Some(i) => i,
+                None => x
+                    .iter_mut()
+                    .position(|s| s.ctx == 0)
+                    .ok_or_else(|| anyhow::anyhow!("跨卡 staging 只支持两张卡"))?,
+            };
+            let s = &mut x[i];
+            if s.ctx != key || s.pin.as_ref().map_or(true, |p| p.len() < nf) {
+                *s = XferSideRaw {
+                    ctx: key,
+                    pin: Some(unsafe { k.stream.context().alloc_pinned_with_flags::<f32>(nf, 0)? }),
+                };
+            }
+        }
+        let (a, b) = {
+            let ia = x.iter().position(|s| s.ctx == key_of(k_from)).unwrap();
+            let ib = x.iter().position(|s| s.ctx == key_of(k_to)).unwrap();
+            anyhow::ensure!(ia != ib, "跨卡裸拷贝的源/目标上下文相同");
+            let (lo, hi) = if ia < ib { (ia, ib) } else { (ib, ia) };
+            let (left, right) = x.split_at_mut(hi);
+            if ia < ib {
+                (&mut left[lo], &mut right[0])
+            } else {
+                (&mut right[0], &mut left[lo])
+            }
+        };
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async::<f32>(
+                &mut a.pin.as_mut().unwrap().as_mut_slice()?[..nf],
+                src,
+                k_from.stream.cu_stream(),
+            )?;
+        }
+        k_from.stream.synchronize()?;
+        b.pin.as_mut().unwrap().as_mut_slice()?[..nf]
+            .copy_from_slice(&a.pin.as_ref().unwrap().as_slice()?[..nf]);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async::<f32>(
+                dst,
+                &b.pin.as_ref().unwrap().as_slice()?[..nf],
+                k_to.stream.cu_stream(),
+            )?;
+        }
+        k_to.stream.synchronize()?;
+        Ok(())
+    })
+}
+
 /// **一趟双向**跨卡交换：`src0`（在 `k0` 上）→ `dst1`（在 `k1` 上），
 /// `src1`（在 `k1` 上）→ `dst0`（在 `k0` 上）。
 ///

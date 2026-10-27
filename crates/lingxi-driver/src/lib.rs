@@ -108,6 +108,19 @@ pub struct Engine<'a> {
     /// 路由全量各算一份，专家按**均衡分配表**（[`EpCtx::expert_assign`]）分给两卡，
     /// 每层交换 MoE 部分和。`None` = 旧路径逐位不变。
     pub ep: Option<&'a EpCtx<'a>>,
+    /// **two-pass prefill**（`LINGXI_PREFILL_TWOPASS=1`）的双卡全层权重镜像：
+    /// GPU0 上 `[split_lo, n_layers)` 层的稠密权重（pass1 在 GPU0 跑全层时用；
+    /// 主缓存的这部分建在 GPU1 上）。`None` = 未配镜像（two-pass 开时会报错）。
+    pub twopass_hi_on0: Option<&'a dyn LayerCache>,
+    /// 同上镜像的另一边：GPU1 上 `[0, split_lo)` 层的稠密权重（pass2 在 GPU1 跑全层时用）。
+    pub twopass_lo_on1: Option<&'a dyn LayerCache>,
+    /// two-pass 的**跨卡 MoE 执行表**（GPU1 侧，层 `[split_lo, n_layers)`）：
+    /// pass1 在 GPU0 跑 hi 层时，把 MoE 远程回 GPU1 执行（那边的专家槽/钉表就是按
+    /// 这些层配置的，OFF 同口径 ⇒ 命中率与逐位性与默认路径一致）。只含
+    /// router/shared（sparse 下 routed 专家走 arena）。`None` = 未配（two-pass 报错）。
+    pub twopass_rmoe_hi1: Option<&'a [Option<lingxi_model::moe::MoeWeights>]>,
+    /// 同上反向：GPU0 侧 `[0, split_lo)` 层的远程 MoE 表（pass2 在 GPU1 跑 lo 层时用）。
+    pub twopass_rmoe_lo0: Option<&'a [Option<lingxi_model::moe::MoeWeights>]>,
 }
 
 /// EP 模式下第二张卡需要的全部句柄。

@@ -40,7 +40,28 @@ thread_local! {
 /// 默认**开启**（本轮已把三个真 bug 修完，48/192 token 输出与 baseline 逐位一致，实测 −4%）；
 /// `LINGXI_NO_GRAPHS=1` 可关。开关名从 `LINGXI_GRAPHS` 改成反向，避免"忘了设就没收益"。
 pub fn enabled() -> bool {
-    !FORCE_OFF.load(std::sync::atomic::Ordering::Relaxed) && !crate::flag("LINGXI_NO_GRAPHS")
+    !FORCE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+        && SCOPE_OFF.load(std::sync::atomic::Ordering::Relaxed) == 0
+        && !crate::flag("LINGXI_NO_GRAPHS")
+}
+
+/// **作用域禁用**计数（路线 A two-pass prefill 用）：同一线程先后在两卡上跑同一层
+/// （pass1 卡 A 录了 key=(层,t) 的图，pass2 卡 B 同 key 会命中 PHASE=2 直接**重放卡 A 的图**
+/// ——图缓存键不含设备）。two-pass 的两个 pass 全程持 guard ⇒ 一个键都不会录/重放，
+/// decode 期 guard 已 drop ⇒ 行为与现状逐字一致。
+static SCOPE_OFF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 取得一个**作用域图禁用**守卫（Drop 时恢复）。可嵌套。
+pub fn scoped_disable() -> GraphScopeGuard {
+    SCOPE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GraphScopeGuard
+}
+
+pub struct GraphScopeGuard;
+impl Drop for GraphScopeGuard {
+    fn drop(&mut self) {
+        SCOPE_OFF.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// ★ P15-㉜（2026-10-17）：双卡自动 layer-split 时**内部强制关图**（跨卡内核不能被

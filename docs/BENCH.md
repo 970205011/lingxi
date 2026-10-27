@@ -49,6 +49,15 @@ golden、T3 端到端贪心逐位一致，外加护栏 gates），优化前后�
 - bf16 质量模式（`LINGXI_DENSE_Q4=0 LINGXI_DENSE_Q4_QSA=0 LINGXI_HEAD_Q4=0`）：
   权重全 bf16，质量最高、显存占用更大；spec 约 96 tok/s 与 Q4 档持平（接受 4.08）。
 - `LINGXI_ROUTE_OPT=1`：路由 pair 乐观发射——**负结果留档**，默认关。
+- `LINGXI_PREFILL_TWOPASS=1`：路线 A two-pass 双卡并行 prefill——段切分 + 末态
+  f32 字节交接的数值判决（t28 集成测试，72 组组合含零态/随机态、变 decay、
+  多种 split）两段式 vs 单段式 **逐位全绿（0 bit 不同）**；生产集成默认关，
+  需双卡 layer-split 且不与 EP 同开。GPU busy≈40% 的结构性余量即其动机。
+
+另外 2026-10-27 起量化/投影/路由 BIG 等开关全部改为**值感知语义**
+（`flag_val`：未设 = 引擎默认，`=0` 真关）——此前"存在即真"语义下
+`export LINGXI_X=0` 反而是开，曾导致 A/B 两边实际同档的误判；start.sh
+相应不再无条件 export 这些开关。
 
 ## 显存（生产 Q4 档，实测）
 

@@ -4,6 +4,7 @@
 use anyhow::{bail, Result};
 use cudarc::driver::CudaSlice;
 use half::bf16;
+use std::sync::atomic::AtomicU64;
 use lingxi_kernels::Kernels;
 use lingxi_model::layer::{AttnState, AttnWeights, LayerEnv, LayerShape, LayerStates};
 use lingxi_model::trunk::LoadedLayer;
@@ -30,6 +31,10 @@ pub struct Sequence {
     states_ep: Option<Vec<LayerStates>>,
     hidden: usize,
     dim: usize,
+    /// 建局时的 QSA KV 容量上限（`new*` 的 `cap` 参数）。two-pass 的影子状态要按同口径建。
+    cap: usize,
+    /// PLE 层配置 `(层号, conv_kernel, dilation)`（无 PLE = None）。two-pass 影子状态复用。
+    ple_cfg: Option<(u32, usize, usize)>,
 }
 
 /// `LINGXI_GDN_DUMP_S=1`：提交完一层后，把该层 GDN 的 `s_all`/`k_hist` **头两三个值**打到 stderr。
@@ -309,6 +314,8 @@ impl Sequence {
             states_ep: None,
             hidden: shape.hidden,
             dim: shape.hc * shape.hidden,
+            cap,
+            ple_cfg: ple_layer,
         })
     }
 
@@ -341,6 +348,8 @@ impl Sequence {
             states_ep: Some(states_ep),
             hidden: shape.hidden,
             dim: shape.hc * shape.hidden,
+            cap,
+            ple_cfg: ple_layer,
         })
     }
 
@@ -937,6 +946,142 @@ fn run_layers_in_place(
     Ok(())
 }
 
+/// **two-pass 的单 pass 层循环**：在**一张卡** `k` 上跑全部 n 层的 `t` 个 token。
+///
+/// 与 [`run_layers_range_parts`] 的区别：层权重/状态按**层区间**从两个缓存、两个状态数组取
+/// （`lo_states` = 层 0..lo、`hi_states` = 层 lo..n），全部层跑在调用方指定的同一张卡上
+/// （`k`/`tab`/`experts` 显式传入，不走 `eng.k_of`）。每层的算子形状/内核/事件顺序与
+/// 默认路径逐字相同 ⇒ 只要状态交接逐位，整条 pass 就逐位。
+#[allow(clippy::too_many_arguments)]
+fn twopass_run_layers(
+    lo_states: &mut [LayerStates],
+    hi_states: &mut [LayerStates],
+    ids: &[i64],
+    k: &Kernels,
+    tab: &crate::RopeTables,
+    experts: Option<&dyn lingxi_model::moe::ExpertSource>,
+    // 本 pass 的跨卡 MoE：落在 `remote.layers` 内的层把 MoE 交给权重/专家的本命卡
+    // 执行（RemoteMoe 的 `k`/`experts`/`moe` 都是**执行卡**侧的句柄）。
+    remote: Option<&lingxi_model::moe::RemoteMoe>,
+    cache_lo: &dyn LayerCache,
+    cache_hi: &dyn LayerCache,
+    eng: &Engine,
+    lo: usize,
+    mut hyper: CudaSlice<bf16>,
+    t: usize,
+) -> Result<CudaSlice<bf16>> {
+    let n = lo + hi_states.len();
+    for i in 0..n {
+        let iu = i as u32;
+        let loaded: &LoadedLayer = if i < lo {
+            cache_lo.peek(iu).ok_or_else(|| anyhow::anyhow!("[twopass] 层 {i}（lo 半）未预热"))?
+        } else {
+            cache_hi.peek(iu).ok_or_else(|| anyhow::anyhow!("[twopass] 层 {i}（hi 半）未预热"))?
+        };
+        let env = LayerEnv {
+            cos: &tab.cos,
+            sin: &tab.sin,
+            cos_host: &tab.cos_host,
+            sin_host: &tab.sin_host,
+            remote,
+            causal_host: &[],
+            k_layernorm_host: &loaded.k_layernorm_host,
+            ids,
+            experts,
+        };
+        // 两个 pass 都走池化：池键自 P15-㉞ 起含设备号（scratch.rs 头部），跨卡安全。
+        // （既有 split 的 GPU1 侧禁池是 ㉞ 之前的历史遗留，BACKLOG 记载 A/B 开池无差异；
+        //   two-pass 下池化省掉每 (chunk,层) 的 cudaMalloc/free 风暴。）
+        let st = if i < lo {
+            &mut lo_states[i]
+        } else {
+            &mut hi_states[i - lo]
+        };
+        let next = lingxi_model::layer::layer_step(
+            k, &loaded.weights, eng.shape, &hyper, t, &env, st, iu,
+        )?;
+        lingxi_model::scratch::put_bf16(hyper);
+        hyper = next;
+    }
+    Ok(hyper)
+}
+
+/// **跨卡交接单层跨 token 状态**（逐位条件①：全程纯字节拷贝，不经任何运算）。
+/// 同层种类必须一致（GDN↔GDN、QSA↔QSA）；PLE 史两边都有才拷。
+/// 全部走 `cross_copy_raw`（裸指针区间拷贝）——`CudaSlice::slice` 返回的是 View，
+/// 类型化的 `cross_copy` 不收。
+fn twopass_xfer_states(
+    k_from: &Kernels,
+    k_to: &Kernels,
+    src: &LayerStates,
+    dst: &mut LayerStates,
+) -> Result<()> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let xf = |s: u64, d: u64, bytes: usize| -> Result<()> {
+        lingxi_model::scratch::cross_copy_raw(k_from, s, k_to, d, bytes)
+    };
+    match (&src.attn, &mut dst.attn) {
+        (AttnState::Gdn(g), AttnState::Gdn(d)) => {
+            let (sp, _g1) = g.s_all.device_ptr(&k_from.stream);
+            let (dp, _g2) = d.s_all.device_ptr_mut(&k_to.stream);
+            xf(sp, dp, g.s_all.len() * 4)?;
+            let (sp, _g1) = g.k_hist.device_ptr(&k_from.stream);
+            let (dp, _g2) = d.k_hist.device_ptr_mut(&k_to.stream);
+            xf(sp, dp, g.k_hist.len() * 2)?;
+            let (sp, _g1) = g.k_hist_next.device_ptr(&k_from.stream);
+            let (dp, _g2) = d.k_hist_next.device_ptr_mut(&k_to.stream);
+            xf(sp, dp, g.k_hist_next.len() * 2)?;
+        }
+        (AttnState::Qsa(q), AttnState::Qsa(d)) => {
+            let rows = q.len;
+            d.ensure_cap(k_to, rows)?;
+            let (kn_s, v_s) = match (&q.kn, &q.v) {
+                (Some(a), Some(b)) => (a, b),
+                _ => anyhow::bail!("[twopass] 交接遇到 K8V4 QSA 状态（应被调用方守卫拦下）"),
+            };
+            let kvd = q.kv_dim;
+            let idd = q.idx_head_dim;
+            // QSA KV 拼接 = 纯字节拷贝：目标前 rows 行 = 源的全部行（[A 半 ∥ B 半] 布局）。
+            {
+                let (sp, _g1) = kn_s.device_ptr(&k_from.stream);
+                let (dp, _g2) = d.kn.as_mut().unwrap().device_ptr_mut(&k_to.stream);
+                xf(sp, dp, rows * kvd * 2)?;
+            }
+            {
+                let (sp, _g1) = v_s.device_ptr(&k_from.stream);
+                let (dp, _g2) = d.v.as_mut().unwrap().device_ptr_mut(&k_to.stream);
+                xf(sp, dp, rows * kvd * 2)?;
+            }
+            {
+                let (sp, _g1) = q.rk_dev.device_ptr(&k_from.stream);
+                let (dp, _g2) = d.rk_dev.device_ptr_mut(&k_to.stream);
+                xf(sp, dp, rows * idd * 2)?;
+            }
+            {
+                let (sp, _g1) = q.pooled.device_ptr(&k_from.stream);
+                let (dp, _g2) = d.pooled.device_ptr_mut(&k_to.stream);
+                xf(sp, dp, q.nblocks * idd * 2)?;
+            }
+            d.len = rows;
+            d.nblocks = q.nblocks;
+        }
+        (a, b) => anyhow::bail!(
+            "[twopass] 层种类不匹配：源 {} vs 目标 {}",
+            matches!(a, AttnState::Gdn(_)),
+            matches!(b, AttnState::Gdn(_)),
+        ),
+    }
+    if let (Some(p), Some(pd)) = (&src.ple, &mut dst.ple) {
+        let (sp, _g1) = p.hist.device_ptr(&k_from.stream);
+        let (dp, _g2) = pd.hist.device_ptr_mut(&k_to.stream);
+        xf(sp, dp, p.hist.len() * 2)?;
+        let (sp, _g1) = p.hist_next.device_ptr(&k_from.stream);
+        let (dp, _g2) = pd.hist_next.device_ptr_mut(&k_to.stream);
+        xf(sp, dp, p.hist_next.len() * 2)?;
+    }
+    Ok(())
+}
+
     fn embed(&self, eng: &Engine, ids: &[i64]) -> Result<CudaSlice<bf16>> {
         let k = eng.k;
         let t = ids.len();
@@ -1138,6 +1283,17 @@ fn run_layers_in_place(
                 if split { 512usize.min(t) } else { 2048usize.min(t) }
             }
         }
+    }
+
+    /// two-pass 的**子块粒度**：固定 512（避开 chunk≥2048 的 OOM 前科；
+    /// 同时 512 对齐是「chunk 行组成与派发序列和默认路径逐字相同」这一逐位条件的前提）。
+    const TWOPASS_CHUNK: usize = 512;
+
+    /// **P4 two-pass 开关**（`LINGXI_PREFILL_TWOPASS`，默认**关**，见 [`Self::prefill_twopass`]）。
+    /// 值感知（flag_val）：`=0` 显式关与未设同效，避免"存在即真"陷阱。
+    fn twopass_enabled() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| lingxi_model::flag_val("LINGXI_PREFILL_TWOPASS", false))
     }
 
     /// **P3 layer-major prefill 开关**（`LINGXI_PREFILL_LM`，默认**关**）。
@@ -1499,6 +1655,31 @@ fn run_layers_in_place(
         if Self::layer_major_enabled() {
             return self.prefill_layer_major(eng, prompt, provider, start, collect, chunk);
         }
+        // ★ 路线 A two-pass 生产集成：token 区间切半的双卡并行 prefill。
+        //   切半点取 512 对齐 ⇒ 每个 chunk 的行组成与派发序列和默认路径**逐字相同**，
+        //   唯一区别是状态交接（GDN 末态 f32 字节拷贝 + QSA KV 纯字节拼接 + PLE 卷积史），
+        //   逐位三条件见 P4 实现说明。优先级高于 THREADS/PIPE（下面分支的预设条件都不变）。
+        if Self::twopass_enabled() {
+            anyhow::ensure!(
+                eng.split_active() && eng.ep.is_none(),
+                "LINGXI_PREFILL_TWOPASS=1 需要双卡 layer-split（且不与 LINGXI_EP 同开）"
+            );
+            anyhow::ensure!(
+                start == 0,
+                "LINGXI_PREFILL_TWOPASS 暂不支持前缀续跑（prefill_append）"
+            );
+            anyhow::ensure!(!collect, "LINGXI_PREFILL_TWOPASS 暂不支持 prefill_with_hyper（collect）");
+            // 短 prompt 走默认路径（两半都摊不到一个 512 chunk 就没意义）。
+            if prompt.len() >= 2 * Self::TWOPASS_CHUNK {
+                let tok = self.prefill_twopass(eng, prompt, provider)?;
+                return Ok((tok, None));
+            }
+            eprintln!(
+                "[twopass] prompt={} < {} ⇒ 回退默认路径",
+                prompt.len(),
+                2 * Self::TWOPASS_CHUNK
+            );
+        }
         let mut hyper = None;
         // `collect` 时的整段 hyper（`[prompt.len, dim]`，主卡）
         let mut all: Option<CudaSlice<bf16>> = None;
@@ -1774,6 +1955,259 @@ fn run_layers_in_place(
         } else {
             Ok((token, None))
         }
+    }
+
+    /// **P4：路线 A two-pass**（`LINGXI_PREFILL_TWOPASS=1`，数值判决见 t28 集成测试）。
+    ///
+    /// 结构（保守两段式；层间流水精化留后续）：
+    /// ```text
+    /// pass 1   卡 A(GPU0) 独占：跑前半 [0, half) 的**全部** 48 层（512 子块，chunk 行组成
+    ///          与默认路径逐字相同）⇒ 每层末态 = GDN s_all/k_hist + QSA KV[0..half) + PLE 史
+    /// 交接     逐层纯字节拷贝 GPU0→GPU1（f32 末态 + KV 拼接 + 卷积史；不经任何运算）
+    /// pass 2   卡 B(GPU1)：以交接态为初值重跑后半 [half, T) 的全部 48 层
+    /// 归位     0..lo 层的最终态（在 GPU1 影子上）拷回 GPU0 的真身 ⇒ decode 续跑状态逐位不变
+    /// ```
+    ///
+    /// **逐位三条件如何满足**：
+    /// ① 交接全程 `cross_copy`/`cross_copy_f32` 纯字节拷贝（D2H+锁页+H2D），不经运算；
+    /// ② 切半点取 **512 对齐** ⇒ 两个 pass 的每个子块行组成与派发序列（t=512 的核分派、
+    ///    chunk 尾形状）与默认路径**逐字相同**，同内核同 env 派发天然成立；
+    /// ③ k̂/β/decay 只依赖本 token（t28 已证任意分段 0 bit）。
+    fn prefill_twopass(
+        &mut self,
+        eng: &Engine,
+        prompt: &[i64],
+        provider: &mut dyn LayerProvider,
+    ) -> Result<i64> {
+        let k0 = eng.k;
+        let k1 = eng.k1.expect("split_active ⇒ k1 存在");
+        let lo = eng.split_lo as usize;
+        let n = eng.n_layers as usize;
+        let dim = self.dim;
+        let chunk = Self::TWOPASS_CHUNK;
+        anyhow::ensure!(lo > 0 && lo < n, "[twopass] 需要 0 < split_lo({lo}) < {n}");
+        // 预热主缓存全部层（镜像缓存在 talk.rs 启动时已建好）。必须在 as_cache()
+        // 之前做（layer() 要 &mut，as_cache() 借 &）。
+        for i in 0..n {
+            let _ = provider.layer(i as u32)?;
+        }
+        let cache_main = provider
+            .as_cache()
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 需要缓存型 provider（DeviceLayerCache）"))?;
+        let hi_on0 = eng
+            .twopass_hi_on0
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 缺 GPU0 的 [split_lo, n) 层权重镜像（talk.rs 接线）"))?;
+        let lo_on1 = eng
+            .twopass_lo_on1
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 缺 GPU1 的 [0, split_lo) 层权重镜像（talk.rs 接线）"))?;
+        let tab1 = eng
+            .tables1
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 缺 GPU1 的 RoPE 表"))?;
+        // 跨卡 MoE 执行表 + 两卡专家源。关键决策：两个 pass 各自跑全 48 层，但
+        // **专家槽不按层全域重分**（那样每层槽容量减半 → LRU thrash，实测 prefill
+        // 37.1s vs OFF 9.6s）——非本命半场的层把 MoE 远程回权重/专家的本命卡执行
+        // （RemoteMoe；槽容量/直方图钉表与 OFF 完全一致，跨卡只过激活、字节拷贝）。
+        let rmoe_hi1 = eng
+            .twopass_rmoe_hi1
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 缺 GPU1 侧远程 MoE 表（talk.rs 接线）"))?;
+        let rmoe_lo0 = eng
+            .twopass_rmoe_lo0
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 缺 GPU0 侧远程 MoE 表（talk.rs 接线）"))?;
+        let experts0 = eng
+            .experts
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 需要 GPU0 专家源（sparse arena）"))?;
+        let experts1 = eng
+            .experts1
+            .ok_or_else(|| anyhow::anyhow!("[twopass] 需要 GPU1 专家源（sparse arena）"))?;
+        // 形状/路径守卫：只支持生产默认档（bf16 KV、非分页、非 host 选块）。
+        for s in &self.states {
+            if let AttnState::Qsa(q) = &s.attn {
+                anyhow::ensure!(!q.paged, "[twopass] 暂不支持 LINGXI_QSA_PAGED");
+                anyhow::ensure!(
+                    q.kn.is_some() && q.v.is_some(),
+                    "[twopass] 暂不支持 LINGXI_KV_K8V4"
+                );
+            }
+        }
+        anyhow::ensure!(
+            !lingxi_model::flag("LINGXI_QSA_HOST"),
+            "[twopass] 暂不支持 LINGXI_QSA_HOST（raw_keys_host 未交接）"
+        );
+        let half = (prompt.len() / 2 / chunk) * chunk;
+        anyhow::ensure!(
+            half >= chunk && half < prompt.len(),
+            "[twopass] 切半点异常：half={half}, T={}",
+            prompt.len()
+        );
+        // 作用域禁图：图缓存键不含设备，pass1(GPU0) 与 pass2(GPU1) 同层同 t 会撞键
+        // （pass1 录的图被 pass2 重放 = 跨卡重放别人的图）。guard 出作用域即恢复，
+        // decode 行为与默认路径逐字一致。
+        let _graph_guard = lingxi_model::graph::scoped_disable();
+
+        // ── 影子状态：本 pass 卡的「另一半层」状态 ─────────────────────────
+        // pass1(GPU0) 用 shadow_hi0 跑 lo..n；pass2(GPU1) 用 shadow_lo1 跑 0..lo。
+        // 真身 states[0..lo] 在 GPU0、states[lo..n] 在 GPU1（split 建局口径不变）。
+        let ple_of =
+            |i: usize| self.ple_cfg.and_then(|(idx, kk, d)| (idx as usize == i).then_some((kk, d)));
+        let mut shadow_hi0: Vec<LayerStates> = Vec::with_capacity(n - lo);
+        for i in lo..n {
+            shadow_hi0.push(LayerStates::for_kind(
+                k0,
+                lingxi_model::layer_kind(i as u32),
+                eng.shape,
+                self.cap,
+                ple_of(i),
+            )?);
+        }
+        let mut shadow_lo1: Vec<LayerStates> = Vec::with_capacity(lo);
+        for i in 0..lo {
+            shadow_lo1.push(LayerStates::for_kind(
+                k1,
+                lingxi_model::layer_kind(i as u32),
+                eng.shape,
+                self.cap,
+                ple_of(i),
+            )?);
+        }
+
+        // ── 跨卡 MoE 句柄 ────────────────────────────────────────────────
+        // pass1：hi 层（lo..n）的 MoE 交给 GPU1 执行；pass2：lo 层（0..lo）交给 GPU0。
+        // 执行侧（rm.k/experts/moe）全是专家的本命卡 ⇒ 与 OFF 同槽位口径逐位等价。
+        // （RemoteMoe 代码方向无关——cross_copy 双向通用——这里首次用于"反向"。）
+        let rm_stat1 = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        let rm_stat0 = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        let rm1 = lingxi_model::moe::RemoteMoe {
+            k: k1,
+            experts: experts1,
+            layers: lo as u32..n as u32,
+            moe: rmoe_hi1,
+            stat: &rm_stat1,
+        };
+        let rm0 = lingxi_model::moe::RemoteMoe {
+            k: k0,
+            experts: experts0,
+            layers: 0..lo as u32,
+            moe: rmoe_lo0,
+            stat: &rm_stat0,
+        };
+
+        // ── pass 1：GPU0 跑前半 [0, half) ────────────────────────────────
+        let t_p1 = std::time::Instant::now();
+        {
+            let mut off = 0usize;
+            while off < half {
+                let c = chunk.min(half - off);
+                self.ids.extend_from_slice(&prompt[off..off + c]);
+                let x = self.embed(eng, &prompt[off..off + c])?;
+                let h = Self::twopass_run_layers(
+                    &mut self.states[..lo],
+                    &mut shadow_hi0[..],
+                    &self.ids[..],
+                    k0,
+                    eng.tables,
+                    eng.experts,
+                    Some(&rm1),
+                    cache_main,
+                    hi_on0,
+                    eng,
+                    lo,
+                    x,
+                    c,
+                )?;
+                off += c;
+                lingxi_model::scratch::put_bf16(h);
+            }
+        }
+        k0.stream.synchronize()?;
+        eprintln!(
+            "[twopass] pass1 完成（GPU0 前半 {half} tok）：{:.2}s",
+            t_p1.elapsed().as_secs_f64()
+        );
+
+        // ── 交接：GPU0 → GPU1（逐层纯字节拷贝）────────────────────────────
+        let t_x = std::time::Instant::now();
+        for i in 0..n {
+            let (src, dst) = if i < lo {
+                (&self.states[i], &mut shadow_lo1[i])
+            } else {
+                (&shadow_hi0[i - lo], &mut self.states[i])
+            };
+            Self::twopass_xfer_states(k0, k1, src, dst)?;
+        }
+        eprintln!(
+            "[twopass] 交接完成（GDN 末态 + QSA KV + PLE 史，GPU0→GPU1）：{:.2}s",
+            t_x.elapsed().as_secs_f64()
+        );
+
+        // ── pass 2：GPU1 以后半程态重跑后半 [half, T) ─────────────────────
+        let t_p2 = std::time::Instant::now();
+        let mut hyper2: Option<CudaSlice<bf16>> = None;
+        let mut last_c = 0usize;
+        {
+            let mut off = half;
+            while off < prompt.len() {
+                let c = chunk.min(prompt.len() - off);
+                self.ids.extend_from_slice(&prompt[off..off + c]);
+                // embedding 表只在 GPU0：先在 GPU0 gather，再跨卡进 GPU1。
+                let x0 = self.embed(eng, &prompt[off..off + c])?;
+                let mut x1 = lingxi_model::scratch::bf16(k1, c * dim)?;
+                lingxi_model::scratch::cross_copy(k0, &x0, k1, &mut x1)?;
+                lingxi_model::scratch::put_bf16(x0);
+                let h = Self::twopass_run_layers(
+                    &mut shadow_lo1[..],
+                    &mut self.states[lo..],
+                    &self.ids[..],
+                    k1,
+                    tab1,
+                    eng.experts1,
+                    Some(&rm0),
+                    lo_on1,
+                    cache_main,
+                    eng,
+                    lo,
+                    x1,
+                    c,
+                )?;
+                off += c;
+                last_c = c;
+                hyper2 = Some(h);
+            }
+        }
+        eprintln!(
+            "[twopass] pass2 完成（GPU1 后半 {} tok）：{:.2}s",
+            prompt.len() - half,
+            t_p2.elapsed().as_secs_f64()
+        );
+
+        // ── 末态归位：GPU1 上 0..lo 的最终态 → GPU0 真身（decode 续跑用）────
+        let t_b = std::time::Instant::now();
+        for i in 0..lo {
+            let (src, dst) = (&shadow_lo1[i], &mut self.states[i]);
+            Self::twopass_xfer_states(k1, k0, src, dst)?;
+        }
+        eprintln!(
+            "[twopass] 归位完成（0..{lo} 层最终态 GPU1→GPU0）：{:.2}s",
+            t_b.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "[twopass] 远程 MoE：pass1→GPU1 {} 次/{:.0}ms（搬运 {:.0}ms）；pass2→GPU0 {} 次/{:.0}ms（搬运 {:.0}ms）",
+            rm_stat1[0].load(std::sync::atomic::Ordering::Relaxed),
+            rm_stat1[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3,
+            rm_stat1[2].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3,
+            rm_stat0[0].load(std::sync::atomic::Ordering::Relaxed),
+            rm_stat0[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3,
+            rm_stat0[2].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3,
+        );
+
+        // ── head：末 chunk hyper（GPU1）→ GPU0 → mixer + lm_head + argmax ──
+        let hyper2 = hyper2.expect("[twopass] pass2 没有产出 hyper");
+        let mut hb = lingxi_model::scratch::bf16(k0, last_c * dim)?;
+        lingxi_model::scratch::cross_copy(k1, &hyper2, k0, &mut hb)?;
+        lingxi_model::scratch::put_bf16(hyper2);
+        let token = self.head_argmax(eng, &hb, last_c)?;
+        lingxi_model::scratch::put_bf16(hb);
+        self.ids.push(token);
+        Ok(token)
     }
 
     /// decode 一步：用当前末尾 token 跑一层所有层，返回贪心出的下一 token

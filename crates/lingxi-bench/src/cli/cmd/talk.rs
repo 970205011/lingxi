@@ -108,15 +108,15 @@ pub fn run(args: &[String]) -> Result<()> {
     let tables = crate::cli::common::load_rope_tables(&k, rope_len, shape.attn.rot_dim)?;
 
     let n_layers = lingxi_model::DIMS.n_layers as u32;
-    // ★★ **全量 layer-split**。
-    // 这套接线必须建在 `Sequence` **之前**：`[lo, n_layers)` 的跨 token 状态
-    // （QSA KV/indexer、GDN 的 S+卷积史、PLE 史）要**直接建在 GPU1 上**，
-    // 建错卡不报错、只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串。
+    // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`）。
+    //    这套接线必须建在 `Sequence` **之前**：`[lo, n_layers)` 的跨 token 状态
+    //    （QSA KV/indexer、GDN 的 S+卷积史、PLE 史）要**直接建在 GPU1 上**，
+    //    建错卡不报错、只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串。
     let ls_arena_path = std::env::var("LINGXI_EXPERT_ARENA").ok();
     // ★★ **EP（专家并行，`LINGXI_EP=1`）**：两卡都跑全部 n_layers 层的稠密段，
-    // 专家按 id 二分（卡 0 < half，卡 1 ≥ half），每层交换 MoE 部分和。
-    // EP 与 layer-split **互斥**（都要求整层/半专家在本卡，混用会重复计算）。
-    // 跨卡 kernel 不能被 CUDA Graph 捕获 ⇒ 强制 `LINGXI_NO_GRAPHS=1`。
+    //    专家按 id 二分（卡 0 < half，卡 1 ≥ half），每层交换 MoE 部分和。
+    //    EP 与 layer-split **互斥**（都要求整层/半专家在本卡，混用会重复计算）。
+    //    跨卡 kernel 不能被 CUDA Graph 捕获 ⇒ 强制 `LINGXI_NO_GRAPHS=1`。
     let ep_on = std::env::var("LINGXI_EP").map(|v| v == "1").unwrap_or(false);
     if ep_on {
         std::env::set_var("LINGXI_NO_GRAPHS", "1");
@@ -134,10 +134,13 @@ pub fn run(args: &[String]) -> Result<()> {
         && ls_arena_path.is_some();
     let ls_lo: u32 = ls_env.unwrap_or(if auto_split { 24 } else { 0 });
     let ls_on = !ep_on && ls_lo > 0 && ls_lo < n_layers;
+    // ★ 路线 A two-pass（值感知）：token 区间切半的双卡并行 prefill。
+    //    需要双卡全层镜像（权重镜像缓存在 provider 建立后构建，见下）+ 双卡专家源全域服务。
+    let twopass_on = lingxi_model::flag_val("LINGXI_PREFILL_TWOPASS", false);
     if ls_on {
         if auto_split {
             // ㊸：单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
-            // 跨卡拷贝在层循环外不进图）。判据翻车则恢复 force_disable。
+            // 跨卡拷贝在层循环外不进图）。判据翻车则恢复 force_disable()。
             eprintln!(
                 "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%；\
                  设 LINGXI_LAYER_SPLIT=0 关闭）。单层本地图保持开启。"
@@ -160,7 +163,7 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
     // ★ EP：两卡各装**全部** 48 层稠密权重，显存比 layer-split 更紧 ⇒ 每卡槽数默认
-    // 8000（`LINGXI_EP_SLOTS` 可覆盖），不走 autotune（那是按半场层数算的）。
+    //   8000（`LINGXI_EP_SLOTS` 可覆盖），不走 autotune（那是按半场层数算的）。
     let ep_slots: usize = std::env::var("LINGXI_EP_SLOTS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -168,7 +171,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let ls_slots: usize = if ep_on {
         ep_slots
     } else {
-    match std::env::var("LINGXI_LAYER_SPLIT_SLOTS")
+    let base = match std::env::var("LINGXI_LAYER_SPLIT_SLOTS")
         .ok().and_then(|s| s.parse().ok())
     {
         Some(v) => v,
@@ -182,6 +185,14 @@ pub fn run(args: &[String]) -> Result<()> {
             },
             None => 9600,
         },
+    };
+    // two-pass：双卡镜像权重（~3.8GB/卡）+ 远程 MoE 表 + 影子状态共吃 ~4.5GB/卡，
+    // 20.8K 长 prompt 实测把 GPU1 顶到 32.5GB OOM。无显式覆盖时把槽位压到 9500
+    // （= 396/层 > 每层工作集 ~300 ⇒ PRELOAD_ALL 下命中率不变；数值不受影响：同权重字节）。
+    if twopass_on && std::env::var("LINGXI_LAYER_SPLIT_SLOTS").is_err() {
+        base.min(9500)
+    } else {
+        base
     }
     };  // ★㊲ 工作集≥槽位判决(375/卡层)
     let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
@@ -257,8 +268,8 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     // 瘦身专家源（sparse 时启用）：
-    // LINGXI_EXPERT_ARENA 给出 → arena 直读（只读 mmap + 整段 pin + DMA + 视图解量化）
-    // 否则 → 旧的 host LRU(mmap 视图) + device LRU 路径（对照/回退）
+    //   LINGXI_EXPERT_ARENA 给出 → arena 直读（只读 mmap + 整段 pin + DMA + 视图解量化）
+    //   否则 → 旧的 host LRU(mmap 视图) + device LRU 路径（对照/回退）
     let expert_source: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> = if sparse {
         let inter = meta["inter"].as_u64().unwrap() as usize;
         let hidden = meta["hidden"].as_u64().unwrap() as usize;
@@ -267,8 +278,8 @@ pub fn run(args: &[String]) -> Result<()> {
             let slots: usize = if ep_on {
                 ep_slots
             } else {
-                match std::env::var("LINGXI_ARENA_SLOTS")
-                    .ok().and_then(|s| s.parse().ok())
+                let base = match std::env::var("LINGXI_ARENA_SLOTS")
+                .ok().and_then(|s| s.parse().ok())
                 {
                     Some(v) => v,
                     None => match crate::vram::autotune_arena_slots(&art, &ap, 0, ls_lo, rope_len + 8)? {
@@ -278,6 +289,12 @@ pub fn run(args: &[String]) -> Result<()> {
                         }
                         None => 4000,
                     },
+                };
+                // two-pass：同 GPU1 的槽位压缩理由（镜像 + 远程 MoE 表的显存余量）。
+                if twopass_on && std::env::var("LINGXI_ARENA_SLOTS").is_err() {
+                    base.min(9500)
+                } else {
+                    base
                 }
             };
             Some(Box::new(crate::arena_source::ArenaExpertSource::new(
@@ -286,7 +303,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 slots,
                 false,
                 // ★ 全量 layer-split：GPU0 这份只服务 `0..ls_lo`（后一半层的槽位
-                // 全部留给 GPU1 那份，否则一半的槽白占）。
+                //   全部留给 GPU1 那份，否则一半的槽白占）。
+                // ★ two-pass 也保持这个口径：两个 pass 各自跑全 48 层时，落在
+                //   非本命半场的层 MoE 走 RemoteMoe 远程回**专家的本命卡**执行
+                //   （槽容量/直方图钉表与 OFF 完全一致，跨卡只过激活，逐位不变）。
                 if ls_on { 0..ls_lo } else { 0..u32::MAX },
             )?))
         } else {
@@ -317,8 +337,8 @@ pub fn run(args: &[String]) -> Result<()> {
         None
     };
     // ★ **EP**：GPU1 的稠密层缓存——**全部** n_layers 层，逐层 build 到 GPU1。
-    // 先预热（`peek` 只读，预热后 `run_layers_ep` 才能每层取到权重）；
-    // `build` 闭包来源与 card0 相同（同一产物、同一指标），只是目标设备不同。
+    //   先预热（`peek` 只读，预热后 `run_layers_ep` 才能每层取到权重）；
+    //   `build` 闭包来源与 card0 相同（同一产物、同一指标），只是目标设备不同。
     let mut ep_cache1: Option<crate::cli::common::DeviceLayerCache> = None;
     if ep_on {
         anyhow::ensure!(sparse, "LINGXI_EP=1 目前要求稀疏专家路径（LINGXI_SPARSE_EXPERTS≠0）");
@@ -352,8 +372,8 @@ pub fn run(args: &[String]) -> Result<()> {
         ep_cache1 = Some(c);
     }
     // ★ EP 专家分配表：**每层一张** `expert -> card`。按「专家槽字节 × 历史命中频次」
-    // 贪心均衡（Q4 热 2.6 MB / Q3 冷 1.92 MB），热专家自然交错到两卡。
-    // 只构建一次，卡0/卡1 读同一份切片 ⇒ 路由结果不会分叉。
+    //   贪心均衡（Q4 热 2.6 MB / Q3 冷 1.92 MB），热专家自然交错到两卡。
+    //   只构建一次，卡0/卡1 读同一份切片 ⇒ 路由结果不会分叉。
     let ep_assign: Option<Vec<u8>> = if ep_on {
         let src = expert_source.as_deref().expect("EP 必须有专家源");
         Some(lingxi_model::moe::build_ep_expert_assign(
@@ -386,6 +406,110 @@ pub fn run(args: &[String]) -> Result<()> {
              ╚══════════════════════════════════════════════════════════════════════╝"
         );
     }
+    // ★ two-pass：双卡全层权重镜像缓存——
+    //   pass1 在 GPU0 跑全部 48 层（主缓存的 [lo, n) 部分建在 GPU1 上，镜像一份到 GPU0），
+    //   pass2 在 GPU1 跑全部 48 层（主缓存的 [0, lo) 部分建在 GPU0 上，镜像一份到 GPU1）。
+    //   Q4 权重走内容寻址缓存（LINGXI_Q4_CACHE）⇒ 第二次构建基本是 H2D，字节与主缓存逐位相同。
+    let (mut twopass_hi0, mut twopass_lo1) = (None, None);
+    // 远程 MoE 执行表（下见构建处；生命周期要覆盖 eng ⇒ 在 eng 之前声明）。
+    let mut twopass_rmoe_hi1: Vec<Option<lingxi_model::moe::MoeWeights>> =
+        (0..n_layers as usize).map(|_| None).collect();
+    let mut twopass_rmoe_lo0: Vec<Option<lingxi_model::moe::MoeWeights>> =
+        (0..n_layers as usize).map(|_| None).collect();
+    if twopass_on {
+        anyhow::ensure!(ls_on, "LINGXI_PREFILL_TWOPASS=1 需要双卡 layer-split（自动或显式）");
+        anyhow::ensure!(sparse, "LINGXI_PREFILL_TWOPASS=1 需要 sparse 常驻层缓存");
+        let k1 = ls_k1.as_ref().expect("split");
+        let t_tp = std::time::Instant::now();
+        // GPU0 镜像：[ls_lo, n_layers) 层，build 目标卡恒为 k（GPU0）。
+        {
+            let (kb, ab, mb) = (&k, &art, &meta);
+            let hcb = host_cache.clone();
+            let mut c = crate::cli::common::DeviceLayerCache {
+                slots: (0..n_layers as usize).map(|_| None).collect(),
+                build: Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
+                    eprint!(
+                        "\r  [twopass-load] GPU0 镜像层 {layer}/{n_layers}  {:>6.1}s",
+                        t_tp.elapsed().as_secs_f64()
+                    );
+                    let b = crate::cli::common::build_layer(
+                        kb, ab, mb, layer, sparse, hcb.as_deref(),
+                    )?;
+                    Ok(lingxi_model::trunk::LoadedLayer {
+                        weights: b.weights,
+                        k_layernorm_host: b.k_layernorm_host,
+                    })
+                }),
+            };
+            for i in ls_lo..n_layers {
+                lingxi_driver::LayerProvider::layer(&mut c, i)?;
+            }
+            eprintln!(
+                "\r  [twopass-load] GPU0 镜像 [{}，{n_layers}) 层就绪（累计 {:.1}s）      ",
+                ls_lo,
+                t_tp.elapsed().as_secs_f64()
+            );
+            twopass_hi0 = Some(c);
+        }
+        // GPU1 镜像：[0, ls_lo) 层，build 目标卡恒为 k1。
+        {
+            let (ab, mb) = (&art, &meta);
+            let hcb = host_cache.clone();
+            let mut c = crate::cli::common::DeviceLayerCache {
+                slots: (0..n_layers as usize).map(|_| None).collect(),
+                build: Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
+                    eprint!(
+                        "\r  [twopass-load] GPU1 镜像层 {layer}/{ls_lo}  {:>6.1}s",
+                        t_tp.elapsed().as_secs_f64()
+                    );
+                    let b = crate::cli::common::build_layer(
+                        k1, ab, mb, layer, sparse, hcb.as_deref(),
+                    )?;
+                    Ok(lingxi_model::trunk::LoadedLayer {
+                        weights: b.weights,
+                        k_layernorm_host: b.k_layernorm_host,
+                    })
+                }),
+            };
+            for i in 0..ls_lo {
+                lingxi_driver::LayerProvider::layer(&mut c, i)?;
+            }
+            eprintln!(
+                "\r  [twopass-load] GPU1 镜像 [0，{ls_lo}) 层就绪（累计 {:.1}s）      ",
+                t_tp.elapsed().as_secs_f64()
+            );
+            twopass_lo1 = Some(c);
+        }
+        eprintln!("[twopass] 双卡镜像权重就绪：GPU0 hi {} 层 + GPU1 lo {} 层", n_layers - ls_lo, ls_lo);
+        // 跨卡 MoE 执行表（第二副本，~12 MB/层）：pass1 把 hi 层 MoE 远程到 GPU1、
+        // pass2 把 lo 层 MoE 远程到 GPU0。只装 router/shared（sparse 下 routed 专家
+        // 走 arena 本体）；与主缓存同一产物路径、同一上传函数 ⇒ 字节逐位同源。
+        let t_rm = std::time::Instant::now();
+        let up_moe = |kk: &lingxi_kernels::Kernels, l: u32| -> Result<lingxi_model::moe::MoeWeights> {
+            let canon = format!("text/layers/{l}/moe/");
+            Ok(lingxi_model::moe::MoeWeights {
+                router_shared_gate: lingxi_model::gpu::upload_any_bf16(
+                    kk, &art, &format!("{canon}router_shared_gate"))?,
+                routed_gate_up: None,
+                routed_down: None,
+                shared_gate_up: lingxi_model::gpu::upload_any_bf16(
+                    kk, &art, &format!("{canon}shared_gate_up"))?,
+                shared_down: lingxi_model::gpu::upload_any_bf16(
+                    kk, &art, &format!("{canon}shared_down"))?,
+            })
+        };
+        for l in ls_lo..n_layers {
+            twopass_rmoe_hi1[l as usize] = Some(up_moe(k1, l)?);
+        }
+        for l in 0..ls_lo {
+            twopass_rmoe_lo0[l as usize] = Some(up_moe(&k, l)?);
+        }
+        eprintln!(
+            "[twopass] 远程 MoE 表就绪（GPU1 hi {} 层 + GPU0 lo {} 层，{:.1}s）",
+            n_layers - ls_lo, ls_lo, t_rm.elapsed().as_secs_f64()
+        );
+    }
+
     let eng = lingxi_driver::Engine {
         k: &k,
         shape: &shape,
@@ -400,6 +524,10 @@ pub fn run(args: &[String]) -> Result<()> {
         tables1: ls_tables.as_ref(),
         experts1: ls_experts.as_deref(),
         ep: ep_ctx.as_ref(),
+        twopass_hi_on0: twopass_hi0.as_ref().map(|c| c as &dyn lingxi_driver::LayerCache),
+        twopass_lo_on1: twopass_lo1.as_ref().map(|c| c as &dyn lingxi_driver::LayerCache),
+        twopass_rmoe_hi1: if twopass_on { Some(twopass_rmoe_hi1.as_slice()) } else { None },
+        twopass_rmoe_lo0: if twopass_on { Some(twopass_rmoe_lo0.as_slice()) } else { None },
     };
 
     // dense 预读：立刻给预读线程喂前两层，之后每层回调里再喂下一层
@@ -457,18 +585,18 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     eprintln!("\nprefill 用时 {:.1}s，首 token = {first}", t0.elapsed().as_secs_f64());
 
-    // ══ 双会话相位重叠判决原型══
+    // ══ 双会话相位重叠判决原型（`LINGXI_TALK_SPEC_BATCH=1`）══
     //
     // 两个 host 线程各驱动一套 (Sequence, SpecRuntime)：重叠不靠调度器，靠的是
     // "每线程阻塞在自己那条 stream 的同步上" —— A.verify.hi 阻塞在 k1 期间，B 的
     // 草稿/verify.lo（k0）照常推进 ⇒ GPU1 的空转（一轮 ~12 ms）被第二会话填上。
     // 三个前置条件（本块强制或已落实）：
-    // 1. **CUDA Graph 全关**：捕获是线程本地的，两会话并发会把对方 kernel 捕进
-    // 自己的图 ⇒ 必须 force_disable。
-    // 2. **层全部预热**：线程里只能 peek（DeviceLayerCache 的 unsafe Sync 契约）。
-    // 3. **ArenaExpertSource 簿记串行化**（op_lock，arena_source/source.rs）：
-    // miss 的 victim/insert 是 host 裸可变；scratch 双缓冲的"隔层必同步"余量
-    // 是每线程路径内的论证（同一条 k0 FIFO + 每层路由同步），与并发无关。
+    //   1. **CUDA Graph 全关**：捕获是线程本地的，两会话并发会把对方 kernel 捕进
+    //      自己的图 ⇒ 必须 force_disable。
+    //   2. **层全部预热**：线程里只能 peek（DeviceLayerCache 的 unsafe Sync 契约）。
+    //   3. **ArenaExpertSource 簿记串行化**（op_lock，arena_source/source.rs）：
+    //      miss 的 victim/insert 是 host 裸可变；scratch 双缓冲的"隔层必同步"余量
+    //      是每线程路径内的论证（同一条 k0 FIFO + 每层路由同步），与并发无关。
     // 判据：①两会话各自 token 流与单会话逐位相同；②聚合 ≥ 1.3× 单流。
     if talk_spec && lingxi_model::flag("LINGXI_TALK_SPEC_BATCH") {
         anyhow::ensure!(
@@ -521,7 +649,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // ★ 反相位 PLL（`LINGXI_TALK_SPEC_PHASE=<Δ_ms>`，默认 36；0 = 关）：
         // A 自由跑（master），B（slave）的每轮锚在 **A 的实际轮起点 + Δ** —— A 快 B 跟、
         // A 慢 B 等，相位锁不滑。固定网格（v1）实测会滑出同步（轮长 40~90ms 不均，
-        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据（R/S）：
+        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据：
         // k0 是瓶颈卡（2×38.7ms/轮对），A 的 verify.hi（23.4ms 纯 k1）应与 B 的
         // 草稿+lo（33.4ms 纯 k0）对齐 ⇒ Δ ≈ A 的 pre-hi 段长。
         let offset_ns = std::env::var("LINGXI_TALK_SPEC_PHASE")
@@ -650,7 +778,7 @@ pub fn run(args: &[String]) -> Result<()> {
         if talk_spec {
             let mp = crate::cli::common::mtp_artifact_path();
             // 第二张卡（层切分的 GPU1）交给 SpecRuntime：草稿相位它整段空闲，
-            // 用来把 lm_head 按 vocab 行二分。
+            // 用来把 lm_head 按 vocab 行二分（`LINGXI_DRAFT_HEAD_SPLIT`）。
             let mut rt = crate::spec::SpecRuntime::load(
                 &k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len,
             )?;

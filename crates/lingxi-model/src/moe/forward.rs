@@ -102,10 +102,10 @@ pub fn sparse_moe_forward(
                 .ok_or_else(|| anyhow::anyhow!("MoE 跨卡：层 {layer} 的 GPU1 权重缺失"))?;
             let t0 = std::time::Instant::now();
             // ⚠️ cudarc 的错误是**粘在上下文上**的（`record_err` 只是存进 `error_state`，
-            // 要等**下一次** `bind_to_thread` 才吐出来）⇒ 跨卡路径上"报错的位置"常常不是
-            // "出错的位置"（实测：真凶在前面，却在几步之后的 `scratch::upload_i32` 才炸）。
-            // ⇒ 每个阶段后主动 `check_err`（它取走并清空错误），把报错点钉回真凶。
-            // 每次只一个原子 swap，开销可忽略。
+            //    要等**下一次** `bind_to_thread` 才吐出来）⇒ 跨卡路径上"报错的位置"常常不是
+            //    "出错的位置"（实测：真凶在前面，却在几步之后的 `scratch::upload_i32` 才炸）。
+            //    ⇒ 每个阶段后主动 `check_err`（它取走并清空错误），把报错点钉回真凶。
+            //    每次只一个原子 swap，开销可忽略。
             let chk = |tag: &str| -> Result<()> {
                 rm.k
                     .ctx
@@ -114,27 +114,27 @@ pub fn sparse_moe_forward(
             };
             chk("enter")?;
             // ── 两块跨卡缓冲的分配 ──
-            // ⚠️ 必须走 `without_pool`：scratch 池的键只有 (类型, 长度)、**没有设备**，
-            // 直接 `scratch::bf16(rm.k, …)` 会拿到一块 GPU0 的缓冲（实测 ILLEGAL_ADDRESS）。
-            let mut x1 = crate::scratch::without_pool(|| crate::scratch::bf16(rm.k, x.len()))?;
-            let mut out =
-                crate::scratch::without_pool(|| crate::scratch::bf16(k, rows * hidden))?;
+            // 池键自 P15-㉞ 起为 (设备号, 长度)（scratch.rs 头部说明），两张卡各用各的
+            // 桶 ⇒ 这里**池化**分配是跨卡安全的（旧注释"键无设备"已过时；without_pool
+            // 会让每次远程调用都退化成 cudaMalloc/free 风暴）。用完显式 put 回池复用。
+            let mut x1 = crate::scratch::bf16(rm.k, x.len())?;
+            let mut out = crate::scratch::bf16(k, rows * hidden)?;
             let rt0 = std::time::Instant::now();
             // 输入激活 → GPU1（走**两张卡各自的锁页 staging**，不再是可分页 Vec）
             crate::scratch::cross_copy(k, x, rm.k, &mut x1)?;
             let rt1 = std::time::Instant::now();
             chk("激活上传")?;
             // 在 GPU1 上原样重跑（权重/专家源都换成 GPU1 的；`remote=None` 防递归）
-            let mo1 = crate::scratch::without_pool(|| {
-                sparse_moe_forward(
-                    rm.k, w1, &x1, rows, hidden, num_experts, top_k, inter, debug_dir, layer,
-                    Some(rm.experts), None, None,
-                )
-            })?;
+            let mo1 = sparse_moe_forward(
+                rm.k, w1, &x1, rows, hidden, num_experts, top_k, inter, debug_dir, layer,
+                Some(rm.experts), None, None,
+            )?;
+            crate::scratch::put_bf16(x1);
             let rt2 = std::time::Instant::now();
             chk("MoE 计算")?;
             // 输出 → GPU0
             crate::scratch::cross_copy(rm.k, &mo1.out, k, &mut out)?;
+            crate::scratch::put_bf16(mo1.out);
             chk("激活回传")?;
             {
                 // 诊断字段（`shared`/`expert_out`）在跨卡路径下是**占位**：需要它们就别开 MOE_SPLIT。
@@ -176,9 +176,9 @@ pub fn sparse_moe_forward(
     // `gemm_skinny_row_bf16`/`gemm_skinny_m8` 逐字相同，swiglu/scale 的舍入点显式保留
     // （见 `moe_ops.cu` 两核头注）。
     // 只对 `2 ≤ rows ≤ 64` 生效：
-    // * rows == 1 走 GEMV（累加次序不同，必须原样）；
-    // * rows > 64 时旧路会切到 `gemm_bf16_mlarge`（有损档、k 升序串行累加，见 `proj_t1`），
-    // 与这里的 skinny 归约次序不同 ⇒ 为了**任何输入都逐位不变**，那一档保持旧路。
+    //  * rows == 1 走 GEMV（累加次序不同，必须原样）；
+    //  * rows > 64 时旧路会切到 `gemm_bf16_mlarge`（有损档、k 升序串行累加，见 `proj_t1`），
+    //    与这里的 skinny 归约次序不同 ⇒ 为了**任何输入都逐位不变**，那一档保持旧路。
     // `hidden < 1024 / hidden % 8 != 0 / LINGXI_NO_SKINNY_ROW` 时旧路也不走 skinny_row；
     // `LINGXI_F32X_PROJ` 是既有诊断档（它会改走 f32x 核），让它优先、融合让位。
     let fuse_shared = (2..=64).contains(&rows)
@@ -215,7 +215,7 @@ pub fn sparse_moe_forward(
         k.swiglu_bf16(&act_full, &mut act, rows, inter)?;
         scratch::put_bf16(act_full);
         // ⚠️ shared_down 的输入是 **act**（swiglu 输出），不是 MoE 入口 x ——
-        // 这里保持 bf16 现转（P15-⑨ 第一轮实 bug：误传 xf 导致首 token 漂移）。
+        //    这里保持 bf16 现转（P15-⑨ 第一轮实 bug：误传 xf 导致首 token 漂移）。
         proj_t1(k, &act, &w.shared_down, &mut shared, hidden, inter, rows)?;
         crate::gpu::proj_f32x(k, &sg_row, xf, &mut sg, 1, hidden, rows, 2, 1.0, 1.0)?;
     } else {
@@ -365,10 +365,10 @@ pub fn sparse_moe_forward(
     // ── 取回 host：**零拷贝**路径（所有 rows）──
     // 让 GEMM/GEMV 直接把 logits 写进「映射到设备的锁页 host 内存」，host 侧只剩一次
     // `cuStreamSynchronize`。原路径（`cuMemcpyDtoHAsync` + sync）实测**光这 1 KB 的拷贝
-    // 就让同步多等 ~0.8 ms/层**，
+    // 就让同步多等 ~0.8 ms/层**（见 docs/decode-speed-profile.md 的 [d2h] 拆解），
     // 48 层累积 ~38 ms/token。`LINGXI_ROUTER_NODMAP=1` 可回退。
     // 【本轮修正】原来这里是 `rows == 1 && ...` —— 于是 **t>1 又跌回 D2H 老路**，
-    // 而 用「剥块后看 Δ(t=2−t=1) 是否塌缩」实测：**t=2 悬崖 +35.8 ms 里有 +23.4 ms 在 MoE**，
+    // 而 §3.42 用「剥块后看 Δ(t=2−t=1) 是否塌缩」实测：**t=2 悬崖 +35.8 ms 里有 +23.4 ms 在 MoE**，
     // 正是这条 0.8 ms/层 × 48。
     // ★ 2026-10-22 二次修正：rows>1 **收回映射路径**。35f4246 放开时只测了 t=2（1 发切片）；
     // 长 prompt（t=512 ⇒ 64 发 ≤8 行切片）每发直写映射 host 内存 = PCIe write-through，
@@ -402,8 +402,8 @@ pub fn sparse_moe_forward(
         MAP.with(|c| -> Result<(Vec<bf16>, Option<(Vec<i32>, Vec<f32>)>)> {
             let mut g = c.borrow_mut();
             // ⚠️ `MappedHost` 里的设备别名是 `cuMemHostGetDevicePointer` 在**它创建时的上下文**
-            // 里取的 ⇒ 线程级缓存必须按上下文隔离，否则 GPU1 的核会拿到 GPU0 的别名
-            // （双卡实测：`CUDA_ERROR_ILLEGAL_ADDRESS`）。
+            //    里取的 ⇒ 线程级缓存必须按上下文隔离，否则 GPU1 的核会拿到 GPU0 的别名
+            //    （双卡实测：`CUDA_ERROR_ILLEGAL_ADDRESS`）。
             let reuse = g.as_ref().map_or(false, |m| {
                 std::sync::Arc::ptr_eq(m.ctx(), k.stream.context()) && m.len() == need
             });
@@ -419,7 +419,7 @@ pub fn sparse_moe_forward(
         })?
     } else {
         let t_alloc = std::time::Instant::now();
-        // [probe-] 判决实验：logits 改走**经典 cuMemAlloc**（without_pool）。
+        // [probe] 判决实验：logits 改走**经典 cuMemAlloc**（without_pool）。
         // 假设：池化（cuMemAllocAsync/VMM）缓冲上的 CE D2H 被 IOMMU/VMM 慢路径拖到
         // ~21MB/s（实测 sync 等时 = payload/21MB/s + 固定 ~5ms；经典分配的独立微基准 6GB/s）。
         let mut logits = if crate::flag("LINGXI_ROUTER_CLASSIC_ALLOC") {
@@ -499,7 +499,7 @@ pub fn sparse_moe_forward(
             PIN.with(|c| -> Result<(Vec<bf16>, Option<(Vec<i32>, Vec<f32>)>)> {
                 let mut g = c.borrow_mut();
                 // ⚠️ 同 `scratch::same_ctx`：线程级锁页缓存**按上下文隔离** ——
-                // 跨上下文用会 `cuStreamWaitEvent` 失败（INVALID_VALUE，双卡实测）。
+                //    跨上下文用会 `cuStreamWaitEvent` 失败（INVALID_VALUE，双卡实测）。
                 let reuse = g.as_ref().map_or(false, |p| {
                     std::sync::Arc::ptr_eq(p.context(), k.stream.context()) && p.len() >= need
                 });
@@ -511,7 +511,7 @@ pub fn sparse_moe_forward(
                 let buf = g.as_mut().unwrap();
                 // [探针] 等的是"router GEMM + 全流积压"。注意 `memcpy_dtoh` **自身就会
                 // 排空流**（cudarc 同步版）⇒ 计时必须包住它而不是后面的 synchronize。
-                // [probe-] GPU 侧事件对横跨同步：区分"GPU 真有积压" vs "同步调用本身慢"。
+                // [probe] GPU 侧事件对横跨同步：区分"GPU 真有积压" vs "同步调用本身慢"。
                 // 事件只记不同步；span = D2H 完成时刻 − 事件入队被 GPU 执行到的时刻。
                 let evp = if prof {
                     let f = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
@@ -522,7 +522,7 @@ pub fn sparse_moe_forward(
                 if let Some((b, _)) = &evp {
                     b.record(&k.stream)?;
                 }
-                // [probe-] 细分：copy 返回 vs synchronize 返回，定位 25ms 躺在哪半。
+                // [probe] 细分：copy 返回 vs synchronize 返回，定位 25ms 躺在哪半。
                 let t_syn = std::time::Instant::now();
                 k.stream.memcpy_dtoh(&logits, &mut buf.as_mut_slice()?[..need])?;
                 let t_copy_done = std::time::Instant::now();
@@ -533,7 +533,7 @@ pub fn sparse_moe_forward(
                     ev.record(&k.stream)?;
                     ev.synchronize()?;
                 } else if crate::flag("LINGXI_EVT_POLL") {
-                    // [probe-] 判决实验：busy-poll cuEventQuery 替代 synchronize。
+                    // [probe] 判决实验：busy-poll cuEventQuery 替代 synchronize。
                     // 若 poll 很快返回 ⇒ 完成信号本身可见、是 sync 的通知路径慢；
                     // 若 poll 也等 25ms ⇒ 完成信号就是延迟的（CE 中断路径）。
                     let f = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
@@ -558,7 +558,7 @@ pub fn sparse_moe_forward(
                     }
                     let _ = spins;
                 } else if crate::flag("LINGXI_KICK") {
-                    // [probe-] 判决实验：enqueue 后立刻 cuStreamQuery 强制 doorbell/flush，
+                    // [probe] 判决实验：enqueue 后立刻 cuStreamQuery 强制 doorbell/flush，
                     // 再同步。若 sync 塌缩 ⇒ 病根是提交批次化延迟（门铃晚响）。
                     let r = unsafe {
                         cudarc::driver::sys::cuStreamQuery(k.stream.cu_stream())
@@ -573,7 +573,7 @@ pub fn sparse_moe_forward(
                     k.stream.synchronize()?; // `memcpy_dtoh` 是异步的，必须等完成再读 host 缓冲
                 }
                 SYNC_WAIT_NS.fetch_add(t_syn.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                // [probe-] 判决实验 5：同步刚返回时立刻测一块**专用预热缓冲**的同尺寸
+                // [probe] 判决实验 5：同步刚返回时立刻测一块**专用预热缓冲**的同尺寸
                 // D2H（流此时是空的）。若它也慢 ⇒ CE 全局被拖（外部竞争）；若快 ⇒ 慢的是
                 // logits 这块缓冲/此刻的流状态。
                 if crate::flag("LINGXI_D2H_BW") {
@@ -673,18 +673,18 @@ pub fn sparse_moe_forward(
             }
         }
     } else {
-        // ★ （2026-10-27）：host topk+softmax 逐行并行化。t=512 时该循环 ~3.8ms/层是
+        // ★ 2026-10-27：host topk+softmax 逐行并行化。t=512 时该循环 ~3.8ms/层是
         // 纯 host CPU（512 行互相独立，实测占层 wall 的 ~15%）。两阶段、**逐位等价**：
-        // A（rayon 全局池，补 起免每 call spawn）：每行复刻旧循环的
-        // max/exp/sum/归一/topk/renorm 算术（每线程独立 scratch，同值同序），
-        // 产出 (专家升序, p/norm) 平铺表；
-        // B（串行）：按行升序合并进 per_expert/sel_rows —— 与旧循环的 push 次序
-        // **逐项相同**（行升序 × 行内专家升序 × 同 w 位级）。
+        //   A（rayon 全局池，起免每 call spawn）：每行复刻旧循环的
+        //     max/exp/sum/归一/topk/renorm 算术（每线程独立 scratch，同值同序），
+        //     产出 (专家升序, p/norm) 平铺表；
+        //   B（串行）：按行升序合并进 per_expert/sel_rows —— 与旧循环的 push 次序
+        //     **逐项相同**（行升序 × 行内专家升序 × 同 w 位级）。
         // `LINGXI_NO_TOPK_PAR=1` 回退旧单线程循环（对拍用）。
         let par = !crate::flag("LINGXI_NO_TOPK_PAR") && rows >= 32;
         if par {
             use rayon::prelude::*;
-            // 补：rayon 全局池（进程常驻线程，免每 call spawn ~0.5ms）。
+            // rayon 全局池（进程常驻线程，免每 call spawn ~0.5ms）。
             let nthreads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
@@ -798,7 +798,7 @@ pub fn sparse_moe_forward(
     // 只是专家槽在第一次之后 100% 命中（不再有 H2D DMA），且路由不再乱跳。
     // 与 `LINGXI_FIXED_IDS` 组合使用，就能干净地量出"每层那点开销到底来自主机交互还是 GPU 本身"。
     // 🚫 以前这里写着"与 `LINGXI_ROUTER_NOSYNC=1` 组合"——**那个开关代码里根本没有实现**
-    // （已登记为 Ghost，见 probes.rs）。照它做实验等于什么都没变，别再用。
+    //    （已登记为 Ghost，见 probes.rs）。照它做实验等于什么都没变，别再用。
     if crate::flag("LINGXI_ARENA_FIXED_EXPERTS") {
         for v in per_expert.iter_mut() {
             v.clear();
@@ -836,8 +836,8 @@ pub fn sparse_moe_forward(
     }
     let t_router = t_start.elapsed();
     // 权重两路径，数学完全相同（同字节、同专家升序遍历，仅存放布局不同）：
-    // Full：w.routed_* 是 [E,…] 全量张量，按专家 id 直接切片（对拍路径）
-    // Sparse：路由后经 ExpertSource 只取回命中专家的 [S,…] 紧凑张量，按槽位切片
+    //  Full    ：w.routed_* 是 [E,…] 全量张量，按专家 id 直接切片（对拍路径）
+    //  Sparse  ：路由后经 ExpertSource 只取回命中专家的 [S,…] 紧凑张量，按槽位切片
     let hit_ids: Vec<u32> = per_expert
         .iter()
         .enumerate()
@@ -871,7 +871,7 @@ pub fn sparse_moe_forward(
     }
     // **唯一专家**（升序）+ 每个唯一专家在"对"列表里的区间 `[group_off[i], group_off[i+1])`。
     // `pair_experts` 本来就是按专家升序拼出来的，所以区间天然连续。
-    // 批量路径靠它把"同一个专家的权重读 t 遍"变成"读一遍、被 t 个 token 共用"（根因 3）。
+    // 批量路径靠它把"同一个专家的权重读 t 遍"变成"读一遍、被 t 个 token 共用"（§3.21 根因 3）。
     let mut uniq_experts: Vec<u32> = Vec::new();
     let mut group_off: Vec<i32> = Vec::new();
     {
@@ -898,10 +898,10 @@ pub fn sparse_moe_forward(
     let q4_hits;
     let q4_alt_hits;
     let bits_sel;
-    // ★ **专家段 hit/miss 重叠**（`LINGXI_MOE_OVERLAP`，；㊶ 起 **rows==1 也生效**）：
-    // rows>1 时 slot_ids[i] 与唯一专家 i 一一对应；rows==1 时对列表==专家列表，
-    // 同样一一对应 ⇒ 两种行数都能按"槽条目"切 hit/miss（arena_source 按 overlap 参数
-    // 把 miss 的 blob H2D 挪去 stream2，见 arena_source.rs）。
+    // ★ **专家段 hit/miss 重叠**（`LINGXI_MOE_OVERLAP`，§P4；㊶ 起 **rows==1 也生效**）：
+    //   rows>1 时 slot_ids[i] 与唯一专家 i 一一对应；rows==1 时对列表==专家列表，
+    //   同样一一对应 ⇒ 两种行数都能按"槽条目"切 hit/miss（arena_source 按 overlap 参数
+    //   把 miss 的 blob H2D 挪去 stream2，见 arena_source.rs）。
     let mo_ov = moe_overlap_on();
     // `LINGXI_EVPROF=1`：MoE 内部再切一刀 —— 段 3（路由+host）到此为止，段 4（查槽+专家 GEMV+归并）开始。
     // 同时把"现场"记进计时器（对数 / 组数 / rows），好让 dump 直接算出相关性。
@@ -1020,7 +1020,7 @@ pub fn sparse_moe_forward(
     }
     // 混档双视图（6.2-2 Stage B）：把命中列表切成**同格式连续段**——每对只被一个
     // 格式写、buffer 全局按对下标 ⇒ combine 无需改动。单格式 ⇒ runs4 = [0, len)。
-    // 注意段下标与 slot_ids/组的编号同源（都对着 hit_list = rows==1 ? pair: uniq）。
+    // 注意段下标与 slot_ids/组的编号同源（都对着 hit_list = rows==1 ? pair : uniq）。
     let (mut runs4, mut runs3): (Vec<(u32, u32)>, Vec<(u32, u32)>) = (Vec::new(), Vec::new());
     {
         let n = bits_sel.len();
@@ -1156,14 +1156,14 @@ pub fn sparse_moe_forward(
         let mut act_all = scratch::bf16(k, s * inter)?;
         let mut o_all = scratch::bf16(k, s * hidden)?;
         // [探针] `LINGXI_MOE_ZERO_OUT=1`：专家段输出先清零 —— 判"是否有行没被写出"
-        // （若清零后两个配置的结果一致 ⇒ 差异来自**未初始化行**，不是数学）。
+        //   （若清零后两个配置的结果一致 ⇒ 差异来自**未初始化行**，不是数学）。
         if crate::flag("LINGXI_MOE_ZERO_OUT") {
             k.stream.memset_zeros(&mut gu_all)?;
             k.stream.memset_zeros(&mut act_all)?;
             k.stream.memset_zeros(&mut o_all)?;
         }
         // [探针] `LINGXI_MOE_NAN_FILL=1`：把三个输出缓冲先填 NaN（0x7FC0）—— 跑完数 NaN
-        // 就能**逐元素定位"哪些位置没被写出"**（正确性判据，不是性能开关）。
+        //   就能**逐元素定位"哪些位置没被写出"**（正确性判据，不是性能开关）。
         if crate::flag("LINGXI_MOE_NAN_FILL") {
             let nan = half::bf16::from_bits(0x7FC0);
             for buf in [&mut gu_all, &mut act_all, &mut o_all] {
@@ -1173,7 +1173,7 @@ pub fn sparse_moe_forward(
         }
         // `rows == 1`：每个专家恰好一个对 → 沿用"逐对"旧核（零额外上传）。
         // `rows > 1`：走"按唯一专家分组"的新核 —— 权重行只 load 一次、被该专家命中的
-        // 所有 token 共用。t=8 时专家段流量因此从 ~3.3× 降到 ~1.2×（根因 3）。
+        // 所有 token 共用。t=8 时专家段流量因此从 ~3.3× 降到 ~1.2×（§3.21 根因 3）。
         if rows == 1 {
             let rpw = slots_rpw();
             if dual_q4 {
@@ -1239,7 +1239,7 @@ pub fn sparse_moe_forward(
                     evs[3].record(&k.stream)?;
                 }
                 // [探针] `LINGXI_MIX_SYNC_DN=1`：dn 前全流同步 —— 判"步 1 输出坏是否
-                // 异步上传/H2D 未就绪竞态"（同步后转好 ⇒ 坐实）。
+                //   异步上传/H2D 未就绪竞态"（同步后转好 ⇒ 坐实）。
                 if crate::flag("LINGXI_MIX_SYNC_DN") {
                     k.stream.synchronize()?;
                 }
@@ -1292,10 +1292,10 @@ pub fn sparse_moe_forward(
             }
             // ① 无重叠：整批一次（老行为，逐位基准）。
             // ② **hit/miss 重叠**（㊶，t=1 启用）：命中条目 gu→swiglu→dn 一口气推进
-            // （与 stream2 上飞的 miss H2D 并行），dn 算完再 `wait(ev_mo_miss)`，
-            // 最后补未命中条目。bit-safe 论据与 slotsm 拆 launch 相同：每个对的
-            // 输出区间互不相交、点积/元素级算式不变，发射边界不影响任何对的数值；
-            // swiglu 元素级按对独立，切段逐位不变。
+            //    （与 stream2 上飞的 miss H2D 并行），dn 算完再 `wait(ev_mo_miss)`，
+            //    最后补未命中条目。bit-safe 论据与 slotsm 拆 launch 相同：每个对的
+            //    输出区间互不相交、点积/元素级算式不变，发射边界不影响任何对的数值；
+            //    swiglu 元素级按对独立，切段逐位不变。
             match q.overlap.as_ref() {
                 None => {
                     // `LINGXI_MOE_PROF=1`：rows==1 单格式档也切四段（原来只有混档/批量档有事件，
@@ -1401,12 +1401,12 @@ pub fn sparse_moe_forward(
             // 逐位等价：bf16→f32 精确、GEMV 内 z 次序与累加次序不变；省每 (word,token) 8 条 CVT。
             // `LINGXI_MOE_NO_XF32=1` 回退 bf16 现转（同二进制 A/B 用）。
             // ★ P15-㉖：`LINGXI_MOE_DP4A=1` 时改走 **int8 行量化 + dp4a 内积**（x 流量 ÷4，
-            // 判据；非位等价 ⇒ 默认关，与 xf32 互斥）。
+            // 判据见 PLAN；非位等价 ⇒ 默认关，与 xf32 互斥）。
             // ⚠️ dp4a 核（`slotsm_dp4a_body`）与修复前的 bf16 版一样只覆盖每组前 8 个对
-            // （`acc[8]` 且无分批循环，2026-10-18 审计发现）⇒ **任一组 m>8 时强制退回 bf16**，
-            // 否则会静默算错。dp4a 本来就非位等价、默认关，这里只加安全网。
+            //   （`acc[8]` 且无分批循环，2026-10-18 审计发现）⇒ **任一组 m>8 时强制退回 bf16**，
+            //   否则会静默算错。dp4a 本来就非位等价、默认关，这里只加安全网。
             // ⚠️ Q3G128 **不支持 dp4a / TC 档**（只有 Q4 布局的变体核）⇒ bits==3 恒走
-            // 普通 bf16 slotsm（xf32 预转仍可用：它只是 bf16→f32 精确转换）。
+            //    普通 bf16 slotsm（xf32 预转仍可用：它只是 bf16→f32 精确转换）。
             let q3_on = q.bits == 3;
             let dp4a_on = crate::flag("LINGXI_MOE_DP4A")
                 && group_off.windows(2).all(|w| (w[1] - w[0]) <= 8)
@@ -1414,10 +1414,10 @@ pub fn sparse_moe_forward(
                 && !dual_q4;
             // ㊽ prefill 大 tile 张量核（LINGXI_MOE_TC 复用同一开关）：rows>16 的批量路径，
             // gu/dn 的 k（hidden/inter）都是 64 的倍数。有损档（~2^-11），判据 = 首 token
-            // 相等 + 质量抽检（PLAN_NEXT 拍板）。开着时不需要 xf/dp4a 预转。
+            // 相等 + 质量抽检（PLAN_NEXT §3 拍板）。开着时不需要 xf/dp4a 预转。
             // ★ 2026-10-22（moe-gemm-bench 隔离判决 12 档全过：×3.3~×33，zipf ×15.7）：
             // 取消 `!dual_q4` 门控 —— 混档时 Q4 视图（runs4）照样可以走 TCP，Q3 视图由
-            // run 内按位宽退回 SIMT。这是 prefill 混档默认提速的最后一块拼图。
+            // run() 内按位宽退回 SIMT。这是 prefill 混档默认提速的最后一块拼图。
             let tcp_on = crate::flag("LINGXI_MOE_TC") && rows > 16
                 && hidden % 64 == 0 && inter % 64 == 0
                 && !q3_on;
@@ -1502,15 +1502,15 @@ pub fn sparse_moe_forward(
                         // ㊼ 张量核档（`LINGXI_MOE_TC=1`）：gu 的 k=hidden 是 64 的整数倍，
                         // 布局与 SIMT 完全相同（group64），只把内积搬到 m8n8k4。
                         // ⚠️ 张量核核只覆盖每组 ≤16 行（kTiles≤2）；prefill 的长 prompt 会出现
-                        // t 上百的行组 ⇒ 逐组判定，超限的组仍走 SIMT（否则会**静默丢掉行**）。
+                        //    t 上百的行组 ⇒ 逐组判定，超限的组仍走 SIMT（否则会**静默丢掉行**）。
                         // ★ 2026-10-18：只在 **1 < rows ≤ 16**（投机验证批）时用 TC ——
-                        // t=1 时 M=8 tile 只用 1 行（−3%），prefill 的大 chunk 会退化成
-                        // "每组一次 launch"（几百次/层）。实测 t=7 验证轮专家段 0.59→0.55
-                        // ms/层（−7%），整轮 −5%。
+                        //    t=1 时 M=8 tile 只用 1 行（−3%），prefill 的大 chunk 会退化成
+                        //    "每组一次 launch"（几百次/层）。实测 t=7 验证轮专家段 0.59→0.55
+                        //    ms/层（−7%），整轮 −5%。
                         // ⚠️ 2026-10-18 实测否决：把 TC 扩到 prefill（kTiles=4，≤32 行/组，
-                        // 整份 unique-expert 列表一次 launch）反而 **23.7K 120.5 → 130.5s
-                        // （+8%）**：fp16 x 的逐次 CVT + 小行组（m<8）填充浪费吃掉了 MMA 收益。
-                        // ⇒ prefill 仍用 SIMT；TC 只服务 1<rows≤16 的验证批。
+                        //    整份 unique-expert 列表一次 launch）反而 **23.7K 120.5 → 130.5s
+                        //    （+8%）**：fp16 x 的逐次 CVT + 小行组（m<8）填充浪费吃掉了 MMA 收益。
+                        //    ⇒ prefill 仍用 SIMT；TC 只服务 1<rows≤16 的验证批。
                         let tc_ok = crate::flag("LINGXI_MOE_TC")
                             && rows > 1
                             && rows <= 16
