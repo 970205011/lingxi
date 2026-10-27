@@ -1,41 +1,9 @@
 # Prebuilt binary (Tesla V100 / sm_70)
 
-CI-built binaries are attached to GitHub Releases (built on Ubuntu 22.04, glibc 2.35).
-Prefer those over the binary committed here; the committed one was built on glibc 2.41.
+Prebuilt `lingxi-bench` binaries are attached to Releases, built by CI
+(`.github/workflows/release.yml`, Ubuntu 22.04, glibc 2.35).
 
-| Item | Value |
-|---|---|
-| File | `lingxi-bench-v0.1.0-linux-x86_64-sm70` |
-| Source commit | `c923563` (public `open-source` branch) |
-| Built | 2026-10-22 |
-| Rust | 1.99.1 |
-| nvcc | CUDA 12.9 compiler, kernels target `sm_70` |
-| glibc | built on glibc 2.41; requires **glibc >= 2.39** |
-| SHA256 | see `SHA256SUMS` |
-
-This build includes the mix-aware `vram-autotune` (Q4/Q3 slots counted separately) and the
-`vram-budget` subcommand. On the 2×V100 production box it allocates 11,423 slots on GPU0 and
-all 12,288 on GPU1 at 32K context.
-
-All CUDA kernels are embedded into the binary as `sm_70` cubins; no separate `.cubin`
-files are needed. The binary links `libc` / `libm` / `libgcc_s` dynamically and loads
-`libcuda`, `libcublas`, and `libnvrtc` at runtime, so a matching NVIDIA driver and CUDA
-runtime libraries must be present.
-
-Model artifacts are **not** included (about 253 GB). Build or obtain them separately;
-see `docs/FORMAT.md` and `tools/convert/hf2lingxi.py`.
-
-## Usage
-
-```bash
-chmod +x lingxi-bench-v0.1.0-linux-x86_64-sm70
-./lingxi-bench-v0.1.0-linux-x86_64-sm70 --help
-
-# In the repo, start.sh looks for ./bin/lingxi-bench:
-mkdir -p bin
-cp lingxi-bench-v0.1.0-linux-x86_64-sm70 bin/lingxi-bench
-LINGXI_ARTIFACT=/path/to/model.lingxi ./start.sh
-```
-
-If your distribution has glibc < 2.39 (for example Ubuntu 22.04), build from source with
-`make build` instead.
+> 2026-10-27 开源分支刷新时移除了此前随仓库提交的 v0.1.0 预编译二进制：它落后于
+> 当前 0.2.0 代码，且内嵌的默认路径是本机路径。请用 CI Release 附件或
+> `make build && make dist` 自行打包（`make dist` 产出含 bin/ + docs/ + 部署脚本的
+> 完整发布包）。

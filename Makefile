@@ -37,6 +37,6 @@ dist: build
 	mkdir -p $(DIST_DIR)/bin $(DIST_DIR)/docs $(DIST_DIR)/tools/deploy
 	cp -v bin/lingxi-bench $(DIST_DIR)/bin/
 	cp -v start.sh README.md README.en.md LICENSE $(DIST_DIR)/
-	cp -v docs/RELEASE-v0.2.0.md docs/FORMAT.md docs/HANDOVER.md $(DIST_DIR)/docs/
+	cp -v docs/FORMAT.md docs/BENCH.md $(DIST_DIR)/docs/
 	cp -v tools/deploy/up.sh tools/deploy/down.sh tools/deploy/serve_single.sh $(DIST_DIR)/tools/deploy/
 	cd dist && tar czf lingxi-$(DIST_DATE).tar.gz lingxi-$(DIST_DATE) && ls -lh lingxi-$(DIST_DATE).tar.gz

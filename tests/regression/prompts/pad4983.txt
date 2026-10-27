@@ -108,7 +108,7 @@
 
 ## 2. 环境与常用命令
 
-* 引擎在**宿主** **`/root/lingxi`** = **容器 141 的** **`/models/lingxi`**（同一挂载）。一切容器操作走
+* 引擎在**宿主** **`lingxi`** = **容器的** **`/models/lingxi`**（同一挂载）。一切容器操作走
   `pct exec 141 -- bash -lc '...'`。
 
 * GPU：Tesla V100-PCIE-32GB（sm\_70），**容器内无 ncu/nvprof**（所以块账靠 SKIP/PROF/KTS 反推）。
