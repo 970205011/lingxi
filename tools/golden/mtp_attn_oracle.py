@@ -6,7 +6,7 @@
   attn_mixed_a（该块输入）、attn_out（Rust 的输出）、w_qkgv / w_q_norm / w_k_norm /
   w_o_proj / w_index_* / rope_cos / rope_sin。
 
-按**规格**（§3.52 与 qsa.rs 的注释）独立实现一遍：
+按**规格**（ 与 qsa.rs 的注释）独立实现一遍：
   q|k|gate|v 四段切分 → 每头 RMSNorm → partial RoPE → 因果掩码注意力 → sigmoid 门 → o_proj
 若与 Rust 的输出对不上，就说明这两者里有一个错 —— 这正是要裁的。
 
@@ -52,8 +52,8 @@ def rope_partial(v, nhead):
     v = v.reshape(T, nhead, HD).copy()
     r = v[:, :, :ROT].reshape(T, nhead, 2, ROT // 2)
     a, b = r[:, :, 0, :].copy(), r[:, :, 1, :].copy()
-    c = cos[:T, :ROT].reshape(T, 1, 2, ROT // 2)[:, :, 0, :]
-    s = sin[:T, :ROT].reshape(T, 1, 2, ROT // 2)[:, :, 0, :]
+    c = cos[:T, :ROT].reshape(T, 1, 2, ROT // 2)[:,:, 0,:]
+    s = sin[:T, :ROT].reshape(T, 1, 2, ROT // 2)[:,:, 0,:]
     r[:, :, 0, :] = a * c - b * s
     r[:, :, 1, :] = a * s + b * c
     return v

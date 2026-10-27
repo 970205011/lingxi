@@ -35,7 +35,7 @@ import torch.nn as nn  # noqa: E402
 from defuse import Defuser, load_ple_table  # noqa: E402
 from tools.convert.qwen4_exp import recipe as R  # noqa: E402
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig  # noqa: E402
-from transformers.models.qwen4_exp.modeling_qwen4_exp import (  # noqa: E402
+from transformers.models.qwen4_exp.modeling_qwen4_exp import ( # noqa: E402
     Qwen4ExpForCausalLM,
     Qwen4ExpTextDecoderLayer,
     Qwen4ExpTextRotaryEmbedding,

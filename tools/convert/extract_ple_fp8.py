@@ -1,5 +1,5 @@
 # P15-㉳：把官方 NVFP4 版模型自带的 PLE FP8(E4M3) 表从 safetensors 分片抽成平铺二进制。
-# 用法（在测试容器内）：python3 tools/convert/extract_ple_fp8.py
+# 用法（在 141 内）：python3 tools/convert/extract_ple_fp8.py
 # 产物：/dev/shm/qwen4_exp.ple-table.fp8.bin（51.2GB = 320001536 行 × 160 B）+ .scale sidecar（全局 bf16 标量）。
 # 行序 = shard_0..shard_127 顺序拼接（已抽验：与 bf16 母表 rel err ~2.3% = FP8 量化噪声）。
 import json, struct, os, shutil

@@ -28,7 +28,7 @@ from tools.convert.qwen4_exp import recipe as R  # noqa: E402
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig  # noqa: E402
 from transformers.models.qwen4_exp import modeling_qwen4_exp as M  # noqa: E402
-from transformers.models.qwen4_exp.modeling_qwen4_exp import (  # noqa: E402
+from transformers.models.qwen4_exp.modeling_qwen4_exp import ( # noqa: E402
     Qwen4ExpTextAttention,
     Qwen4ExpTextGatedResidual,
     Qwen4ExpTextRotaryEmbedding,

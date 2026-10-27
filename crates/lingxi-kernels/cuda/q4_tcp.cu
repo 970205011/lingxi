@@ -1,16 +1,16 @@
 // ㊽ Q4 专家张量核 GEMM —— **prefill 大 tile 版**（Volta mma.sync.m8n8k4，QPN 映射）。
 //
-// 为什么（2026-10-19，PLAN_NEXT §3 拍板：判据放开为「首 token 相等 + 质量抽检」）：
+// 为什么（2026-10-19，PLAN_NEXT 拍板：判据放开为「首 token 相等 + 质量抽检」）：
 // 旧的 kTiles=4 实验（q4_tc.cu，实测 +8% 更慢被否决）死在三个地方——
-//   1. CTA 只覆盖 32 行（M 轴不分块），t 上百的行组要么丢行要么每组一次 launch；
-//   2. A 片（x）每个 mma 都从 global 现读 bf16 + 逐元素 CVT fp16，CVT 比 MMA 还多；
-//   3. 权重（DRAM 主流量）不做行摊销：一 warp 一个输出行，同一批 x 被反复重读。
+// 1. CTA 只覆盖 32 行（M 轴不分块），t 上百的行组要么丢行要么每组一次 launch；
+// 2. A 片（x）每个 mma 都从 global 现读 bf16 + 逐元素 CVT fp16，CVT 比 MMA 还多；
+// 3. 权重（DRAM 主流量）不做行摊销：一 warp 一个输出行，同一批 x 被反复重读。
 // 本核的对应修法：
-//   1. **M 轴分块进 grid.z**（每块 64 行），任意大的组一次 launch 全覆盖；
-//   2. x 按 k-group（64）**整块进 shared 并一次性 CVT 成 fp16**（每专家行摊 n/128 次，
-//      CVT 总量与 SIMT 预转档同量级），A 片从 shared 按 uint4 取、零冲突；
-//   3. 每 warp 算 32 行 × 32 列（QPN quadpair），CTA = 2×4 warp = **64 行 × 128 列**，
-//      权重行的读取被 64 个 token 行摊销（权重重读因子 = t/64）。
+// 1. **M 轴分块进 grid.z**（每块 64 行），任意大的组一次 launch 全覆盖；
+// 2. x 按 k-group（64）**整块进 shared 并一次性 CVT 成 fp16**（每专家行摊 n/128 次，
+// CVT 总量与 SIMT 预转档同量级），A 片从 shared 按 uint4 取、零冲突；
+// 3. 每 warp 算 32 行 × 32 列（QPN quadpair），CTA = 2×4 warp = **64 行 × 128 列**，
+// 权重行的读取被 64 个 token 行摊销（权重重读因子 = t/64）。
 //
 // 数值口径与 q4_tc.cu 一致（有损档）：权重 nibble × fp16 group-scale 进 fp16 张量核、
 // fp32 累加；x 在进 shared 时 bf16→fp16 舍入（~2^-11 相对，远小于 Q4 权重本身的 2^-4
@@ -50,23 +50,29 @@ __device__ __forceinline__ void mma_qpn(float (&d)[8], unsigned a0, unsigned a1,
         : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
 
-// grid = (ceil(n/128), n_experts, ceil(tmax/64))，block = 256。
-// 每 CTA：本专家（blockIdx.y）的 [row0, row0+64) token 行 × [col0, col0+128) 输出行。
+// 网格形态两档：
+// 旧档 `lingxi_gemv_q4g64_slots_tcp_bf16`：grid = (ceil(n/128), n_experts, ceil(tmax/64))，
+// 每 CTA 本专家（blockIdx.y）的 [row0, row0+64) 行 × [col0, col0+128) 列；
+// 乐观档 `lingxi_gemv_q4g64_slots_tcp_bf16_dyn`：grid = (ceil(n/128), ng_ub, 1)，行块在
+// 核内按**本组大小 t** 循环（免 host 计数 ⇒ 可在 pair 建表核完成前发射）。
+// 两档每 (组, 行块) 的算术逐字相同（同一 body），只是行块的驱动方式不同。
 template <int kBlk>
 __device__ __forceinline__ void q4_slots_tcp_body(
     const std::uint8_t* __restrict__ slots, const std::int32_t* __restrict__ slot_ids,
     const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
+    __nv_bfloat16* __restrict__ y, int e, int row0,
+    int n, int k, int a_stride, int k_pad,
     std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
     using S = TcpS;
-    const int e = static_cast<int>(blockIdx.y);
     const int s0 = group_off[e];
     const int t = group_off[e + 1] - s0;
-    const int row0 = static_cast<int>(blockIdx.z) * S::kRowsPerCta;
     if (t <= 0 || row0 >= t) {
         return;
     }
     const int slot = slot_ids[e];
+    if (slot < 0) {
+        return; // 混档单 launch：他格式组的哨兵槽，跳过
+    }
     const int groups = k_pad / S::kGroupK;
 
     const std::uint8_t* base = slots + static_cast<std::int64_t>(slot) * blob + seg_off;
@@ -216,8 +222,29 @@ lingxi_gemv_q4g64_slots_tcp_bf16(
     const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
     std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
-    q4_slots_tcp_body<4>(slots, slot_ids, group_off, x, y, n, k, a_stride, k_pad, blob,
-                         seg_off, scale_off);
+    q4_slots_tcp_body<4>(slots, slot_ids, group_off, x, y,
+                         static_cast<int>(blockIdx.y),
+                         static_cast<int>(blockIdx.z) * TcpS::kRowsPerCta,
+                         n, k, a_stride, k_pad, blob, seg_off, scale_off);
+}
+
+// 乐观发射档（`LINGXI_ROUTE_FULLDEV_BIG` 路径）：grid = (ceil(n/128), ng_ub, 1)。
+// ng_ub 组的网格是 **host 侧上界**（min(E, S)）——真实组数 ng 由 pair 建表核写在
+// group_off[0..ng]（尾部已清零）里，e >= ng 的块 t <= 0 早退；行块按本组 t 核内循环，
+// 不需要 host 的 tmax。因此本核可以在 pair 核完成**之前**入队（同流序 ⇒ 读到建成后的表），
+// 把 host 从"钉在 pair 完成上才发专家段"里解放出来。算术与旧档逐 (组,行块) 相同。
+extern "C" __global__ void __launch_bounds__(TcpS::kThreads, 2)
+lingxi_gemv_q4g64_slots_tcp_bf16_dyn(
+    const std::uint8_t* __restrict__ slots, const std::int32_t* __restrict__ slot_ids,
+    const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
+    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
+    const int e = static_cast<int>(blockIdx.y);
+    const int t = group_off[e + 1] - group_off[e];
+    for (int row0 = 0; row0 < t; row0 += TcpS::kRowsPerCta) {
+        q4_slots_tcp_body<4>(slots, slot_ids, group_off, x, y, e, row0,
+                             n, k, a_stride, k_pad, blob, seg_off, scale_off);
+    }
 }
 
 #endif // sm_70

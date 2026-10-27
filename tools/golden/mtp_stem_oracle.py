@@ -41,7 +41,7 @@ def rmsnorm(x, g, eps=1e-6):
     return (x / np.sqrt(ms + eps)) * g
 
 
-# ── 两条分支（与 §3.52 对齐）──
+# ── 两条分支（与  对齐）──
 en = rmsnorm(emb, enorm)                    # [T, N]
 e2 = en @ fce.T                             # [T, N]
 

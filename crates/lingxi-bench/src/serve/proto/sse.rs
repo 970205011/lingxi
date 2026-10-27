@@ -1,309 +1,14 @@
-//! R4 拆分（2026-10-21）：原 serve.rs 3152 行按职责分段，本模块为其中一段。
-//! 模块总览见 `serve/mod.rs`。段间共享类型一律 `pub(crate)`。
+//! 出站/流式侧：OutEv 输出解析、StreamSplitter、SSE/chunked 响应、Detok/StopFilter、
+//! 事件渲染与写回。CODE_MAP Phase 4 收尾刀从 proto.rs 搬入，只搬家不改行为。
 
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::spec::SpecRuntime;
 
-
-
-/// 投机解码的**单请求状态**：MTP 运行时 + 本请求的验证缓冲 + 待发 token 队列。
-///
-/// 为什么队列：一轮会一次接受 `keep` 个 token，而 HTTP/SSE 是一个一个发；
-/// 队列空了再跑下一轮（`SpecRuntime::round`）。
-pub(crate) struct SpecGen<'a, 'k> {
-    pub(crate) rt: &'a mut SpecRuntime<'k>,
-    pub(crate) sb: lingxi_driver::SpecBuffers,
-    pub(crate) h_last: cudarc::driver::CudaSlice<half::bf16>,
-    pub(crate) queue: VecDeque<i64>,
-    pub(crate) accepted: usize,
-    pub(crate) rounds: usize,
-    /// 已送进验证的行数（= 每轮 `chunk.len()`）——用来算"每验证一行产出几个 token"
-    pub(crate) verified: usize,
-    /// 自适应关闸：长上下文/低接受率时投机反而更慢（实测 875-token 文档：20 vs 25 tok/s），
-    /// 连续 3 轮 `产出/验证行 < 0.5` 就本请求切回纯自回归（KV 状态本来就是连续的，切换安全）。
-    pub(crate) disabled: bool,
-}
-
-impl<'a, 'k> SpecGen<'a, 'k> {
-    pub(crate) fn next(
-        &mut self,
-        seq: &mut lingxi_driver::Sequence,
-        eng: &lingxi_driver::Engine<'_>,
-        provider: &mut dyn lingxi_driver::LayerProvider,
-    ) -> Result<i64> {
-        // ⚠️ 顺序：**先发完上一轮队列里的 token**，再决定要不要关闸。
-        //    否则关闸时会把"已提交但还没发"的 token 静默吞掉（ids 里已经有它们，AR 会从更后面接）。
-        if let Some(t) = self.queue.pop_front() {
-            return Ok(t);
-        }
-        if !self.disabled && self.rounds >= 3 {
-            let ratio = (self.accepted + self.rounds) as f64 / self.verified.max(1) as f64;
-            // 安全网（默认不会触发）：实测 875-token 上下文、128 token 时 yield≈0.8（acc≈2.2、链被 min_p
-            // 截到 ~4 行），投机 +28%；明显低于 0.5 才是"每验证一行换不到半个 token"，那时切回自回归。
-            if ratio < 0.5 {
-                self.disabled = true;
-                eprintln!(
-                    "[serve] 投机产出/验证行 = {ratio:.2} < 0.5（{} 轮、接受 {}）⇒ 本请求切回自回归",
-                    self.rounds, self.accepted
-                );
-            }
-        }
-        if self.disabled {
-            return seq.decode_token(eng, provider);
-        }
-        let r = self.rt.round(seq, eng, provider, &mut self.sb, &mut self.h_last)?;
-        self.accepted += r.accepted;
-        self.verified += r.verified;
-        self.rounds += 1;
-        self.queue.extend(r.tokens);
-        Ok(self.queue.pop_front().expect("每轮至少提交 1 个 token"))
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum ReasoningEffort {
-    Xhigh,
-    Medium,
-    Low,
-}
-
-impl ReasoningEffort {
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s {
-            "xhigh" => Some(Self::Xhigh),
-            "medium" => Some(Self::Medium),
-            "low" => Some(Self::Low),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn instruction(self) -> &'static str {
-        match self {
-            Self::Xhigh => "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
-            Self::Low => "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
-            Self::Medium => "",
-        }
-    }
-}
-
-
-#[derive(Clone, Copy)]
-pub(crate) struct ChatCfg {
-    pub(crate) enable_thinking: bool,
-    pub(crate) preserve_thinking: bool,
-    pub(crate) effort: ReasoningEffort,
-}
-
-impl ChatCfg {
-    pub(crate) fn reasoning_instruction(&self) -> &'static str {
-        if self.enable_thinking {
-            self.effort.instruction()
-        } else {
-            ""
-        }
-    }
-}
-
-/// 取消息正文（字符串或 OpenAI 的 content parts 数组）。
-pub(crate) fn content_text(m: &serde_json::Value) -> String {
-    match &m["content"] {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
-/// 历史 assistant 的 `tool_calls[].function.arguments`（可能是对象或 JSON 字符串）。
-pub(crate) fn tool_arguments(tc: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    let f = tc.get("function").unwrap_or(tc);
-    match f.get("arguments") {
-        Some(serde_json::Value::Object(m)) => m.clone(),
-        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default(),
-        _ => serde_json::Map::new(),
-    }
-}
-
-pub(crate) const TOOLS_PREAMBLE: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
-pub(crate) const TOOLS_SUFFIX: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
-
-/// 按官方 `chat_template.jinja` 拼 prompt，返回 `(prompt, 最后一条消息的字符边界)`。
-pub(crate) fn build_prompt(
-    messages: &[serde_json::Value],
-    tools: Option<&Vec<serde_json::Value>>,
-    cfg: ChatCfg,
-) -> (String, usize) {
-    let instr = cfg.reasoning_instruction();
-    let mut p = String::new();
-
-    // ── 1) system 段（有 tools 时先写工具说明，再接原 system 内容）──
-    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-        p.push_str("<|im_start|>system\n");
-        if !instr.is_empty() {
-            p.push_str(instr);
-            p.push_str("\n\n");
-        }
-        p.push_str(TOOLS_PREAMBLE);
-        for t in tools {
-            p.push('\n');
-            p.push_str(&serde_json::to_string(t).unwrap_or_default());
-        }
-        p.push_str(TOOLS_SUFFIX);
-        if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
-            let c = content_text(&messages[0]).trim().to_string();
-            if !c.is_empty() {
-                p.push_str("\n\n");
-                p.push_str(&c);
-            }
-        }
-        p.push_str("<|im_end|>\n");
-    } else if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
-        let c = content_text(&messages[0]).trim().to_string();
-        if !c.is_empty() {
-            p.push_str("<|im_start|>system\n");
-            if !instr.is_empty() {
-                p.push_str(instr);
-                p.push_str("\n\n");
-            }
-            p.push_str(&c);
-            p.push_str("<|im_end|>\n");
-        } else if !instr.is_empty() {
-            p.push_str("<|im_start|>system\n");
-            p.push_str(instr);
-            p.push_str("<|im_end|>\n");
-        }
-    } else if !instr.is_empty() {
-        p.push_str("<|im_start|>system\n");
-        p.push_str(instr);
-        p.push_str("<|im_end|>\n");
-    }
-
-    // ── 2) 最后一条“真实用户消息”的下标（preserve_thinking=false 时的分界）──
-    let mut multi_step = true;
-    let mut last_query = messages.len().saturating_sub(1);
-    for (i, m) in messages.iter().enumerate().rev() {
-        if multi_step && m["role"].as_str() == Some("user") {
-            let c = content_text(m);
-            let c = c.trim();
-            if !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>")) {
-                multi_step = false;
-                last_query = i;
-            }
-        }
-    }
-
-    // ── 3) 逐条消息 ──
-    let n = messages.len();
-    let mut boundary = 0usize;
-    let mut tool_run_start: Option<usize> = None;
-    for (i, m) in messages.iter().enumerate() {
-        let role = m["role"].as_str().unwrap_or("user");
-        if i + 1 == n {
-            boundary = if role == "tool" {
-                tool_run_start.unwrap_or(p.len())
-            } else {
-                p.len()
-            };
-        }
-        match role {
-            // system 已在头部渲染，这里只校验位置
-            "system" => {}
-            "user" | "developer" => {
-                p.push_str("<|im_start|>user\n");
-                p.push_str(content_text(m).trim());
-                p.push_str("<|im_end|>\n");
-                tool_run_start = None;
-            }
-            "assistant" => {
-                let content = content_text(m);
-                let content = content.trim();
-                let reasoning = m["reasoning_content"].as_str().unwrap_or("").trim();
-                let include_think = cfg.preserve_thinking || i > last_query;
-                p.push_str("<|im_start|>assistant\n");
-                if include_think {
-                    p.push_str("<think>\n");
-                    p.push_str(reasoning);
-                    p.push_str("\n</think>\n\n");
-                }
-                p.push_str(content);
-                if let Some(tcs) = m["tool_calls"].as_array() {
-                    for (ti, tc) in tcs.iter().enumerate() {
-                        let f = tc.get("function").unwrap_or(tc);
-                        let name = f["name"].as_str().unwrap_or("");
-                        if ti == 0 {
-                            if content.is_empty() {
-                                p.push_str("<tool_call>\n<function=");
-                            } else {
-                                p.push_str("\n\n<tool_call>\n<function=");
-                            }
-                        } else {
-                            p.push_str("\n<tool_call>\n<function=");
-                        }
-                        p.push_str(name);
-                        p.push_str(">\n");
-                        for (k, val) in tool_arguments(tc) {
-                            p.push_str("<parameter=");
-                            p.push_str(&k);
-                            p.push_str(">\n");
-                            match val {
-                                serde_json::Value::String(s) => p.push_str(&s),
-                                other => p.push_str(&other.to_string()),
-                            }
-                            p.push_str("\n</parameter>\n");
-                        }
-                        p.push_str("</function>\n</tool_call>");
-                    }
-                }
-                p.push_str("<|im_end|>\n");
-                tool_run_start = None;
-            }
-            "tool" => {
-                let first_of_run = i == 0 || messages[i - 1]["role"].as_str() != Some("tool");
-                if first_of_run {
-                    tool_run_start = Some(p.len());
-                    p.push_str("<|im_start|>user");
-                }
-                p.push_str("\n<tool_response>\n");
-                p.push_str(content_text(m).trim());
-                p.push_str("\n</tool_response>");
-                let next_is_tool =
-                    i + 1 < n && messages[i + 1]["role"].as_str() == Some("tool");
-                if !next_is_tool {
-                    p.push_str("<|im_end|>\n");
-                    tool_run_start = None;
-                }
-            }
-            _ => {
-                p.push_str("<|im_start|>user\n");
-                p.push_str(content_text(m).trim());
-                p.push_str("<|im_end|>\n");
-                tool_run_start = None;
-            }
-        }
-    }
-
-    // ── 4) 生成头 ──
-    p.push_str("<|im_start|>assistant\n");
-    if cfg.enable_thinking {
-        p.push_str("<think>\n");
-    } else {
-        p.push_str("<think>\n\n</think>\n\n");
-    }
-    (p, boundary)
-}
 
 // ───────────────────────── 输出解析（思考 / 正文 / 工具调用）─────────────────────────
 
@@ -608,7 +313,7 @@ pub(crate) fn respond_chunked(stream: &mut TcpStream, body: &[u8]) -> Result<()>
 
 // ─────────────────────────── ㊿-P1 会话驻留（多会话·单物化） ───────────────────────────
 //
-// 形态（PLAN_NEXT §6.3.2 P1 v1）：**任意数量会话驻留，但同时只物化一个 Sequence**。
+// 形态（PLAN_NEXT P1 v1）：**任意数量会话驻留，但同时只物化一个 Sequence**。
 // 切换时当前会话整份 `save_host_checkpoint` 沉到 host RAM（秒级唤醒 = H2D 灌回，
 // 不是重跑 prefill）；沉没层总量受 `LINGXI_SERVE_SUNK_MB`（默认 32GB）约束，超了按 LRU 丢
 // （数据损失，打响亮日志）。KV 预算走 `KvBudget`（pledge = prompt+生成+余量）；
@@ -865,13 +570,13 @@ pub(crate) fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8
 
 // ═══════════════════════════ v1.5 并发路径（多物化 + 真并发） ═══════════════════════════
 //
-// 结构（PLAN_NEXT §6.3.2 P1→v1.5）：
-//   连接线程（每连接一个）：读 HTTP/请求体 → `Req` 送进队列 → 阻塞转发 `Ev` 字节回 socket
-//   引擎线程（唯一）：收 `Req` → 物化/切换会话（`Sessions`）→ prefill → 把生成拆成
-//     每会话一个 `Gen`，**轮转步进**（每轮每个活跃 Gen 一个 token）——单流时间片，
-//     无队头阻塞；引擎内部（Kernels/scratch/图固定槽/路由工作区）全线程局部，
-//     串行步进下天然安全。
-//   会话隔离：每会话 per-session CUDA Graph epoch（切换 = epoch_switch，图集各自保留；
-//   新建/唤醒 = epoch_fresh；沉没 = epoch_purge）。`LINGXI_SERVE_MATERIALIZED`（默认 2）
-//   控制同时物化上限，超配把最久未动的 live 会话沉到 host（生成中的会话受 protect）。
-//   投机解码与并发调度不兼容（草稿态绑会话）——投机开时整体走串行路径（见 `run`）。
+// 结构（PLAN_NEXT P1→v1.5）：
+// 连接线程（每连接一个）：读 HTTP/请求体 → `Req` 送进队列 → 阻塞转发 `Ev` 字节回 socket
+// 引擎线程（唯一）：收 `Req` → 物化/切换会话（`Sessions`）→ prefill → 把生成拆成
+// 每会话一个 `Gen`，**轮转步进**（每轮每个活跃 Gen 一个 token）——单流时间片，
+// 无队头阻塞；引擎内部（Kernels/scratch/图固定槽/路由工作区）全线程局部，
+// 串行步进下天然安全。
+// 会话隔离：每会话 per-session CUDA Graph epoch（切换 = epoch_switch，图集各自保留；
+// 新建/唤醒 = epoch_fresh；沉没 = epoch_purge）。`LINGXI_SERVE_MATERIALIZED`（默认 2）
+// 控制同时物化上限，超配把最久未动的 live 会话沉到 host（生成中的会话受 protect）。
+// 投机解码与并发调度不兼容（草稿态绑会话）——投机开时整体走串行路径（见 `run`）。

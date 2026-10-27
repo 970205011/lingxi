@@ -1,4 +1,4 @@
-//! build.rs — 把 `cuda/*.cu` 编译为 `$OUT_DIR/*.cubin`（§5）。
+//! build.rs — 把 `cuda/*.cu` 编译为 `$OUT_DIR/*.cubin`。
 //! 纯函数 kernel：无全局态、无隐式 stream 依赖；host 侧 launch 封装后续加 cudarc。
 
 use std::path::Path;

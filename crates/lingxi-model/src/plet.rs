@@ -1,14 +1,14 @@
 //! PLE（Per-Layer Embedding，**仅 layer 1**）。数学对齐 HF `Qwen4ExpTextPLELayer`：
-//! ```text
-//! emb            = ngram_embedding(ngram_hash(input_ids))     # [T, ple_embed_dim]
-//! key_normed     = norm_key(key_proj(emb))                    # [T, hc, hidden]
-//! value          = value_proj(emb)                            # [T, hidden]
-//! query_normed   = norm_query(hidden_states)                  # [T, hc, hidden]
-//! gate           = Σ_i key_normed*query_normed / sqrt(hidden) # [T, hc, 1]
-//! gate          = sign(gate) * sqrt(clamp(|gate|, 1e-6))
-//! gated_value    = sigmoid(gate) * value.unsqueeze(-2)        # [T, hc, hidden]
-//! out            = gated_value + short_conv(norm_conv(gated_value))
-//! ```
+//! `text
+//! emb = ngram_embedding(ngram_hash(input_ids)) # [T, ple_embed_dim]
+//! key_normed = norm_key(key_proj(emb)) # [T, hc, hidden]
+//! value = value_proj(emb) # [T, hidden]
+//! query_normed = norm_query(hidden_states) # [T, hc, hidden]
+//! gate = Σ_i key_normed*query_normed / sqrt(hidden) # [T, hc, 1]
+//! gate = sign(gate) * sqrt(clamp(|gate|, 1e-6))
+//! gated_value = sigmoid(gate) * value.unsqueeze(-2) # [T, hc, hidden]
+//! out = gated_value + short_conv(norm_conv(gated_value))
+//! `
 //! `short_conv` = 膨胀深度卷积（K=4, dilation=ngram_size=3）+ silu。
 //!
 //! ngram 哈希与 95GiB 表的查表在 host 上做（按需 `pread`，不整表进内存）；
@@ -140,7 +140,7 @@ impl PleDerived {
 ///
 /// 为什么必须有缓存：表在机械盘上，每 token 要按 ngram 哈希**随机**取
 /// `heads` 行（本模型 `heads=120`）。95 GiB 的随机读基本每次都是寻道，
-/// 实测单 token 因此抖动到 0.15 s（`docs/decode-speed-profile.md` §3.10）。
+/// 实测单 token 因此抖动到 0.15 s。
 /// 但同一段对话里同一批 token 的 ngram 行会**反复命中**（相邻 token 的
 /// 2~4-gram 窗口只平移一格），所以进程内缓存一次就够。
 ///
@@ -148,6 +148,13 @@ impl PleDerived {
 /// 满了按 FIFO 淘汰。缓存与否**不改变数值**（只省 I/O）。
 pub struct PleTable {
     file: File,
+    /// 补（2026-10-27）：**mmap 直达路径**。miss 原来是 `read_exact_at` 每行一次
+    /// syscall（表在 /dev/shm 时实测 PLE ~36ms/次 ×2/chunk ≈ 0.65s/prefill，占 6%）；
+    /// mmap 后随机行读 = 直接指针访问（tmpfs 页常驻，重复进程 ~100ns），且**跳过
+    /// RowCache**（4GB LRU 的 HashMap+逐出行分配对 90B 行是纯开销，页缓存严格更优；
+    /// 磁盘表靠既有 prewarm 喂页缓存，mmap 同样受益）。**逐位等价**：同字节同 dequant。
+    /// `LINGXI_PLE_NOMMAP=1` 回退 read_exact_at + RowCache 旧路。
+    mmap: Option<memmap2::Mmap>,
     row_bytes: usize,
     /// FP8(E4M3) 模式：`Some(scale)` ⇒ 行是 row_elems 字节的 e4m3 索引，读时查表 ×scale。
     /// 来源 = 官方 NVFP4 版模型自带的 PLE 表（51.2GB，bf16 母表的官方发布格式，
@@ -157,7 +164,9 @@ pub struct PleTable {
     /// （2B fp16 scale + 16B packed nibbles，split-half：byte j 低半 = 元素 j、高半 = 元素 j+16）。
     /// 解码语义与 ninfer-dev `ple_iq4nl_dequant_row` 逐项一致。sidecar `<path>.iq4nl` 存在即启用。
     iq4nl: bool,
-    cache: std::cell::RefCell<RowCache>,
+    /// host 行缓存。`Mutex` 而非 `RefCell`：双会话并发（`LINGXI_TALK_SPEC_BATCH`）时
+    /// 两个线程同时 ple_step ⇒ RefCell 双借 panic（2026-10-25 实测）。命中路径持锁 ~µs。
+    cache: std::sync::Mutex<RowCache>,
 }
 
 /// llama.cpp IQ4_NL 码本（与 ninfer-dev `ple_iq4nl_codebook` 一致）。
@@ -269,8 +278,24 @@ impl PleTable {
             ),
             _ => {}
         }
+        // 补：mmap 直达（见 struct 字段注释）。失败静默回退旧路。
+        let mmap = if crate::flag("LINGXI_PLE_NOMMAP") {
+            None
+        } else {
+            match unsafe { memmap2::Mmap::map(&file) } {
+                Ok(m) => {
+                    eprintln!("[ple] mmap 直达路径（跳过 RowCache）");
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("[ple] mmap 失败（{e}），回退 read_exact_at + RowCache");
+                    None
+                }
+            }
+        };
         Ok(Self {
             file,
+            mmap,
             row_bytes: if fp8_scale.is_some() {
                 row_elems
             } else if iq4nl {
@@ -280,7 +305,7 @@ impl PleTable {
             },
             fp8_scale,
             iq4nl,
-            cache: std::cell::RefCell::new(RowCache {
+            cache: std::sync::Mutex::new(RowCache {
                 map: std::collections::HashMap::new(),
                 order: std::collections::VecDeque::new(),
                 bytes: 0,
@@ -289,15 +314,61 @@ impl PleTable {
         })
     }
 
-    /// 取一行（`head_dim` 个 f32）。命中缓存则不碰磁盘。
+    /// 取一行（`head_dim` 个 f32）。mmap 直达路径直接指针访问；旧路命中缓存则不碰磁盘。
     fn read_row(&self, id: u64, out: &mut [f32]) -> Result<()> {
-        let mut c = self.cache.borrow_mut();
+        // 补 mmap 直达：同字节同 dequant ⇒ 逐位等价；越界语义同 read_exact_at（报错）。
+        if let Some(mm) = &self.mmap {
+            let off = id
+                .checked_mul(self.row_bytes as u64)
+                .and_then(|o| usize::try_from(o).ok())
+                .ok_or_else(|| anyhow::anyhow!("PLE 行号越界：id={id} row_bytes={}", self.row_bytes))?;
+            let buf = mm
+                .get(off..off + self.row_bytes)
+                .ok_or_else(|| anyhow::anyhow!("PLE 行号越界：id={id}（表 {} B）", mm.len()))?;
+            self.dequant_row(buf, out);
+            return Ok(());
+        }
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = c.map.get(&id) {
             out.copy_from_slice(v);
             return Ok(());
         }
-        let mut buf = vec![0u8; self.row_bytes];
-        self.file.read_exact_at(&mut buf, id * self.row_bytes as u64)?;
+        // ★ 2026-10-25：行缓冲走**栈**（90 B / 160 B / 2×hidden 都 ≤ 1 KiB），
+        // 不再每行 `vec![0u8; row_bytes]` —— 一次 decode 轮 96 行就是 96 次堆分配，
+        // 而这些分配正是"层 1 单点软卡 3.3 s"（direct reclaim）唯一可能的落点。
+        let mut stack = [0u8; 1024];
+        let mut heap: Vec<u8>;
+        let buf: &mut [u8] = if self.row_bytes <= stack.len() {
+            &mut stack[..self.row_bytes]
+        } else {
+            heap = vec![0u8; self.row_bytes];
+            &mut heap[..]
+        };
+        self.file.read_exact_at(buf, id * self.row_bytes as u64)?;
+        self.dequant_row(buf, out);
+        if c.cap_bytes > 0 {
+            let row_bytes = self.row_bytes;
+            if c.bytes + row_bytes > c.cap_bytes {
+                while c.bytes + row_bytes > c.cap_bytes {
+                    match c.order.pop_front() {
+                        Some(old) => {
+                            if let Some(v) = c.map.remove(&old) {
+                                c.bytes -= v.len() * 4;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+            c.map.insert(id, out.to_vec().into_boxed_slice());
+            c.order.push_back(id);
+            c.bytes += row_bytes;
+        }
+        Ok(())
+    }
+
+    /// 行字节 → f32 三档解码（FP8 / IQ4_NL / bf16），与 ninfer-dev 参考逐项一致。
+    fn dequant_row(&self, buf: &[u8], out: &mut [f32]) {
         if let Some(scale) = self.fp8_scale {
             let t = fp8_e4m3_table();
             for (i, &b) in buf.iter().enumerate() {
@@ -321,25 +392,6 @@ impl PleTable {
                 out[i] = bf16::from_bits(u16::from_le_bytes([ch[0], ch[1]])).to_f32();
             }
         }
-        if c.cap_bytes > 0 {
-            let row_bytes = self.row_bytes;
-            if c.bytes + row_bytes > c.cap_bytes {
-                while c.bytes + row_bytes > c.cap_bytes {
-                    match c.order.pop_front() {
-                        Some(old) => {
-                            if let Some(v) = c.map.remove(&old) {
-                                c.bytes -= v.len() * 4;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-            c.map.insert(id, out.to_vec().into_boxed_slice());
-            c.order.push_back(id);
-            c.bytes += row_bytes;
-        }
-        Ok(())
     }
 }
 
@@ -371,7 +423,7 @@ fn shift_right_ignore_eos(tokens: &[i64], shift: usize, eos: i64) -> Vec<i64> {
 ///
 /// ⚠️ 这里曾经对**整段历史**每个位置都算一遍（`O(L·heads·ngram)`），于是
 /// decode 的 host 时间随上下文长度线性增长（实测 300 token 上下文时单项
-/// 就 ~5 ms/token，见 §3.10）。调用方只要末尾 `t` 行，所以内层循环收窄到
+/// 就 ~5 ms/token，见）。调用方只要末尾 `t` 行，所以内层循环收窄到
 /// `t` 个位置即可 —— 数值完全不变（每个位置的行号只依赖它自己的局部窗口）。
 pub fn ngram_ids(cfg: &PleCfg, d: &PleDerived, ids: &[i64], t: usize) -> Vec<i64> {
     assert!(t <= ids.len(), "ngram_ids: t={t} > ids.len()={}", ids.len());
@@ -433,6 +485,12 @@ pub fn ple_forward(
     let dim = cfg.hc * hidden;
 
     // 1) ngram 表查表 → emb [T, embed_dim]（host）
+    // ★ 2026-10-25：**PLE 是唯一只在 layer 1 的模块**，而"单轮软卡 1.5~3.4 s"
+    // 的逐层探针把那一轮全部记在 `层1 wall` 上（供层 0.2 µs，说明卡在本函数里）。
+    // 这里按段计时（`LINGXI_PLE_PROF=1`，只在总耗时 > 100 ms 时打一行），
+    // 口径：`查表` 是 host 侧 `pread`（表在机械盘/内存会差三个数量级），
+    // `D2H` 三次 `clone_dtoh` 是**同步点**（等 GPU 会落在这里）。
+    let t_ple = std::time::Instant::now();
     let rows = ngram_ids(cfg, d, ids, t);
     let mut emb = vec![0f32; t * cfg.embed_dim];
     let mut rowbuf = vec![0f32; d.head_dim];
@@ -444,6 +502,7 @@ pub fn ple_forward(
                 .copy_from_slice(&rowbuf);
         }
     }
+    let t_ple_read = t_ple.elapsed().as_secs_f64() * 1e3;
     let emb_bf: Vec<bf16> = emb.iter().map(|v| bf16::from_f32(*v)).collect();
     let demb = k.stream.clone_htod(&emb_bf)?;
 
@@ -460,9 +519,11 @@ pub fn ple_forward(
     k.grouped_rmsnorm_bf16(x, &w.norm_query, &mut query_n, t as u32, dim, hidden, cfg.eps)?;
 
     // 4) gate（host）：gate[t,g] = Σ_i key_n·query_n / sqrt(hidden) → 逐段处理
+    let t_ple_d2h = std::time::Instant::now();
     let key_h: Vec<f32> = k.stream.clone_dtoh(&key_n)?.iter().map(|v| v.to_f32()).collect();
     let query_h: Vec<f32> = k.stream.clone_dtoh(&query_n)?.iter().map(|v| v.to_f32()).collect();
     let value_h: Vec<f32> = k.stream.clone_dtoh(&value)?.iter().map(|v| v.to_f32()).collect();
+    let t_ple_d2h_ms = t_ple_d2h.elapsed().as_secs_f64() * 1e3;
     let inv = 1.0f32 / (hidden as f32).sqrt();
     let mut gated = vec![0f32; t * dim];
     for i in 0..t {
@@ -500,6 +561,14 @@ pub fn ple_forward(
     // 6) out = gated_value + short_conv(...)
     let mut out = k.stream.alloc_zeros::<bf16>(t * dim)?;
     k.add_bf16(&dgated, &conv, &mut out, t * dim)?;
+    let t_ple_all = t_ple.elapsed().as_secs_f64() * 1e3;
+    if t_ple_all > 100.0 && crate::flag("LINGXI_PLE_PROF") {
+        eprintln!(
+            "    [ple-prof] t={t} 总 {t_ple_all:.0} ms：查表(host pread) {t_ple_read:.1}／\
+             D2H(3 次同步) {t_ple_d2h_ms:.1}／其余(kernel 发牌+host gate) {:.1}",
+            t_ple_all - t_ple_read - t_ple_d2h_ms
+        );
+    }
     Ok(out)
 }
 
@@ -517,6 +586,16 @@ pub struct PleState {
     /// 必须换缓冲再 swap（与 GDN 的 `k_hist/k_hist_next` 同范式）。
     pub hist_next: CudaSlice<bf16>,
     pub hist_len: usize,
+    /// **host 侧暂存（只增不减，按需扩容）**：`emb` / `rowbuf` / `emb_bf`。
+    /// ★ 2026-10-25：这三个原来是每步 `vec![...]` 新分配 ⇒ **每个 decode 轮
+    /// 都向内核申请新页**（`emb` 61 KB + 96×`buf` 90 B）。实测约 25% 的跑会出现"某一轮
+    /// 单点软卡 3.3 s"，逐段探针把它钉在 **PLE 的 host 段、且不在任何一次 `read_row` 里**
+    /// （单行最大只有 29 µs）⇒ 进程在两次极短的读之间被冻住。容器 `pgscan_direct` 有计数
+    /// （2.08M）说明**直接回收（direct reclaim）**会落在这条分配路径上；把它改成常驻后，
+    /// 每轮不再申请新页，这条停顿就没有落点了。
+    pub emb: Vec<f32>,
+    pub rowbuf: Vec<f32>,
+    pub emb_bf: Vec<bf16>,
 }
 
 impl PleState {
@@ -527,6 +606,9 @@ impl PleState {
             hist: k.stream.alloc_zeros::<bf16>(hist_len * dim)?,
             hist_next: k.stream.alloc_zeros::<bf16>(hist_len * dim)?,
             hist_len,
+            emb: Vec::new(),
+            rowbuf: Vec::new(),
+            emb_bf: Vec::new(),
         })
     }
 
@@ -562,56 +644,126 @@ pub fn ple_step(
     // 1) ngram 表查表 → emb [T, embed_dim]（host）；只算末尾 t 个位置
     let t_ple_host = std::time::Instant::now();
     let rows_all = ngram_ids(cfg, d, ids_all, t);
-    let mut emb = vec![0f32; t * cfg.embed_dim];
-    let mut rowbuf = vec![0f32; d.head_dim];
-    for i in 0..t {
-        for h in 0..d.heads {
-            let id = rows_all[i * d.heads + h] as u64;
-            w.table.read_row(id, &mut rowbuf)?;
-            emb[i * cfg.embed_dim + h * d.head_dim..i * cfg.embed_dim + (h + 1) * d.head_dim]
-                .copy_from_slice(&rowbuf);
+    let t_ple_ngram = t_ple_host.elapsed();
+    // host 暂存常驻（只扩容，不再每步 `vec!` —— 见 `PleState::emb` 的注释）
+    let need = t * cfg.embed_dim;
+    if state.emb.len() < need {
+        state.emb.resize(need, 0.0);
+        state.emb_bf.resize(need, bf16::ZERO);
+    }
+    if state.rowbuf.len() < d.head_dim {
+        state.rowbuf.resize(d.head_dim, 0.0);
+    }
+    let mut max_row_us = 0f64;
+    {
+        let emb = &mut state.emb[..need];
+        let rowbuf = &mut state.rowbuf[..d.head_dim];
+        // ★ 补：查表循环并行化。t=512 时 8192 次行读串行 ~55-105ms/chunk（≈0.6s
+        // prefill，6%）——行与行互相独立（读-only 表 + 不相交输出切片），逐位等价。
+        // 单行长尾（40~180µs）疑似宿主调度/软卡噪声，16 线程摊薄 ~10×。
+        // `LINGXI_NO_PLE_PAR=1` 回退串行（对拍用）。
+        let lookups = t * d.heads;
+        if lookups >= 256 && !crate::flag("LINGXI_NO_PLE_PAR") {
+            use rayon::prelude::*;
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 16);
+            let chunk = t.div_ceil(nthreads); // 按 token 行切（每行 heads 个查表）
+            let heads = d.heads;
+            let head_dim = d.head_dim;
+            let embed_dim = cfg.embed_dim;
+            let table = &w.table;
+            let rows_all = &rows_all;
+            emb.par_chunks_mut(chunk * embed_dim)
+                .enumerate()
+                .try_for_each(|(pi, part)| -> Result<()> {
+                    let start = pi * chunk;
+                    let mut rb = vec![0f32; head_dim];
+                    let nrows = part.len() / embed_dim;
+                    for j in 0..nrows {
+                        let i = start + j;
+                        if i >= t {
+                            break;
+                        }
+                        let row = &mut part[j * embed_dim..(j + 1) * embed_dim];
+                        for h in 0..heads {
+                            let id = rows_all[i * heads + h] as u64;
+                            table.read_row(id, &mut rb)?;
+                            row[h * head_dim..(h + 1) * head_dim].copy_from_slice(&rb);
+                        }
+                    }
+                    Ok(())
+                })?;
+        } else {
+        for i in 0..t {
+            for h in 0..d.heads {
+                let id = rows_all[i * d.heads + h] as u64;
+                let t_row = std::time::Instant::now();
+                w.table.read_row(id, rowbuf)?;
+                let us = t_row.elapsed().as_secs_f64() * 1e6;
+                if us > max_row_us {
+                    max_row_us = us;
+                }
+                emb[i * cfg.embed_dim + h * d.head_dim..i * cfg.embed_dim + (h + 1) * d.head_dim]
+                    .copy_from_slice(rowbuf);
+            }
+        }
         }
     }
     let t_ple_read = t_ple_host.elapsed();
-    let emb_bf: Vec<bf16> = emb.iter().map(|v| bf16::from_f32(*v)).collect();
-    let demb = k.stream.clone_htod(&emb_bf)?;
+    for (dst, &src) in state.emb_bf[..need].iter_mut().zip(state.emb[..need].iter()) {
+        *dst = bf16::from_f32(src);
+    }
+    let demb = k.stream.clone_htod(&state.emb_bf[..need])?;
     if crate::flag("LINGXI_PLE_PROF") {
         eprintln!(
-            "[ple-prof] t={t} rows={} 查表+反量化 {:.1}ms  f32→bf16+H2D {:.1}ms",
+            "[ple-prof] t={t} rows={} ngram_ids {:.1}ms／查表+反量化 {:.1}ms（单行最大 {max_row_us:.0}µs）／\
+             f32→bf16+H2D {:.1}ms",
             t * d.heads,
-            t_ple_read.as_secs_f64() * 1e3,
+            t_ple_ngram.as_secs_f64() * 1e3,
+            (t_ple_read - t_ple_ngram).as_secs_f64() * 1e3,
             (t_ple_host.elapsed() - t_ple_read).as_secs_f64() * 1e3
         );
     }
 
     // 2) key/value 投影
-    let mut key = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    // ★ 2026-10-25：**全部改走 scratch 池**。原来这 8 个中间张量是
+    // `alloc_zeros` ⇒ 每次 PLE 步 8 次 `cudaMalloc` + 8 次 `cudaFree`（每轮 ~16 次驱动往返）。
+    // 它们**全都是纯写**（下面的核都是覆盖写，`add_bf16` 也是 `y = a + b`，不是累加）
+    // ⇒ 不需要清零，池化安全；同一 stream 顺序保证"放回后被后续核覆写"必在"先前读它的核"之后。
+    // 这同时是"单轮软卡都记在层 1"的头号嫌疑（驱动在池紧张时的分配停顿）。
+    let mut key = crate::scratch::bf16(k, t * dim)?;
     proj_t1(k, &demb, &w.key_proj, &mut key, dim, cfg.embed_dim, t)?;
-    let mut key_n = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut key_n = crate::scratch::bf16(k, t * dim)?;
     k.grouped_rmsnorm_bf16(&key, &w.norm_key, &mut key_n, t as u32, dim, hidden, cfg.eps)?;
-    let mut value = k.stream.alloc_zeros::<bf16>(t * hidden)?;
+    let mut value = crate::scratch::bf16(k, t * hidden)?;
     proj_t1(k, &demb, &w.value_proj, &mut value, hidden, cfg.embed_dim, t)?;
 
     // 3) query_normed = norm_query(x)
-    let mut query_n = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut query_n = crate::scratch::bf16(k, t * dim)?;
     k.grouped_rmsnorm_bf16(x, &w.norm_query, &mut query_n, t as u32, dim, hidden, cfg.eps)?;
 
     // 4) gate：**GPU kernel**（原本是 host 参考实现：每层 3 次 D2H + 1 次 H2D，
-    //    18 层 PLE × 每 token = 54 次硬同步，是 decode 的主要停顿来源之一）
+    // 18 层 PLE × 每 token = 54 次硬同步，是 decode 的主要停顿来源之一）
     let inv = 1.0f32 / (hidden as f32).sqrt();
-    let mut dgated = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut dgated = crate::scratch::bf16(k, t * dim)?;
     k.ple_gate_bf16(&key_n, &query_n, &value, &mut dgated, t, cfg.hc, hidden, inv)?;
+    crate::scratch::put_bf16(key);
+    crate::scratch::put_bf16(key_n);
+    crate::scratch::put_bf16(value);
+    crate::scratch::put_bf16(query_n);
 
     // 5) norm_conv
-    let mut gated_n = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut gated_n = crate::scratch::bf16(k, t * dim)?;
     k.grouped_rmsnorm_bf16(&dgated, &w.norm_conv, &mut gated_n, t as u32, dim, hidden, cfg.eps)?;
 
     // 6) 膨胀短卷积：**融合版（一次 launch，P15-㊵）**。
-    //    原链「hist→cin 拷 / gated_n→cin 拷 / conv 全量 / cin 尾→hist 拷 / cout 尾→conv 拷」= 5 发
-    //    + 2 次 (hl+t)×dim 缓冲分配；现在直接读 (hist, gated_n)、只算 t 行、
-    //    历史推进写 hist_next 后 swap（逐位语义与 GDN 已验证的融合核相同：k 升序、silu 同式）。
+    // 原链「hist→cin 拷 / gated_n→cin 拷 / conv 全量 / cin 尾→hist 拷 / cout 尾→conv 拷」= 5 发
+    // + 2 次 (hl+t)×dim 缓冲分配；现在直接读 (hist, gated_n)、只算 t 行、
+    // 历史推进写 hist_next 后 swap（逐位语义与 GDN 已验证的融合核相同：k 升序、silu 同式）。
     let hl = state.hist_len;
-    let mut conv = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut conv = crate::scratch::bf16(k, t * dim)?;
     {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let (hp, _g0) = state.hist.device_ptr(&k.stream);
@@ -626,7 +778,10 @@ pub fn ple_step(
     std::mem::swap(&mut state.hist, &mut state.hist_next);
 
     // 7) out = gated_value + short_conv(...)
-    let mut out = k.stream.alloc_zeros::<bf16>(t * dim)?;
+    let mut out = crate::scratch::bf16(k, t * dim)?;
     k.add_bf16(&dgated, &conv, &mut out, t * dim)?;
+    crate::scratch::put_bf16(gated_n);
+    crate::scratch::put_bf16(conv);
+    crate::scratch::put_bf16(dgated);
     Ok(out)
 }

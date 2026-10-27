@@ -1,5 +1,5 @@
 # P15-㊳：把 bf16 PLE 母表量化成官方 IQ4_NL 格式（26.8GiB）。
-# 用法（在测试容器内）：python3 tools/convert/quantize_ple_iq4nl.py [行数]
+# 用法（在 141 内）：python3 tools/convert/quantize_ple_iq4nl.py [行数]
 # 产物：/dev/shm/qwen4_exp.ple-table.iq4nl.bin（320001536 行 × 90 B）+ 空 sidecar .iq4nl
 #
 # 格式 = llama.cpp IQ4_NL（dequant 语义与 ninfer-dev ple_iq4nl_dequant_row 逐项对齐）：
@@ -10,12 +10,12 @@
 import numpy as np
 import sys, os, time
 
-SRC = "/data/models/lingxi-assets/qwen4_exp.ple-table.bin"
+SRC = "/models/lingxi-assets/qwen4_exp.ple-table.bin"
 OUT = "/dev/shm/qwen4_exp.ple-table.iq4nl.bin"
 ROWS = 320_001_536
 ROW_ELEMS = 160
 BLOCK = 32
-NBLK = ROW_ELEMS // BLOCK  # 5
+NBLK = ROW_ELEMS // BLOCK # 5
 CB = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
 MID = (CB[:-1] + CB[1:]) / 2  # 15 个边界，cb 有序 ⇒ 最近码 = sum(x > mid)
 NSTEP = 8

@@ -28,7 +28,7 @@ pub struct ServeOpts<'a> {
     pub max_new_default: usize,
 }
 
-/// **只记性能、不记内容**的 JSONL（数据飞轮 M1，见 BACKLOG §6.2）。
+/// **只记性能、不记内容**的 JSONL。
 ///
 /// 应用侧拿 `request_id` 与自己的对话日志 join，就能得到“真实 token 流 + 每 token 耗时”。
 /// `LINGXI_SERVE_PERF_LOG` 置空可关；`LINGXI_SERVE_PERF_MAX_MB` 控制轮转（默认 64MB，留 3 份）。
@@ -178,7 +178,7 @@ fn handle(
     stream.set_nodelay(true).ok();
     // 单线程 accept 循环：一个只连不发的连接会把整个服务卡死 ⇒ 等**请求头**必须有超时。
     // ⚠️ 但 body 可能是一大段上下文，30s 会把它掐断（用户实测 24K token 请求被断开）⇒
-    //    头读完就放宽到 10min。
+    // 头读完就放宽到 10min。
     stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
     stream.set_write_timeout(Some(std::time::Duration::from_secs(120))).ok();
     let mut rdr = BufReader::new(stream.try_clone()?);
@@ -257,13 +257,15 @@ fn handle(
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, "application/json", br#"{"ok":true}"#),
-        ("GET", "/stats") => respond(
+        // 轻量监视面板（可选）：`LINGXI_NO_DASHBOARD=1` 关闭 `/stats` + `/dashboard`
+        // （生产只暴露 /health 时用它显式关掉，而不是靠网络层挡）。
+        ("GET", "/stats") if !crate::serve::stats::disabled() => respond(
             &mut stream,
             200,
             "application/json",
             crate::serve::stats::json().as_bytes(),
         ),
-        ("GET", "/dashboard") => respond(
+        ("GET", "/dashboard") if !crate::serve::stats::disabled() => respond(
             &mut stream,
             200,
             "text/html; charset=utf-8",
@@ -441,15 +443,25 @@ fn chat(
 
     // ── 智能前缀复用（C3）：最长匹配检查点 + 消息边界检查点 ──
     let cache_on = prefix_cache_enabled();
-    // **按请求选路**：只有完全没有前缀可复用的请求才开 MTP。
-    // 有缓存命中时走自回归——MTP 的草稿 KV 还没纳入检查点，混用会算错；
-    // 这样冷请求吃投机提速，热请求吃前缀缓存的 TTFT≈0。
+    // **按请求选路**（2026-10-25 改，）：缓存命中不再一票否决投机。
+    // 旧设计：命中 ⇒ 纯 AR（吃 TTFT≈0）。但多轮对话的每一轮都命中——于是生产的
+    // 典型请求**永远**吃不到投机（实测：168 tok 走 AR 3.9s，投机只需 ~2.2s）。
+    // 新判据（重 prefill 成本 vs 投机收益，实测数字：prefill ~0.5ms/tok、
+    // AR ~43 tok/s、投机 ~90 tok/s ⇒ 收益 ~12.7ms/tok ⇒ 盈亏 max_tokens ≈ prompt/25）：
+    // 命中但 `max_tokens ≥ max(prompt/25, 48)` ⇒ 放弃复用、整段重 prefill 开投机；
+    // 短生成或超长 prompt ⇒ 保持旧路（TTFT≈0 + AR）。
+    // 两条路都是 trunk 贪心 ⇒ 文本逐位相同，纯性能路由。`LINGXI_SPEC_ON_HIT=0` 回滚。
     let pre_reuse = if cache_on {
         cache.best(&ids).map(|(_, l)| l).unwrap_or(0)
     } else {
         0
     };
-    let spec_on = spec.is_some() && pre_reuse == 0;
+    let spec_on_hit = std::env::var("LINGXI_SPEC_ON_HIT")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let spec_on = spec.is_some()
+        && (pre_reuse == 0
+            || (spec_on_hit && max_tokens >= 48 && max_tokens * 25 >= prompt_tokens));
     // 本请求的专家统计（引擎内部；应用侧拿不到）
     crate::arena_source::expert_track_reset();
     let t0 = Instant::now();
@@ -505,16 +517,24 @@ fn chat(
             eprintln!("[serve] MTP prime 失败，回退纯自回归: {e:#}");
         } else {
             let kd = rt.kd();
-            match seq
-                .spec_prepare(eng, provider, kd + 1)
-                .and_then(|sb| Ok((sb, seq.decode_token_with_hyper(eng, provider)?)))
-            {
-                Ok((sb, (tok2, h_last))) => {
+            let init_res = (|| -> Result<(lingxi_driver::SpecBuffers, Vec<i64>, cudarc::driver::CudaSlice<half::bf16>, f64)> {
+                let sb = seq.spec_prepare(eng, provider, kd + 1)?;
+                // AR 基准 ms/tok：取**第二步** decode（第一步含一次性冷成本，实测 44.3 vs
+                // 稳态 24.4——抬高关闸 ② 门槛近 2×）。多花一步 decode 换可靠判据。
+                let (tok2, _h2) = seq.decode_token_with_hyper(eng, provider)?;
+                let t_ar = Instant::now();
+                let (tok3, h_last) = seq.decode_token_with_hyper(eng, provider)?;
+                Ok((sb, vec![tok2, tok3], h_last, t_ar.elapsed().as_secs_f64() * 1e3))
+            })();
+            match init_res {
+                Ok((sb, toks, h_last, ar_ms)) => {
                     // `first` 由生成器开头直接发（与纯自回归同口径）；队列里只放它之后的 token
                     let mut queue = VecDeque::new();
-                    queue.push_back(tok2);
-                    spec_gen =
-                        Some(SpecGen { rt, sb, h_last, queue, accepted: 0, rounds: 0, verified: 0, disabled: false });
+                    queue.extend(toks);
+                    spec_gen = Some(SpecGen {
+                        rt, sb, h_last, queue, accepted: 0, rounds: 0, verified: 0, disabled: false,
+                        ar_ms, eff: std::collections::VecDeque::new(),
+                    });
                 }
                 Err(e) => eprintln!("[serve] 投机初始化失败，回退纯自回归: {e:#}"),
             }
@@ -612,7 +632,9 @@ fn run_prefill(
     let mut restored = 0usize;
     let mut hit = "";
     let mut best: Option<(usize, usize)> = None;
-    if allow_reuse && cache_on {
+    // ★ 2026-10-25：spec_on 时**不恢复**检查点——投机要整段重 prefill 收
+    // hyper（命中恢复 ⇒ hyper_p=None ⇒ MTP 被静默跳过，修了选路也不生效）。
+    if allow_reuse && cache_on && !spec_on {
         best = cache.best(ids);
         // 没命中（或命中的是别的会话的 host 缓存）⇒ 先把设备上当前会话整段换出到内存，
         // 别让它一直占着显存；下次再命中时拉回来。
@@ -667,7 +689,7 @@ fn run_prefill(
     }
     // 消息边界检查点：只有“从更早的位置续跑”才有意义。
     // ⚠️ spec_on 时跳过：投机要 `prefill_with_hyper` 在**空序列**上整段喂（收全段 hyper），
-    //    先喂边界前缀会把 seq 弄非空 → assert 炸（2026-10-20 v1.5 验证实测命中）。
+    // 先喂边界前缀会把 seq 弄非空 → assert 炸（2026-10-20 v1.5 验证实测命中）。
     let boundary = if allow_reuse && cache_on && !spec_on {
         boundary.filter(|&b| b > restored && b < ids.len())
     } else {
@@ -988,13 +1010,13 @@ fn conn_loop_inner(
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, "application/json", br#"{"ok":true}"#),
-        ("GET", "/stats") => respond(
+        ("GET", "/stats") if !crate::serve::stats::disabled() => respond(
             &mut stream,
             200,
             "application/json",
             crate::serve::stats::json().as_bytes(),
         ),
-        ("GET", "/dashboard") => respond(
+        ("GET", "/dashboard") if !crate::serve::stats::disabled() => respond(
             &mut stream,
             200,
             "text/html; charset=utf-8",
@@ -1612,7 +1634,7 @@ fn run_concurrent(
     let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            // 非阻塞 accept：否则 shutdown 后线程永远卡在 `incoming()` 上不退出。
+            // 非阻塞 accept：否则 shutdown 后线程永远卡在 `incoming` 上不退出。
             listener.set_nonblocking(true).ok();
             loop {
                 if SHUTDOWN.load(Ordering::Relaxed) {

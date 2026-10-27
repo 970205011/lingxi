@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 长上下文（256K）单实例部署：双卡 layer-split，主入口 :8000。
+# 长上下文（256K）单实例部署：双卡 layer-split，主入口:8000。
 # 用法：PORT=8000 CTX=262144 SLOTS=7200 SLOTS1=7600 bash tools/deploy/up_long.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -21,14 +21,14 @@ HIST=${HIST:-run/hist_live.csv}
 # MTP 投机：冷请求（无前缀可复用）自动开，命中缓存的请求自动退回自回归。
 # ⚠️ 256K + MTP 首次重启要确认显存；若顶到 32G，把 SLOTS/SLOTS1 各降 400~800。
 SPEC=${SPEC:-1}
-MTP=${MTP:-/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer}
+MTP=${MTP:-/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer}
 ART=${LINGXI_ARTIFACT:-/models/qwen4_exp-artifact/qwen4_exp.ninfer}
 
 # 2026-10-18 实测（33,052-token 代码类冷 prefill，MTP 开）：
-#   lo=24/chunk=512  336.9s
-#   lo=28/chunk=512  319.3s（−5.2%，但 chunk 1024 会 OOM）
-#   lo=24/chunk=1024 278.7s（−17.3%，miss 440k vs 760k）← **生产默认**
-#   lo=24/chunk=1536 OOM（GPU0 32.4G）
+# lo=24/chunk=512 336.9s
+# lo=28/chunk=512 319.3s（−5.2%，但 chunk 1024 会 OOM）
+# lo=24/chunk=1024 278.7s（−17.3%，miss 440k vs 760k）← **生产默认**
+# lo=24/chunk=1536 OOM（GPU0 32.4G）
 SPLIT_LO=${SPLIT_LO:-24}
 CHUNK=${CHUNK:-1024}
 EXTRA=()

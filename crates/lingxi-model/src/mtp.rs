@@ -1,6 +1,6 @@
 //! MTP（多 token 预测）草稿层：权重加载 + **stem**。
 //!
-//! 规格与权威参考见 `docs/decode-speed-profile.md` §3.52：
+//! 规格与权威参考见：
 //! - 前向顺序取自 **Strata 的 `src/core/mtp.cpp` L669–693**（跑过 `--mtp`、已验证）；
 //! - 图结构对照 llama.cpp `qwen3next.cpp::graph_mtp`（L627–755）；
 //! - **不照抄 ninfer**（用户明确：它的 MTP 接受率是错的）。
@@ -105,8 +105,8 @@ pub fn load(k: &Kernels, art: &Artifact) -> Result<MtpWeights> {
     let mut fc_embedding = up("fc_embedding")?;
     let mut fc_hidden = up("fc_hidden")?;
     // ⚠️ 诊断开关：`fc_embedding` 与 `fc_hidden` **形状完全相同（[N,N]）**，
-    //    一旦产物里两者命名/顺序被搞反，症状正好是"能跑、量级正常、但全错"。
-    //    `LINGXI_MTP_SWAP_FC=1` 交换一下，用来一刀裁掉这个可能。
+    // 一旦产物里两者命名/顺序被搞反，症状正好是"能跑、量级正常、但全错"。
+    // `LINGXI_MTP_SWAP_FC=1` 交换一下，用来一刀裁掉这个可能。
     if crate::flag("LINGXI_MTP_SWAP_FC") {
         std::mem::swap(&mut fc_embedding, &mut fc_hidden);
         eprintln!("[mtp] ⚠️ LINGXI_MTP_SWAP_FC=1：已交换 fc_embedding / fc_hidden（诊断用）");
@@ -119,14 +119,14 @@ pub fn load(k: &Kernels, art: &Artifact) -> Result<MtpWeights> {
 
 /// **MTP stem**：`(Rin[T, HC*N], emb[T, N]) -> R[T, HC*N]`。
 ///
-/// 逐字对应 §3.52（Strata `src/core/mtp.cpp` L669–693）：
-/// ```text
-/// en = RMSNorm_N(emb, embedding_norm)            // 整段 N 宽
-/// e2 = fc_embedding @ en                         // [T, N]
-/// hn = 逐 stream RMSNorm_N(Rin, hidden_norm)     // HC 片各 norm
-/// h2 = fc_hidden @ hn                            // **每片各投一份**
-/// R  = h2 + repeat(e2, HC)                       // **广播相加**（不是 concat、不是只加一路）
-/// ```
+/// 逐字对应 （Strata `src/core/mtp.cpp` L669–693）：
+/// `text
+/// en = RMSNorm_N(emb, embedding_norm) // 整段 N 宽
+/// e2 = fc_embedding @ en // [T, N]
+/// hn = 逐 stream RMSNorm_N(Rin, hidden_norm) // HC 片各 norm
+/// h2 = fc_hidden @ hn // **每片各投一份**
+/// R = h2 + repeat(e2, HC) // **广播相加**（不是 concat、不是只加一路）
+/// `
 pub fn stem(
     k: &Kernels,
     w: &MtpWeights,
@@ -138,6 +138,10 @@ pub fn stem(
     let n = w.geom.n;
     let hc = w.geom.hc;
     let rows = t * hc; // 把 [T, HC, N] 当成 T*HC 行
+    // `LINGXI_MTP_PROF=1`：MTP 一步的分段事件探针从这里起（见 `mtp_prof`）。
+    crate::mtp_prof::begin(k, t)?;
+    // `LINGXI_DRAFT_PROF=1`：同一分段、**边界写法正确**的复本（见 `draft_prof` 顶部说明）。
+    crate::draft_prof::begin(k, t)?;
 
     // embedding 分支（整段 N 宽的一次 norm ⇒ group == dim）
     let mut en = scratch::bf16(k, t * n)?;
@@ -149,19 +153,19 @@ pub fn stem(
     // hidden 分支：`pre_fc_norm_hidden` 是 **[HC*N]（10240）** 的 gamma，**两种 norm 分组**：
     //
     // ★★ 2026-10-16 **翻案**：默认改成 **逐 stream**（`LINGXI_MTP_HNORM=pooled` 可退回）。
-    //   原注释写着"最初我按逐 stream 实现（group = N），实测接受率 0/64 —— 就是这里错了"，
-    //   但**那次对照与 stem 的 `+1` gamma 修正同期**（`tools/golden/mtp_fix_stem_norm.py`）
-    //   ⇒ 整个比较作废。重做的证据（交错 A/B，各跑 2 轮，n=200，`min_p=0` 全链）：
-    //     | 模式 | 每轮接受 | tok/s | 主干验证 ms/轮 |
-    //     | pooled | 3.47/6 | 38.6 / 37.2 | 83.7 / 86.6 |
-    //     | **stream** | **3.67/6** | **41.0 / 41.0** | **81.6 / 81.6** |
-    //   逐位条件接受率（位 0→5）：pooled 0.98/0.68/0.83/1.00/0.76/0.68；
-    //                              **stream 0.98/0.79/0.79/0.96/0.72/0.78** ⇒ 位 1 是主要改善点。
-    //   旁证：① Strata `src/core/mtp.cpp:686` 的注释明写逐 stream 才是
-    //        **"as llama.cpp's qwen4exp MTP graph does"**；② 同机同模型的「顺子」
-    //        开着 `--mtp-hnorm stream`（峰值 +3.7%）且 MTP 接受率 93~99%。
-    //   ⚠️ 测量陷阱：第一次 A/B 是"pooled 先跑、stream 后跑"，stream 那轮温度上来了
-    //      （主干验证 89→149 ms）⇒ 差点得出"stream 更慢 45%"的错结论。**A/B 必须交错。**
+    // 原注释写着"最初我按逐 stream 实现（group = N），实测接受率 0/64 —— 就是这里错了"，
+    // 但**那次对照与 stem 的 `+1` gamma 修正同期**（`tools/golden/mtp_fix_stem_norm.py`）
+    // ⇒ 整个比较作废。重做的证据（交错 A/B，各跑 2 轮，n=200，`min_p=0` 全链）：
+    // | 模式 | 每轮接受 | tok/s | 主干验证 ms/轮 |
+    // | pooled | 3.47/6 | 38.6 / 37.2 | 83.7 / 86.6 |
+    // | **stream** | **3.67/6** | **41.0 / 41.0** | **81.6 / 81.6** |
+    // 逐位条件接受率（位 0→5）：pooled 0.98/0.68/0.83/1.00/0.76/0.68；
+    // **stream 0.98/0.79/0.79/0.96/0.72/0.78** ⇒ 位 1 是主要改善点。
+    // 旁证：① Strata `src/core/mtp.cpp:686` 的注释明写逐 stream 才是
+    // **"as llama.cpp's qwen4exp MTP graph does"**；② 同机同模型的「顺子」
+    // 开着 `--mtp-hnorm stream`（峰值 +3.7%）且 MTP 接受率 93~99%。
+    // ⚠️ 测量陷阱：第一次 A/B 是"pooled 先跑、stream 后跑"，stream 那轮温度上来了
+    // （主干验证 89→149 ms）⇒ 差点得出"stream 更慢 45%"的错结论。**A/B 必须交错。**
     let pooled = std::env::var("LINGXI_MTP_HNORM").map(|v| v == "pooled").unwrap_or(false);
     let mut hn = scratch::bf16(k, rows * n)?;
     if pooled {
@@ -185,5 +189,7 @@ pub fn stem(
     k.add_bf16(&h2, &e2b, &mut r, rows * n)?;
     scratch::put_bf16(h2);
     scratch::put_bf16(e2b);
+    crate::mtp_prof::mark(k, 0)?; // 段 0 = stem 结束
+    crate::draft_prof::mark(k, 0)?; // 同上（正确边界版）
     Ok(r)
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """qwen4_exp 专家 arena 量化打包器（lingxi 收纳版，2026-10-19）。
 
-从内部脚本原样收纳并参数化：格式由 `ARENA_FMT` 环境
-变量选择（默认 Q4G64_F16S；Q3G128_F16S = 3.125bpw、blob −26%，见 PLAN_NEXT §6.2）。
+从 /data14t/tmp/quantize_expert_arena.py 原样收纳并参数化：格式由 `ARENA_FMT` 环境
+变量选择（默认 Q4G64_F16S；Q3G128_F16S = 3.125bpw、blob −26%，见 PLAN_NEXT ）。
 编码数值与字节布局单一来源 = ninfer-dev `tools/convert/common/quantize.py::
 quantize_and_encode`（3-bit 打包 = dense LSB-first 位流，128 值/48B，见上游 layouts.py
 _pack_three_bit；GPU 参考反量化在上游 gsq_dequant_sm70.cu）。
@@ -15,8 +15,8 @@ routed blob = [encode(gate_up [1280,2560])][encode(down [2560,640])]；shared �
 用法（本机）：
   ARENA_FMT=Q3G128_F16S PYTHONPATH=~/ninfer python3 \
     tools/arena-gen/quantize_expert_arena.py \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.bin \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin
+    /models/lingxi-assets/qwen4_exp.expert-arena.bin \
+    /models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin
 """
 from __future__ import annotations
 
@@ -296,7 +296,12 @@ def main() -> int:
               f"ETA {el / (l + 1) * (NL - l - 1):.0f}s", flush=True)
         # 层尾显式释放：hessians 12.8GB + W 副本 ~5GB 必须在下一层解析（+12.8GB）前归还，
         # 否则峰值 ~38GB 超 available → 全局 OOM（2026-10-21 05:18 实证被杀）。
-        del hessians, Wgu_of, Wdn_of, layer_blob_gu, layer_blob_dn
+        # hessians 只在 hess_dir（逐层懒加载）模式下于循环内绑定；file 模式（line 109
+        # 单次加载）要跨层保留，无 GPTQ 时从未绑定——三种情况都不能无条件 del
+        # （2026-10-22 实证：无 GPTQ_H 跑到第 3 层 UnboundLocalError）。
+        if hess_dir:
+            del hessians
+        del Wgu_of, Wdn_of, layer_blob_gu, layer_blob_dn
         import gc
         gc.collect()
     omm.flush()

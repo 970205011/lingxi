@@ -1,5 +1,5 @@
 // L1 RMSNorm（f32 契约测试版）：y[r,i] = x[r,i] / rms(x[r,:]) * gamma[i]
-//   rms(x) = sqrt(mean_i x^2 + eps)
+// rms(x) = sqrt(mean_i x^2 + eps)
 // 一 block 处理一行，block 内归约。纯函数；gamma 已由转换器烘焙好。
 
 extern "C" __global__ void lingxi_rmsnorm_f32(const float* __restrict__ x,

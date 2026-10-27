@@ -1,14 +1,14 @@
 //! GDN（Gated DeltaNet 线性注意力，36 层）。数学对齐 HF `Qwen4ExpTextGatedDeltaNet`
 //! 的 **recurrent** 形式（`torch_recurrent_gated_delta_rule`，单序列下与 chunk 形式等价）：
-//! ```text
+//! `text
 //! qkv = in_proj_qkv(x); z = in_proj_z(x); a = in_proj_a(x); b = in_proj_b(x)
-//! qkv = silu(causal_conv1d(qkv, K=4));  q,k,v = split(qkv)
+//! qkv = silu(causal_conv1d(qkv, K=4)); q,k,v = split(qkv)
 //! q,k = l2norm(q,k); q /= sqrt(head_k_dim)
-//! beta = sigmoid(b);  g = -exp(A_log) * softplus(a + dt_bias)
-//! S = 0;  逐 token:  S *= exp(g_t);  delta = (v_t - k_t^T S) * beta_t
-//!                    S += k_t ⊗ delta;  o_t = q_t^T S
-//! out = out_proj( RMSNormGated(o, z) )
-//! ```
+//! beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias)
+//! S = 0; 逐 token: S *= exp(g_t); delta = (v_t - k_t^T S) * beta_t
+//! S += k_t ⊗ delta; o_t = q_t^T S
+//! out = out_proj(RMSNormGated(o, z))
+//! `
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -317,7 +317,7 @@ pub fn gdn_step(
     gdn_step_rec(k, w, x, t, c, state, None)
 }
 
-/// **`gdn_step` 的内部输入录像 / 重放**（PLAN §P15-F）。
+/// **`gdn_step` 的内部输入录像 / 重放**。
 ///
 /// 为什么要它：投机提交时要把 GDN 的状态挪到 `accept` 行处。`gdn_step` 做三件事
 /// `投影(qkv/z/a/b) → 卷积(推进 k_hist) → 递推(推进 s_all)`，**三步全是 `mixed` 的纯函数**。
@@ -374,18 +374,18 @@ pub fn gdn_step_rec(
     }
     let t0 = std::time::Instant::now();
     // 【子段括号】`投影` 段不是"一个 kernel"：它是
-    //   ① `qkv` 的 Q4 GEMV（[conv_dim, h]，本轮最大的一块）
-    //   ② `z` 的 Q4 GEMV（[value_dim, h]，同一份权重的另一段，**又读一遍 x**）
-    //   ③ 两个 tiny 的 bf16 GEMV（`a_b_projection` 的 a 段与 b 段，n=num_v_heads）
-    //   ④ 5 次 `scratch` 分配 + 视图切片的 CPU 侧开销
+    // ① `qkv` 的 Q4 GEMV（[conv_dim, h]，本轮最大的一块）
+    // ② `z` 的 Q4 GEMV（[value_dim, h]，同一份权重的另一段，**又读一遍 x**）
+    // ③ 两个 tiny 的 bf16 GEMV（`a_b_projection` 的 a 段与 b 段，n=num_v_heads）
+    // ④ 5 次 `scratch` 分配 + 视图切片的 CPU 侧开销
     // 冷启动口径下 ①+② 的字节（21.2 MB / 403 GB/s）应 ≈55 µs，而 KTS 实测这一段要 ~86 µs
     // ⇒ 差的 ~31 µs 到底是"多一次 launch/排空"还是"两个 tiny GEMV"还是"CPU 侧"，靠这三个刻度二分。
     let mut t_mark_qkvz = t0;
     let mut t_mark_z = t0;
     let mut t_mark_ab = t0;
     // ★ **重放模式**（`LINGXI_...`）：跳过全部投影，直接把录像里的内部输入拷回来。
-    //   投影（尤其 `query_key_value_z` 那 84 MB/层）是 GDN 层最大的 HBM 流量，
-    //   而它的输出对同一批行是完全确定的 ⇒ 重放时**没有理由再算一次**。
+    // 投影（尤其 `query_key_value_z` 那 84 MB/层）是 GDN 层最大的 HBM 流量，
+    // 而它的输出对同一批行是完全确定的 ⇒ 重放时**没有理由再算一次**。
     let replay = rec.as_ref().map_or(false, |r| r.replay);
     // `LINGXI_GDN_REPLAY_ZERO=1`（诊断）：重放时把这 4 个内部输入缓冲**零初始化**。
     // 用途：判"重放读到了没被完整写过/残留的内存"——若零初始化后抖消失，就是这类问题。
@@ -402,6 +402,10 @@ pub fn gdn_step_rec(
     let mut a = alc(t * c.num_v_heads)?;
     let mut bb = alc(t * c.num_v_heads)?;
     let nvh = c.num_v_heads;
+    // ★ 2026-10-24：a/b 是否已并进 `qkvz` 那一发（见下面 `proj_q4_plus_ab`）。
+    let mut ab_fused = false;
+    // `LINGXI_ATTN_SYNC=1`：分段探针的现场信息（`begin` 已由 layer.rs 打过第 0 个事件）
+    crate::attn_prof::info(t, 0);
     if replay {
         let r = rec.as_ref().unwrap();
         let off = r.off;
@@ -409,6 +413,8 @@ pub fn gdn_step_rec(
         k.stream.memcpy_dtod(&r.z.slice(off * value_dim..(off + t) * value_dim), &mut z)?;
         k.stream.memcpy_dtod(&r.a.slice(off * nvh..(off + t) * nvh), &mut a)?;
         k.stream.memcpy_dtod(&r.b.slice(off * nvh..(off + t) * nvh), &mut bb)?;
+        // 重放跳过全部投影 ⇒ 段 1/2 记 0 宽，段 3 = 这四次拷贝
+        crate::attn_prof::mark(k, 3)?;
         if kts {
             k.stream.synchronize()?;
             t_mark_qkvz = std::time::Instant::now();
@@ -419,12 +425,24 @@ pub fn gdn_step_rec(
     // `query_key_value_z` 是每层最大的稠密矩阵（84 MB），decode 下走 W4 融合反量化 GEMV
     // 可以把它的 HBM 流量砍到 1/2~1/2.2（实测 Q4GEMV 321 GB/s vs bf16 725 GB/s，payload 小 3.77x）。
     if let Some(wq) = &w.query_key_value_z_q4 {
-        crate::gpu::proj_q4_epi(k, x, wq, &mut qkv, conv_dim, h, 0, t, 0, 0.0, 0.0)?;
+        // ★ 2026-10-24：a/b 的 96 行 bf16 作为**本发 qkvz 的尾巴 block**（合发）。
+        // 省掉两次 n=48 的 tiny GEMV（17.5 µs，几乎全是发射地板）；
+        // 合发核逐字保留 Q4 体与 `gemm_skinny_row_bf16` 行体 ⇒ 逐位等价。
+        // `LINGXI_NO_GDN_AB_FUSE=1` 回退（回退时下面那段还会照旧发两次 `proj_t1`）。
+        ab_fused = crate::gpu::proj_q4_plus_ab(
+            k, x, wq, &mut qkv, conv_dim,
+            &w.a_b_projection, &mut a, &mut bb, nvh, h, t,
+        )?;
+        if !ab_fused {
+            crate::gpu::proj_q4_epi(k, x, wq, &mut qkv, conv_dim, h, 0, t, 0, 0.0, 0.0)?;
+        }
+        crate::attn_prof::mark(k, 1)?;
         if kts {
             k.stream.synchronize()?;
             t_mark_qkvz = std::time::Instant::now();
         }
         crate::gpu::proj_q4_epi(k, x, wq, &mut z, value_dim, h, conv_dim, t, 0, 0.0, 0.0)?;
+        crate::attn_prof::mark(k, 2)?;
         if kts {
             k.stream.synchronize()?;
             t_mark_z = std::time::Instant::now();
@@ -433,21 +451,26 @@ pub fn gdn_step_rec(
         let qkv_w = w.query_key_value_z.slice(0..conv_dim * h);
         let z_w = w.query_key_value_z.slice(conv_dim * h..total * h);
         proj_t1(k, x, &qkv_w, &mut qkv, conv_dim, h, t)?;
+        crate::attn_prof::mark(k, 1)?;
         if kts {
             k.stream.synchronize()?;
             t_mark_qkvz = std::time::Instant::now();
         }
         proj_t1(k, x, &z_w, &mut z, value_dim, h, t)?;
+        crate::attn_prof::mark(k, 2)?;
         if kts {
             k.stream.synchronize()?;
             t_mark_z = std::time::Instant::now();
         }
     }
-    proj_t1(k, x, &w.a_b_projection.slice(0..nvh * h), &mut a, nvh, h, t)?;
-    proj_t1(
-        k, x, &w.a_b_projection.slice(nvh * h..2 * nvh * h),
-        &mut bb, nvh, h, t,
-    )?;
+    if !ab_fused {
+        proj_t1(k, x, &w.a_b_projection.slice(0..nvh * h), &mut a, nvh, h, t)?;
+        proj_t1(
+            k, x, &w.a_b_projection.slice(nvh * h..2 * nvh * h),
+            &mut bb, nvh, h, t,
+        )?;
+    }
+    crate::attn_prof::mark(k, 3)?;
     if kts {
         k.stream.synchronize()?;
         t_mark_ab = std::time::Instant::now();
@@ -498,7 +521,7 @@ pub fn gdn_step_rec(
 
     // `LINGXI_KT=1`：在引擎内量**单个 kernel 的真实 GPU 时间**，判断引擎里的 kernel 是否也像
     // 微基准那样带宽受限（微基准 [16384,2560] → 108µs / 775 GB/s）。
-    // ⚠️ 必须加 `query_key_value_z_q4.is_none()` 守卫：开了 `LINGXI_DENSE_Q4` 之后
+    // ⚠️ 必须加 `query_key_value_z_q4.is_none` 守卫：开了 `LINGXI_DENSE_Q4` 之后
     // bf16 的 `query_key_value_z` 是空的，下面 `.slice(0..conv_dim*h)` 会 unwrap 到 None 直接 panic
     //（实测：`LINGXI_KT=1` + `LINGXI_DENSE_Q4=1` → 首个 decode token 崩在 cudarc core.rs:2010）。
     if kt_on() && t == 1 && w.query_key_value_z_q4.is_none() {
@@ -523,13 +546,13 @@ pub fn gdn_step_rec(
         t0.elapsed()
     };
     // 2) 卷积：**融合版（一次 launch）**。
-    //    原来要「hist→cin 拷 / qkv→cin 拷 / conv 算 (kh+t) 行 / 末尾 kh 行→hist 拷」= **4 次 launch**，
-    //    `LINGXI_KTS` 实测 **28 µs/层**，而数据只有 ~5 µs（launch ≈ 6.6 µs）——几乎全是发射开销。
-    //    现在直接读 `(k_hist, qkv)`、只算 t 行、把历史推进写进 `k_hist_next`（双缓冲避开竞态）。
+    // 原来要「hist→cin 拷 / qkv→cin 拷 / conv 算 (kh+t) 行 / 末尾 kh 行→hist 拷」= **4 次 launch**，
+    // `LINGXI_KTS` 实测 **28 µs/层**，而数据只有 ~5 µs（launch ≈ 6.6 µs）——几乎全是发射开销。
+    // 现在直接读 `(k_hist, qkv)`、只算 t 行、把历史推进写进 `k_hist_next`（双缓冲避开竞态）。
     let mut cout = scratch::bf16(k, t * conv_dim)?;
     if kh > 0 {
         // ⚠️ 指针守卫（`DevicePtrGuard`）在 Drop 时才算归还借用，所以必须**整段括起来**，
-        //    不能跨越 `swap`（否则 E0499/E0502：swap 需要再借 `state.k_hist*`）。
+        // 不能跨越 `swap`（否则 E0499/E0502：swap 需要再借 `state.k_hist*`）。
         {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             let (hp, _g0) = state.k_hist.device_ptr(&k.stream);
@@ -545,6 +568,8 @@ pub fn gdn_step_rec(
     }
     scratch::put_bf16(qkv);
 
+    // 段 4 结束：卷积
+    crate::attn_prof::mark(k, 4)?;
     let t_conv = if kts {
         k.stream.synchronize()?;
         t0.elapsed()
@@ -552,7 +577,7 @@ pub fn gdn_step_rec(
         t0.elapsed()
     };
     // 3) 递推：**GPU kernel** 就地推进 `state.s_all`。
-    //    `LINGXI_GDN_HOST=1` 回退到 host 参考（`recurrent_core`），用于对拍。
+    // `LINGXI_GDN_HOST=1` 回退到 host 参考（`recurrent_core`），用于对拍。
     let mut dgated = scratch::bf16(k, t * value_dim)?;
     let host_fallback = crate::flag("LINGXI_GDN_HOST");
     if host_fallback {
@@ -578,12 +603,23 @@ pub fn gdn_step_rec(
             lingxi_ids::GateActivation::Silu => 0,
             lingxi_ids::GateActivation::Sigmoid => 1,
         };
-        k.gdn_recurrent_bf16(
-            &cout, &z, &a, &bb, &w.norm,
-            state.a_log_d.as_ref().unwrap(), state.dt_bias_d.as_ref().unwrap(),
-            &mut state.s_all, &mut dgated,
-            t, c.head_k_dim, c.head_v_dim, c.num_v_heads, c.num_k_heads, gate_act, 0, 1,
-        )?;
+        // ㉟+1：递推多 warp 占用率版（M5 便宜形态）。t>1 才值得（decode t=1 走旧核），
+        // 有损档（跨 split 定序归约 ≠ 旧核单线程升序；PLAN_NEXT 判据），`LINGXI_GDN_MW=1`。
+        if t > 1 && crate::flag("LINGXI_GDN_MW") {
+            k.gdn_recurrent_mw_bf16(
+                &cout, &z, &a, &bb, &w.norm,
+                state.a_log_d.as_ref().unwrap(), state.dt_bias_d.as_ref().unwrap(),
+                &mut state.s_all, &mut dgated,
+                t, c.head_k_dim, c.head_v_dim, c.num_v_heads, c.num_k_heads, gate_act,
+            )?;
+        } else {
+            k.gdn_recurrent_bf16(
+                &cout, &z, &a, &bb, &w.norm,
+                state.a_log_d.as_ref().unwrap(), state.dt_bias_d.as_ref().unwrap(),
+                &mut state.s_all, &mut dgated,
+                t, c.head_k_dim, c.head_v_dim, c.num_v_heads, c.num_k_heads, gate_act, 0, 1,
+            )?;
+        }
     }
 
     let ts_rec = if kts {
@@ -592,6 +628,8 @@ pub fn gdn_step_rec(
     } else {
         t0.elapsed()
     };
+    // 段 5 结束：递推
+    crate::attn_prof::mark(k, 5)?;
 
     if prof {
         let t_all = t0.elapsed();
@@ -641,5 +679,7 @@ pub fn gdn_step_rec(
     scratch::put_bf16(a);
     scratch::put_bf16(bb);
     scratch::put_bf16(dgated);
+    // 段 6 结束：out_proj（层末：sync + 汇总打印）
+    crate::attn_prof::mark(k, 6)?;
     Ok(y)
 }

@@ -5,7 +5,7 @@
 目的：回答"能不能压到 2bit 还保住精度"。全部在单专家矩阵上量，
 指标 = 权重 Frobenius 相对误差 + 随机向量 matvec 相对误差。
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/quant_frontier.py

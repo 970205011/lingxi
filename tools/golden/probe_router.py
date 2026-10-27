@@ -19,12 +19,12 @@ sys.path.insert(0, "/models/lingxi/tools/golden")
 import torch.nn as nn  # noqa: E402
 from defuse import Defuser, load_ple_table  # noqa: E402
 from tools.convert.qwen4_exp import recipe as R  # noqa: E402
-from transformers.models.qwen4_exp.modeling_qwen4_exp import (  # noqa: E402
+from transformers.models.qwen4_exp.modeling_qwen4_exp import ( # noqa: E402
     Qwen4ExpForCausalLM,
     Qwen4ExpTextDecoderLayer,
     Qwen4ExpTextRotaryEmbedding,
 )
-from run_layer_golden import (  # noqa: E402
+from run_layer_golden import ( # noqa: E402
     _no_embedding_init,
     build_text_config,
     LAYER_PREFIX,
@@ -32,7 +32,7 @@ from run_layer_golden import (  # noqa: E402
 )
 
 DTYPE = torch.bfloat16
-ARTIFACT = os.environ.get("LINGXI_ARTIFACT", "/data/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer")
+ARTIFACT = os.environ.get("LINGXI_ARTIFACT", "/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer")
 
 
 class _StopAfterLayer1(Exception):

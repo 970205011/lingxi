@@ -1,6 +1,6 @@
 //! `lingxi-plan` — 由 [`TensorCatalog`] 生成运行时内存布局（offset / [`Span`]）。
 //!
-//! 职责边界（见 `ARCHITECTURE.md` §3）：**只算地址，不做计算、不碰 CUDA。
+//! 职责边界（见 `ARCHITECTURE.md`）：**只算地址，不做计算、不碰 CUDA。
 //! ** 它是 `TensorResolver` 的实现方：model/kernel 只拿 [`TensorId`] 换 [`Span`]。
 
 use lingxi_ids::{Span, TensorCatalog, TensorId, TensorResolver};

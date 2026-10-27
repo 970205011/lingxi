@@ -11,15 +11,16 @@ members = [
     "crates/lingxi-kernels",
     "crates/lingxi-model",
     "crates/lingxi-driver",
-    "crates/lingxi-server",
     "crates/lingxi-bench",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.80"
+description = "V100 (sm_70) inference engine for Qwen3-Next"
+repository = "https://github.com/970205011/lingxi"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -28,6 +29,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 half = "2"
+memmap2 = "0.9"
+rayon = "1.12"
 log = "0.4"
 env_logger = "0.11"
 cudarc = { version = "0.19", features = ["cuda-12080", "cublas", "f16"] }

@@ -1,11 +1,11 @@
 # lingxi 推理框架总体设计——strata × ninfer 优势综合方案
 
 > 事实源：
-> - strata 源码（已读透，详见 [strata-mtp-expert-cache-plan.md](docs/strata-mtp-expert-cache-plan.md)）；
-> - ninfer C++ fork 源码（`$DATA/ninfer-dev`，已拉出 892 个源码文件对照阅读，
->   含其自己的 STRATA_RESEARCH.md，
+> - strata 源码（已读透，详见 [strata-mtp-expert-cache-plan.md](file:///root/lingxi/docs/strata-mtp-expert-cache-plan.md)）；
+> - ninfer C++ fork 源码（`/data14t/ninfer-dev`，已拉出 892 个源码文件对照阅读，
+>   含其自己的 [STRATA_RESEARCH.md](file:///root/ninfer_read/docs/perf/STRATA_RESEARCH.md)，
 >   属互相参考关系，fork 已转录过 strata 的槽位/profile 思想并按 V100 现实做了关键修正）；
-> - lingxi 现有架构约束 [ARCHITECTURE.md](ARCHITECTURE.md)（硬约束，本文不违反）。
+> - lingxi 现有架构约束 [ARCHITECTURE.md](file:///root/lingxi/ARCHITECTURE.md)（硬约束，本文不违反）。
 >
 > 一句话：**ninfer 给「能不能跑起来」的工程骨架（产物、专家 arena、分页 KV、调度、HTTP），
 > strata 给「能不能跑快」的算法部件（profile 热度、lookahead、suffix/MTP Controller），
@@ -18,7 +18,7 @@
 | 语言 | C++/CUDA + Python server | C++/CUDA + 内嵌 HTTP | **Rust/cudarc**，unsafe 只在 kernels crate |
 | 主模型 | 另厂 MoE | Qwen3.8-27B dense + qwen4_exp MoE（端口进行中） | qwen4_exp：48 层混合（12 QSA / 36 GDN），512 选 10 MoE，hc=4，PLE |
 | 专家精度 | Q8_0（draft Q8_0，主模型 gguf 全档量化 MMQ） | BF16 原样镜像为主，备 W4/W5/W6/W8（Q4G64…）混档 | 同 ninfer 注册表，**离线产出 kernel 直接消费的镜像**（铁律 0.6） |
-| 专家 miss 怎么算 | **CPU 池 AVX512 + GPU 双路径**，舍入不同，temp=0 也会漂移（issue #152）；byte-identical 需一串开关 | **只搬字节、永远 GPU 同一套核算**（moe_expert_cache.cuh L8-18），命中与否逐位一致 | **继承 ninfer 这条**：不做 CPU 专家池；缓存只解决「字节在哪」，不引入第二条舍入路径 |
+| 专家 miss 怎么算 | **CPU 池 AVX512 + GPU 双路径**，舍入不同，temp=0 也会漂移（issue #152）；byte-identical 需一串开关 | **只搬字节、永远 GPU 同一套核算**（[moe_expert_cache.cuh](file:///root/ninfer_read/src/targets/qwen4_exp/impl/kernels/moe_expert_cache.cuh) L8-18），命中与否逐位一致 | **继承 ninfer 这条**：不做 CPU 专家池；缓存只解决「字节在哪」，不引入第二条舍入路径 |
 | 调度并发 | 单/少请求，验证窗内 T 列并行 | **连续批处理**：decode 合批（权重每轮只读一次）、单 prefill lane、FIFO 队首保护 + persistent backfill 准入、KV 预算准入 | 先单流贪心跑对，再按 ninfer 同款模型实现合批；**不提前抽象**（单流都没对先不写调度框架） |
 | KV | 分页 + FP16/Q8/Q4 + >64K 降 RAM | paged KV + **host KV arena 降级/恢复** + TBQ4（262K 实测可用）+ StateImage 前缀快照 | QSA 仅 12 层需要 KV（占比小）；GDN 36 层持递归 state；先 bf16，后续可借 TBQ4 |
 | 投机 | MTP + suffix trigram + Controller E[提交]/ms + 在线 EMA | MTP + DFlash2（27B 模型实测 57~59 t/s，接受率 0.52） | 按 strata 方案先 M0→M3（见专家方案文档 §3.1）；DFlash2 不做（需要训练管线） |
@@ -26,13 +26,13 @@
 | 服务 | Python OpenAI/Anthropic | **C++ 内嵌三套协议**：OpenAI Chat + Responses API + Anthropic Messages，SSE | axum 只做 OpenAI Chat Completions + SSE（YAGNI），Responses/Anthropic 排后 |
 | sm 目标 | sm_75 起，sm_70 实验性 | **sm_70 V100 一等公民**（本家和我们同硬件） | sm_70，cuBLAS bf16 tensor core + 自研小核；无 fp4 指令 |
 | 存储假设 | SSD、大内存 | SSD；qwen4 专家 arena 60GiB mmap | **机械盘**、79GB RAM、PCIe x8——三层存储更依赖离线镜像与预取设计 |
-| 验证文化 | scalar 参考+pinned llama.cpp oracle+负对照，env 门控手术 | bit 级对拍文化（C 系列每条独立验证）；故障静默回退教训深（C8） | T0–T3 分级（[ARCHITECTURE.md](ARCHITECTURE.md) §6）+ env 门控 + 每个新核配 golden |
+| 验证文化 | scalar 参考+pinned llama.cpp oracle+负对照，env 门控手术 | bit 级对拍文化（C 系列每条独立验证）；故障静默回退教训深（C8） | T0–T3 分级（[ARCHITECTURE.md](file:///root/lingxi/ARCHITECTURE.md) §6）+ env 门控 + 每个新核配 golden |
 
 # 2. 各自真正的强项（剔除表象后的清单）
 
 ## 2.1 ninfer 强在「工程骨架已经在同硬件上被生产验证过」
 
-1. **专家 arena 镜像格式 Q4EARN1**（moe_expert_arena.h）：
+1. **专家 arena 镜像格式 Q4EARN1**（[moe_expert_arena.h](file:///root/ninfer_read/src/targets/qwen4_exp/impl/kernels/moe_expert_arena.h)）：
    72B 头 + routed/shared 两张 16B 索引 + slot 对齐 blob 区；**每个 blob 自带字节数与格式字**，
    读侧强制校验「tag 与字节数一致」（挡「Q4 的标签、BF16 的长度」这类貌似合理的垃圾）；
    缺席条目 -1 支持稀疏 arena。转换期一次落盘、启动直接 mmap，**运行时零反量化**——与我们铁律 0.6 同构。
@@ -43,13 +43,13 @@
    聚合 gather（32 个 miss blob 拼成两发 H2D + 一个设备侧 scatter 核）；
    per-call scratch 与 persistent LRU 双模式；**call_pin 保证本 call 在用的槽不被自己驱逐**；
    fill 后 verify_slot 字节读回是上线唯一凭据。
-4. **三层 KV 体系**：device paged pool（paged_kv_cache.cpp）
+4. **三层 KV 体系**：device paged pool（[paged_kv_cache.cpp](file:///root/ninfer_read/src/core/paged_kv_cache.cpp)）
    → host pinned KV arena，device→host demote / host→device 逐页恢复完整实现；
    StateImage 前缀快照（shared 前缀/多轮命中）；TBQ4（WHT-d256 + Lloyd-Max 4bit）质量 A/B 过。
-5. **连续批处理调度**（scheduler.h）：
+5. **连续批处理调度**（[scheduler.h](file:///root/ninfer_read/src/runtime/engine/scheduler.h)）：
    FIFO 队首保护 + epoch/protection 机制，队首被资源阻塞时才借让出资源给 persistent backfill；
    prefill 单 lane、decode 多 lane 合批（`ordinary_decode_batch`，权重每轮只读一次，4 路近线性 3.5×）；
-   KV 容量准入（kv_capacity.cpp）与
+   KV 容量准入（[kv_capacity.cpp](file:///root/ninfer_read/src/runtime/engine/kv_capacity.cpp)）与
    materialization planner。
 6. **完整服务层**：OpenAI Chat / Responses API / Anthropic Messages 三套请求-状态机 + SSE +
    请求校验/操作日志（`src/serve/`），可直接照抄协议语义（不是代码）。
@@ -84,7 +84,7 @@
 
 # 3. 目标架构：部件从哪来、长在哪个 crate
 
-严格落在 [ARCHITECTURE.md](ARCHITECTURE.md) §1 的依赖方向上；
+严格落在 [ARCHITECTURE.md](file:///root/lingxi/ARCHITECTURE.md) §1 的依赖方向上；
 新增职责**优先新增模块**，不膨胀现有模块。
 
 ```
@@ -113,11 +113,11 @@ lingxi-bench     （golden/trace/命中率/接受率/对拍，旁路）
 - **放什么进槽**：第一层先用 STRP 风格 profile 预填（**per-layer 名额**，
   不许用全局到达顺序）；槽位数由自己的 routing trace 十折留一曲线定，不抄 7168。
   第二层再上 strata usage 衰减自适应（独立 stream、窗口间换入、迟滞门限）。
-- **hit/miss 行集拆分**：host 路由（[moe.rs](crates/lingxi-model/src/moe.rs)
+- **hit/miss 行集拆分**：host 路由（[moe.rs](file:///root/lingxi/crates/lingxi-model/src/moe.rs)
   已有 `sel_rows`）在调核前切行；hit 走槽内权重，miss 走 PCIe 直读 pin 住的 blob 上卡算；
   **两路径同一 GPU 核、同一 bf16 舍入**，输出按 router 原序 scatter 加权（现有
   `scatter_add_rows` 可复用）。不做 strata 的 CPU 池——确定性优先。
-- 细节顺序与门禁见 [strata-mtp-expert-cache-plan.md](docs/strata-mtp-expert-cache-plan.md) §3.2 E0–E2；
+- 细节顺序与门禁见 [strata-mtp-expert-cache-plan.md](file:///root/lingxi/docs/strata-mtp-expert-cache-plan.md) §3.2 E0–E2；
   其中 arena 文件格式/staging/聚合/gather/verify 的**实现以 ninfer 已验证代码为蓝本转录为 Rust**，
   不重新发明。
 
@@ -209,7 +209,7 @@ M3 Controller），不重复。补充两点 ninfer 侧实证：
 5. **新 kernel 先对 HF/scalar golden 再接线**；批量形状 vs 单列形状必须有 bit 级或容差对拍
    （multi_exact 原则）。
 6. **性能参数机上标定**：trace 命中率、接受率 EMA、cost model，先验只用于冷启动。
-7. T3 端到端贪心中若遇到 bf16 router 并列翻转，按 [ARCHITECTURE.md](ARCHITECTURE.md)
+7. T3 端到端贪心中若遇到 bf16 router 并列翻转，按 [ARCHITECTURE.md](file:///root/lingxi/ARCHITECTURE.md)
    T2 附注处理：逐行归因到并列翻转，不把混沌当 bug，也不把真 bug 塞进「混沌」里蒙混。
 
 
@@ -559,7 +559,7 @@ DeepGEMM / Marlin（sm_70 不支持）、`dp4a`（要 W4A8，破坏精度路线�
 | 逐块实测原账 | `docs/decode-speed-profile.md` §8.5~§8.7 | 落盘 ✅ |
 | 跨卡探针源码 | `tools/gpu/gpu_peer_probe.cu` | 落盘 ✅ |
 | 原始日志（KTS 逐层 / 命中率曲线 / P2P） | `docs/bench-logs/*.log.gz`（5 个，~24 KB） | 落盘 ✅ |
-| 本轮临时草稿日志 | 测试机 `/tmp/*.log` | 按用户要求留在 tmp（**不删**） |
+| 本轮临时草稿日志 | CT141 `/tmp/*.log` | 按用户要求留在 tmp（**不删**） |
 
 <!-- 维护提示：新增提速实验后，把"预期收益/风险/工作量"补进第 6 节总表，
      并把被否决的写进行末的否决清单（附件：decode-speed-profile.md §7 否决登记）。 -->

@@ -1,18 +1,18 @@
 // 跨卡（GPU0 ↔ GPU1）稳定性/带宽探针 —— 决定"GPU1 拿 32 GB 做专家常驻"这条路能不能走。
 //
-// 为什么需要（2026-10-16，docs/decode-speed-profile.md §8.6）：
+// 为什么需要：
 // 单流 26.8 ms/token 里 **26% 花在 PCIe 上**（专家 Q4 不在显存里，7000 槽 / 24576 专家，
 // 稳态 93% 命中 ⇒ 每 token 89 MB 过 PCIe）。单卡加槽到 9500 就 OOM ⇒ 单卡无解。
 // 唯一还有 >1.5× 潜力的结构改动是把专家摊到两块卡（2×32 GB）。
 // **但 project_memory 记着：GPU1（index1 = PCI 44:00.0，x8 链路）在高跨卡流量下会触发
 // PCIe CmpltTO 导致物理掉线。** 本探针要回答三件事：
-//   ① P2P（`cudaDeviceCanAccessPeer` / `cudaMemcpyPeerAsync`）在这对卡上到底能不能用；
-//   ② 设计口径（每层 ~56 KB、每 token ~2.7 MB、约 80 MB/s）长时间跑稳不稳、带宽多少；
-//   ③ 「把专家灌进 GPU1」（host→GPU1 一次性 ~30 GB）这个动作能不能扛。
+// ① P2P（`cudaDeviceCanAccessPeer` / `cudaMemcpyPeerAsync`）在这对卡上到底能不能用；
+// ② 设计口径（每层 ~56 KB、每 token ~2.7 MB、约 80 MB/s）长时间跑稳不稳、带宽多少；
+// ③ 「把专家灌进 GPU1」（host→GPU1 一次性 ~30 GB）这个动作能不能扛。
 //
-// 用法（测试机 内）：
-//   /usr/local/cuda-12.8/bin/nvcc -O2 -arch=sm_70 -o /tmp/gpu_peer_probe gpu_peer_probe.cu
-//   /tmp/gpu_peer_probe 2000 8          # 迭代 token 数、host→GPU1 的 GiB
+// 用法（CT141 内）：
+// /usr/local/cuda-12.8/bin/nvcc -O2 -arch=sm_70 -o /tmp/gpu_peer_probe gpu_peer_probe.cu
+// /tmp/gpu_peer_probe 2000 8 # 迭代 token 数、host→GPU1 的 GiB
 // 之后在宿主上看 `dmesg | tail -50` 有没有 Xid / CmpltTO。
 //
 // ⚠️ 本探针**只读**：不碰 /dev/shm、不碰 arena、不写任何模型文件。GPU1 掉卡只影响本进程。
@@ -88,8 +88,8 @@ int main(int argc, char** argv) {
         cudaSetDevice(0);
         cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
         // ⚠️ 只跑 5 次：2026-10-16 实测这台机器的 **IOMMU（DMAR）会挡掉 P2P DMA**
-        //    （`DMAR: [DMA Write NO_PASID] Request device [44:00.0] fault ... PTE Write access is not set`），
-        //    每次失败都在刷内核日志 ⇒ 次数必须小，别把 dmesg 刷爆。
+        // （`DMAR: [DMA Write NO_PASID] Request device [44:00.0] fault ... PTE Write access is not set`），
+        // 每次失败都在刷内核日志 ⇒ 次数必须小，别把 dmesg 刷爆。
         const int R = 5;
         cudaError_t e0 = cudaMemcpyPeerAsync(dst, 1, src, 0, bytes, 0); // 预热 + 取错误码
         cudaError_t e1 = cudaDeviceSynchronize();
@@ -113,8 +113,8 @@ int main(int argc, char** argv) {
     double bw5 = bench("peer 5 KB (激活)", s1, s0, SMALL, 0);
     if (bw5 > 0) bench("peer 2.61 MB (单专家 blob)", b1, b0, BLOB, 0);
     // ⚠️ `CanAccessPeer` 与 `EnablePeerAccess` **都返回 1**，但实测 5 KB 要 49 ms（0.0001 GB/s）——
-    //    DMA 撞 IOMMU（DMAR）后走的是"故障+回退"路。所以**门槛必须卡在带宽上**，
-    //    不能只看那两个 API 的返回值。<0.1 GB/s = 实际上不可用。
+    // DMA 撞 IOMMU（DMAR）后走的是"故障+回退"路。所以**门槛必须卡在带宽上**，
+    // 不能只看那两个 API 的返回值。<0.1 GB/s = 实际上不可用。
     const bool peer_ok = (bw5 > 0.1);
     printf("  ⇒ P2P 可用性：%s\n", peer_ok ? "可用" : "**实际不可用（IOMMU 挡 DMA；API 说可用但带宽 0.0001 GB/s）**");
 

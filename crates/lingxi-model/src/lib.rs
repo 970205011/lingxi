@@ -1,23 +1,27 @@
 //! `lingxi-model` — L2 前向逻辑 + 本模型的静态描述与张量角色推导。
 //!
-//! 职责边界（见 `ARCHITECTURE.md` §3）：**只做数学编排与模型知识；不做调度、不做 IO。**
+//! 职责边界（见 `ARCHITECTURE.md`）：**只做数学编排与模型知识；不做调度、不做 IO。**
 //!
 //! 张量角色（[`TensorRole`]）是**模型知识**，由 canonical 名字在加载期推导——
-//! 产物本身不含 role，因此不需要改动 ninfer 的产物（§0.5 复用铁律）。
+//! 产物本身不含 role，因此不需要改动 ninfer 的产物（复用铁律）。
 
 use lingxi_artifact::Artifact;
 use lingxi_ids::{Dims, LayerId, LayerKind, LayerSpec, ModelId, ModelSpec, TensorCatalog, TensorInfo, TensorRole};
 
+pub mod attn_prof;
 pub mod cpu_moe;
 pub mod decode;
+pub mod draft_prof;
 pub mod gdn;
 pub mod gpu;
 pub mod gr;
+pub mod gr_prof;
 pub mod graph;
 pub mod graph_timer;
 pub mod layer;
 pub mod moe;
 pub mod mtp;
+pub mod mtp_prof;
 pub mod plet;
 pub mod probes;
 pub mod q4;
@@ -52,6 +56,41 @@ pub fn flag(name: &str) -> bool {
         g.insert(name.to_string(), v);
     }
     v
+}
+
+/// **值感知**开关查询（2026-10-27 ㊿ 教训复发后引入）：未设 = `default`；设了按值判
+/// （"0"/"false"/"no"/"off" = 关，其余 = 开）。`flag` 是"存在即真"——
+/// `export LINGXI_X=0` 对它**照样是开**，值语义开关必须走这里才允许外部 `=0` 覆盖。
+pub fn flag_val(name: &str, default: bool) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let m = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = m.try_lock() {
+        if let Some(v) = g.get(name) {
+            return *v;
+        }
+    }
+    let v = match std::env::var(name) {
+        Err(_) => default,
+        Ok(s) => !matches!(s.as_str(), "0" | "false" | "no" | "off" | ""),
+    };
+    if let Ok(mut g) = m.lock() {
+        g.insert(name.to_string(), v);
+    }
+    v
+}
+
+/// 逗号分隔的整数表（诊断用）：判断 `v` 是否在 `name` 环境变量列出的集合里。
+/// 例：`LINGXI_FULLDEV_OFF=26,27` ⇒ 这两层强制走 legacy 路径。
+pub fn env_list_contains(name: &str, v: u32) -> bool {
+    match std::env::var(name) {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|t| t.trim().parse::<u32>().ok())
+            .any(|x| x == v),
+        Err(_) => false,
+    }
 }
 
 /// 静态形状（编译期常量集中地）。来自 HF `config.json` 的 `text_config`。

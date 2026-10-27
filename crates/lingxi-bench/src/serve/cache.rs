@@ -8,7 +8,7 @@
 /// - 缓存里放 **1~2 个状态检查点**（`StateCheckpoint`：GDN/PLE 真拷贝 + QSA 长度）；
 /// - 请求进来时找**最长匹配**的检查点（不要求最后一个字也对上）；
 /// - 另外在“最后一条消息之前”存一个**消息边界检查点**：用户只改最后一句时，
-///   前面的历史直接复用，只重读新消息。
+/// 前面的历史直接复用，只重读新消息。
 ///
 /// 默认**开**（`LINGXI_SERVE_PREFIX_CACHE=0` 可关）。
 pub(crate) enum CkptStore {
@@ -456,11 +456,11 @@ pub(crate) fn prefix_cache_enabled() -> bool {
 //
 // 产物里的 `chat_template.jinja` 是唯一权威：
 // - 思考：`<|im_start|>assistant\n<think>\n` 开场，模型只写思考内容，再自己收 `</think>`；
-//   `enable_thinking=false` 时改成 `<think>\n\n</think>\n\n` 直接进入正文。
+// `enable_thinking=false` 时改成 `<think>\n\n</think>\n\n` 直接进入正文。
 // - 工具：system 段注入 `<tools>` + 格式说明；模型输出
-//   `<tool_call><function=名><parameter=键>值</parameter></function></tool_call>`。
+// `<tool_call><function=名><parameter=键>值</parameter></function></tool_call>`。
 // - 历史：assistant 的 `reasoning_content` 回填 `<think>`；`tool_calls` 重放成 XML；
-//   连续 `role:"tool"` 合并进同一个 `<|im_start|>user` 的 `<tool_response>`。
+// 连续 `role:"tool"` 合并进同一个 `<|im_start|>user` 的 `<tool_response>`。
 
 /// 只认我们自己生成的文件名：`lingxi-ckpt-<13位毫秒>-<6位序号>.lxc`（可带 `.lxc.tmp`）。
 /// 缓存目录里的其他文件一律不读、不删。

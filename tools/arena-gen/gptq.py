@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPTQ one-shot 误差补偿（PLAN_NEXT §6.2-3）：真实校准的 Hessian ⇒ 同 bpw 误差砍半。
+"""GPTQ one-shot 误差补偿（PLAN_NEXT -3）：真实校准的 Hessian ⇒ 同 bpw 误差砍半。
 
 背景（2026-10-19 实测）：Q3G128 纯 RTN 专家权重 rel L2 27~32%（Q4G64 为 11~12%），
 pad4983 长程金丝雀翻船。GPTQ（OBQ 块状版）用校准激活的二阶信息把"已量化列的误差"
@@ -18,7 +18,7 @@ scale = fp16(max_abs/qmax)、reciprocal = f32(1/scale)、codes = clamp(round(w*r
   python3 tools/arena-gen/gptq.py
   断言：GPTQ 输出空间误差 < RTN 输出空间误差（幅度校验 rel L2 也打印）。
 
-校准 Hessian 的捕获（下一步，引擎侧）：见 PLAN_NEXT §6.2-3 记录。
+校准 Hessian 的捕获（下一步，引擎侧）：见 PLAN_NEXT -3 记录。
 """
 from __future__ import annotations
 

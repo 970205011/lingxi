@@ -2,30 +2,30 @@
 # 回归套件（㊽ 判据地基 → 2026-10-19 可用性判据版）：按 golden.toml 逐 case 跑判据。
 #
 # 用法：
-#   bash tests/regression/run.sh [env=val ...]     # 判据模式：不等即退出码 1
-#   bash tests/regression/run.sh RECORD=1 [...]    # 记录模式：打印实测值，不比对
+# bash tests/regression/run.sh [env=val ...] # 判据模式：不等即退出码 1
+# bash tests/regression/run.sh RECORD=1 [...] # 记录模式：打印实测值，不比对
 #
 # 环境：
-#   ART=/path/model.ninfer   产物路径（默认 /models/qwen4_exp-artifact/qwen4_exp.ninfer）
-#   CASES="smoke48,needle12k"  只跑指定 case（逗号分隔；默认全量）
-#   BLOCKING=1               置 CUDA_LAUNCH_BLOCKING=1（ stopgap：WIP 懒分配分支有一起
-#                            间歇 CUDA_ERROR_INVALID_VALUE（见 PLAN_NEXT 事故记录），
-#                            同步发射可关闭竞态窗口；根因修复前回归门禁默认开）
+# ART=/path/model.ninfer 产物路径（默认 /models/qwen4_exp-artifact/qwen4_exp.ninfer）
+# CASES="smoke48,needle12k" 只跑指定 case（逗号分隔；默认全量）
+# BLOCKING=1 置 CUDA_LAUNCH_BLOCKING=1（stopgap：WIP 懒分配分支有一起
+# 间歇 CUDA_ERROR_INVALID_VALUE（见 PLAN_NEXT 事故记录），
+# 同步发射可关闭竞态窗口；根因修复前回归门禁默认开）
 #
 # 设计约束：
-#   * 走 ./start.sh ⇒ 与生产同一套 env；传入的 env=val 放 start.sh 之前生效
-#     （start.sh 内部开关一律 ${VAR:-default} 形式，可被外部覆盖——2026-10-19 教训）。
-#   * 每个 case 独立进程（引擎不跨 run 复用状态）。
+# * 走 ./start.sh ⇒ 与生产同一套 env；传入的 env=val 放 start.sh 之前生效
+# （start.sh 内部开关一律 ${VAR:-default} 形式，可被外部覆盖——2026-10-19 教训）。
+# * 每个 case 独立进程（引擎不跨 run 复用状态）。
 #
 # golden.toml case 字段（2026-10-19 判据升级：从"首 token 金丝雀"到"可用性判据"）：
-#   name               case 名
-#   prompt / prompt_file  二选一
-#   tokens             期望的 prompt token 数（信息项，输出对照用）
-#   max_new            生成长度（默认 1）。可用性判据必须 >1，否则 eos 即"测了寂寞"
-#   expect_first_token 首 token 锚（可选；短 prompt 稳定锚保留，长 prompt 有损档会合法翻转）
-#   expect_contains    逗号分隔子串，生成文本必须**全部**包含（质量/检索判据）
-#   min_new            生成 token 数下限（可选，默认：设了 expect_contains 则 ≥1）
-#   source             记录口径（哪套环境录的期望值）
+# name case 名
+# prompt / prompt_file 二选一
+# tokens 期望的 prompt token 数（信息项，输出对照用）
+# max_new 生成长度（默认 1）。可用性判据必须 >1，否则 eos 即"测了寂寞"
+# expect_first_token 首 token 锚（可选；短 prompt 稳定锚保留，长 prompt 有损档会合法翻转）
+# expect_contains 逗号分隔子串，生成文本必须**全部**包含（质量/检索判据）
+# min_new 生成 token 数下限（可选，默认：设了 expect_contains 则 ≥1）
+# source 记录口径（哪套环境录的期望值）
 set -u
 cd "$(dirname "$0")/../.."
 ART=${ART:-${LINGXI_ARTIFACT:-/models/qwen4_exp-artifact/qwen4_exp.ninfer}}

@@ -5,7 +5,7 @@
   A) 专家模式的奇异值谱 → 判 TD-MoE / BitsMoE 的"共享基/Tucker 分解"对我们是否可行
   B) 上下文条件熵 → 判 DeepCABAC/CABAC 式上下文熵编码能比一阶熵再省多少
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/quant_deep.py

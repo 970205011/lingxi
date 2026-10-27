@@ -1,20 +1,10 @@
-//! 专家 arena 直读源：`Q4EARN1` arena → 设备 Q4 槽缓存 →（视图解量化）→ 紧凑 bf16 scratch。
-//!
-//! **归属**：arena 容器与"每 blob 格式字"来自 ninfer-dev（灵犀分支）；设计参考
-//! Strata（`Niko1221/Strata`, MIT）的 pinned arena + 常驻槽位思想。
-//!
-//! **磁盘纪律（事故见 project_memory / 磁盘归属 README）**：默认**不 pin**。
-//! 整段 `cudaHostRegister` 会逼内核把整个 arena major-fault 进内存 = 对机械盘持续
-//! 顺序读，15+ 分钟不停会触发该盘固件假死。惰性缺页天然分块（每专家 ~2.6 MB）。
-//!
-//! 两层缓存：
-//!   1. **设备 Q4 槽缓存**（本文件）：热专家的 Q4 blob 常驻显存，命中即跳过 H2D——
-//!      这是 decode 的主瓶颈（每 token 480 专家 × 2.6 MB ≈ 1.25 GB 过 PCIe）；
-//!   2. host 侧 pinned arena（可选）：`LINGXI_ARENA_PIN_GIB`，源在 RAM 时注册瞬时不触发磁盘读。
+//! ArenaExpertSource 主逻辑：arena → 设备槽缓存 → 视图解量化 → 紧凑 scratch
+//!（CODE_MAP Phase 2 刀P2-1 从 arena_source.rs 搬入，只搬家不改行为；
+//! prewarm/重钉/mix 的方法实现仍在本文件，按方法级拆分是 P2 后续刀）。
 
 use std::cell::UnsafeCell;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -22,254 +12,14 @@ use half::bf16;
 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat, ExpertArena};
 use lingxi_kernels::Kernels;
 
-// ── 请求级专家统计（serve 的 perf.jsonl 用；这些是**应用侧拿不到**的引擎内部量）──
-// 命中/未命中 = 设备槽缓存；unique = 本请求实际路由到多少个不同的 (层, 专家)。
-static EXPERT_HITS: AtomicU64 = AtomicU64::new(0);
-static EXPERT_MISSES: AtomicU64 = AtomicU64::new(0);
-static EXPERT_TRACK: AtomicBool = AtomicBool::new(false);
-const EXPERT_WORDS: usize = (48 * 512) / 64;
-
-fn expert_seen() -> &'static [AtomicU64] {
-    static SEEN: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
-    SEEN.get_or_init(|| (0..EXPERT_WORDS).map(|_| AtomicU64::new(0)).collect())
-}
-
-/// 请求开始时清零（serve 每请求调用一次）。
-pub fn expert_track_reset() {
-    EXPERT_HITS.store(0, Ordering::Relaxed);
-    EXPERT_MISSES.store(0, Ordering::Relaxed);
-    for w in expert_seen() {
-        w.store(0, Ordering::Relaxed);
-    }
-    EXPERT_TRACK.store(true, Ordering::Relaxed);
-}
-
-/// 请求结束：返回 `(命中, 未命中, 去重专家数)` 并停止记录。
-pub fn expert_track_finish() -> (u64, u64, usize) {
-    EXPERT_TRACK.store(false, Ordering::Relaxed);
-    let hits = EXPERT_HITS.load(Ordering::Relaxed);
-    let misses = EXPERT_MISSES.load(Ordering::Relaxed);
-    let unique = expert_seen()
-        .iter()
-        .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
-        .sum();
-    (hits, misses, unique)
-}
-
-#[inline]
-fn mark_expert(layer: u32, e: u32) {
-    if !EXPERT_TRACK.load(Ordering::Relaxed) {
-        return;
-    }
-    let idx = layer as usize * 512 + e as usize;
-    if idx < 48 * 512 {
-        expert_seen()[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Relaxed);
-    }
-}
-
-/// 设备 Q4 槽缓存：`n_slots` 个等大 blob 槽 + LRU。
-struct SlotCache {
-    /// `n_slots * blob` 字节的 Q4 blob 区
-    slots: CudaSlice<u8>,
-    n_slots: usize,
-    index: HashMap<(u32, u32), usize>,
-    /// LRU 序：`(key, 版本, 槽号)`。**只含非钉住的槽**（钉住的在构造期一次填好后永不进队）。
-    order: VecDeque<((u32, u32), u64, usize)>,
-    ver: HashMap<(u32, u32), u64>,
-    next_free: usize,
-    /// **钉住的槽号**（`LINGXI_ARENA_PREWARM` 预热的那批）：不进 LRU 队 ⇒ `victim()` 永不返回它们。
-    /// 为什么要"钉"而不是"只预热"：实测工作集 ≈ 槽数（bench 负载 6774 个 (层,专家) / 7000 槽）
-    /// ⇒ 纯 LRU 会**抖**（把很快要用的热专家换出去），实测命中率只有 93%。
-    /// 钉住最热的一批、让 LRU 只管理尾巴，尾巴就能装下（4800 钉 + 2200 尾 ≥ 尾巴 distinct）。
-    /// ★ P15-⑱：HashSet<usize> → `Vec<bool>`（按槽号 O(1) 判钉）。`touch`/`victim` 热路径
-    ///    每次命中都要查一次，HashSet 哈希 ~20ns × 每层数十命中 ⇒ Vec 下标 ~2ns。
-    pinned: Vec<bool>,
-    /// **钉住槽的入钉顺序**（`victim()` 兜底时用它取"最旧的钉槽"）。
-    /// 为什么必须有：钉表 + 尾槽超过总槽数时，LRU 队会**被掏空**，而钉住的槽从不进队 ⇒
-    /// `victim()` 走到 `return 0` 那一步，把 0 号槽上钉住的专家**静默覆盖**（数学出错、
-    /// 无人知晓）。2026-10-16 实测：`PREWARM_N=200 × 48 层 = 9600 > 9000 槽` ⇒ 9000 槽全钉
-    /// ⇒ 主干首 token 判据当场不再命中（英文提示词的固定贪心序列直接变了）。
-    pinned_q: VecDeque<usize>,
-    /// **反向索引** `槽号 → key`。为什么要它（2026-10-16，性能坑）：`victim()` 的兜底
-    /// （"槽全被钉住"时解钉最旧的钉槽）需要"这个槽属于哪个 key"，而第一版写成
-    /// `self.index.iter().find(|(_, &s)| s == sl)` —— **O(n_slots) 的 HashMap 扫描**（9000 项指针追逐
-    /// ≈ 数百 µs）。而"钉表 ≈ 槽数"时**每个 miss 都会走兜底** ⇒ 那 0.29 ms/miss 的"拷贝代价"
-    /// 其实是**这段扫描**（实测：换注册方式、换拷贝流，斜率一点没变）。这里加个 O(1) 的反查。
-    rev: HashMap<usize, (u32, u32)>,
-    pub hits: u64,
-    pub misses: u64,
-    /// **在线自适应重钉**（`LINGXI_ARENA_REPIN=<窗口>`）用的"最近热度"计数。
-    /// 每窗口结束按它重排 top-N，并把计数**减半**（滑动窗口）⇒ 话题切了就跟着换。
-    /// ⚠️ 只有 `LINGXI_ARENA_REPIN>0` 时才被填（否则恒空、完全不参与任何逻辑）。
-    recent: HashMap<(u32, u32), u32>,
-    /// 上次重钉时的 `hits+misses` 水位
-    recent_at: u64,
-    /// ㊹ B3：**扁平直查表** `(layer*E+e) → 槽号+1`（0=不在缓存）。热路径 `load_hits` 每 token
-    /// 480 次 `HashMap<(u32,u32),usize>` 查找（~50-100ns 哈希+探测）⇒ 换 O(1) 下标（~2ns）。
-    /// `index`/`ver`/`rev` 保留（victim/重钉簿记仍用）；变更点在 insert/victim/prewarm 同步维护。
-    flat: Vec<u32>,
-    n_experts: usize,
-    /// ㊺ A2：哪些层的槽位表行自上次同步后变过（insert/victim 都会改 flat）。
-    /// 被淘汰的 key 可能属于**别的层**——那一层也必须重传，否则设备表会指向已被覆盖的槽。
-    dirty: Vec<bool>,
-}
-
-impl SlotCache {
-    fn new(k: &Kernels, n_slots: usize, blob: usize, n_layers: usize, n_experts: usize) -> Result<Self> {
-        Ok(Self {
-            slots: unsafe { k.stream.alloc::<u8>(blob * n_slots.max(1)) }?,
-            n_slots,
-            index: HashMap::new(),
-            order: VecDeque::new(),
-            ver: HashMap::new(),
-            next_free: 0,
-            pinned: vec![false; n_slots],
-            pinned_q: VecDeque::new(),
-            rev: HashMap::new(),
-            hits: 0,
-            misses: 0,
-            recent: HashMap::new(),
-            recent_at: 0,
-            flat: vec![0u32; n_layers * n_experts],
-            n_experts,
-            dirty: vec![false; n_layers],
-        })
-    }
-
-    #[inline]
-    fn flat_get(&self, key: (u32, u32)) -> Option<usize> {
-        let v = self.flat[key.0 as usize * self.n_experts + key.1 as usize];
-        if v == 0 { None } else { Some((v - 1) as usize) }
-    }
-    #[inline]
-    fn flat_set(&mut self, key: (u32, u32), sl: usize) {
-        self.flat[key.0 as usize * self.n_experts + key.1 as usize] = (sl + 1) as u32;
-        self.dirty[key.0 as usize] = true;
-    }
-    #[inline]
-    fn flat_clr(&mut self, key: (u32, u32)) {
-        self.flat[key.0 as usize * self.n_experts + key.1 as usize] = 0;
-        self.dirty[key.0 as usize] = true;
-    }
-
-    fn touch(&mut self, key: (u32, u32), sl: usize) {
-        // 钉住的槽不进 LRU 队：`victim()` 只从队里取 ⇒ 永不淘汰它们
-        if self.pinned[sl] {
-            return;
-        }
-        let v = {
-            let e = self.ver.entry(key).or_insert(0);
-            *e += 1;
-            *e
-        };
-        self.order.push_back((key, v, sl));
-        if self.order.len() > self.index.len() * 4 + 64 {
-            // ⚠️ `self.ver[kk]` 会**直接 panic**（`HashMap: Index` 用 `expect`）：`index` 里
-            //    有**预热/重钉**塞进去的 key（它们只 `index.insert`、从不 `touch` ⇒ 不入 `ver`）。
-            //    2026-10-16 实测踩到：`LINGXI_MOE_SPLIT` + 7000 槽 + `REPIN` 那条路上
-            //    `touch` 的压缩分支 `panic at arena_source.rs:88: option::expect_failed`。
-            //    这里按"版本号缺失 = 0"处理（预热的槽从不进 `order`，所以 `retain` 只会把它们
-            //    之外的陈旧项删掉 —— 语义与原来一致，但不再 panic）。
-            let cur: HashSet<((u32, u32), u64, usize)> = self
-                .index
-                .iter()
-                .map(|(kk, &s)| (*kk, self.ver.get(kk).copied().unwrap_or(0), s))
-                .collect();
-            self.order.retain(|ent| cur.contains(ent));
-        }
-    }
-
-    fn insert(&mut self, key: (u32, u32), sl: usize) {
-        self.index.insert(key, sl);
-        self.rev.insert(sl, key);
-        self.flat_set(key, sl);
-        self.touch(key, sl);
-    }
-
-    /// 取一个可写槽：先用未用过的，再用 LRU 最旧的。
-    ///
-    /// `prot`（**保护集**）：本批 `load_hits` **已经分配出去**的槽 —— 必须跳过。
-    /// 为什么（2026-10-16 抓到的真 bug）：原来这里是"LRU 队里随便取一个"。而 `load_hits`
-    /// 是**边取槽边 insert** 的 ⇒ 同一次调用里先为 e1 拿到槽 S、`insert(e1,S)` 把 S 推到 LRU 队尾；
-    /// 接着为 e2 取槽时，若队里只剩 S（尾槽耗尽/全钉住时必然如此），就会把 **S 再分配给 e2**
-    /// ⇒ S 里装的是 e2 的权重，而 `slot_ids` 里 e1 仍指着 S ⇒ **两个专家共用一块权重**：
-    /// 数学静默出错（实测：`PREWARM_N=200×48 > 9000 槽` 时首 token 从 11751 变成 303）。
-    /// `None` = 实在没有可淘汰的槽（调用方必须报错，不能再像以前那样 `return 0` 硬来）。
-    fn victim(&mut self, prot: &[usize]) -> Option<usize> {
-        if self.next_free < self.n_slots {
-            let s = self.next_free;
-            self.next_free += 1;
-            return Some(s);
-        }
-        // ① 先找**未被钉、且不在本批**的最旧项（跳过的按原顺序放回队头，保持 LRU 序）
-        // ★ P15-⑱：`prot` 从 HashSet 改 `&[usize]` 线性扫（本批对数 ≤ 64，哈希反而慢）。
-        let mut skipped: Vec<((u32, u32), u64, usize)> = Vec::new();
-        let mut picked = None;
-        while let Some(ent) = self.order.pop_front() {
-            let (key, v, sl) = ent;
-            if self.pinned[sl] || prot.contains(&sl) {
-                skipped.push(ent);
-                continue;
-            }
-            if self.ver.get(&key) == Some(&v) && self.index.get(&key) == Some(&sl) {
-                self.index.remove(&key);
-                self.ver.remove(&key);
-                self.rev.remove(&sl);
-                self.flat_clr(key);
-                picked = Some(sl);
-                break;
-            }
-        }
-        for e in skipped.into_iter().rev() {
-            self.order.push_front(e);
-        }
-        if picked.is_some() {
-            return picked;
-        }
-        // ② 兜底：队空了或只剩钉住/本批的 ⇒ **解钉最旧的**那个（钉 = 优先不淘汰，不是永不淘汰）。
-        //    以前这里直接 `return 0`，会**静默覆盖 0 号槽上钉住的专家**。
-        let mut keep: Vec<usize> = Vec::new();
-        let mut got = None;
-        while let Some(sl) = self.pinned_q.pop_front() {
-            if prot.contains(&sl) {
-                keep.push(sl);
-                continue;
-            }
-            if !self.pinned[sl] {
-                continue; // 已经解钉过的陈旧项
-            }
-            self.pinned[sl] = false;
-            // O(1) 反查（第一版是 `index.iter().find(...)` = O(n_slots) ⇒ 每个 miss 数百 µs）
-            if let Some(key) = self.rev.remove(&sl) {
-                self.index.remove(&key);
-                self.ver.remove(&key);
-                self.flat_clr(key);
-            }
-            got = Some(sl);
-            break;
-        }
-        for sl in keep.into_iter().rev() {
-            self.pinned_q.push_front(sl);
-        }
-        if got.is_some() {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[arena] ⚠️ 槽位全被钉住（钉表 ≥ 槽数）⇒ 被迫淘汰**钉住的**槽。\
-                     数学仍然正确（不再覆盖 0 号槽、也不会把本批在用的槽分给别人），\
-                     但说明 `LINGXI_ARENA_PREWARM_N` 过大：钉表应当留出足够的 LRU 尾巴。"
-                );
-            }
-        }
-        got
-    }
-}
+use super::pin::backing_fs_type;
+use super::slot::SlotCache;
+use super::{mark_expert, EXPERT_HITS, EXPERT_MISSES};
 
 pub struct ArenaExpertSource<'a> {
     k: &'a Kernels,
     arena: ExpertArena,
-    /// **可写别名映射**（`LINGXI_ARENA_PIN_DMA=1`，见 §P13.9b）：与 `arena` 是**同一份 tmpfs 页**，
+    /// **可写别名映射**（`LINGXI_ARENA_PIN_DMA=1`，见）：与 `arena` 是**同一份 tmpfs 页**，
     /// 只是 VMA 可写 ⇒ 才能用 `PORTABLE` 做 DMA 注册。`None` = 老行为（READ_ONLY 注册）。
     alias: Option<memmap2::MmapMut>,
     cache: UnsafeCell<SlotCache>,
@@ -310,12 +60,27 @@ pub struct ArenaExpertSource<'a> {
     /// ㊺ A2 设备路由：`[层, E]` 的槽位表（slot+1、0=未缓存）。路由核在设备端直查它，
     /// 省掉每层"sync → host top-k → host 查槽 → staging"的整条决策链。
     slot_map: CudaSlice<i32>,
+    /// 混档次格式（Q3）cache 的 `[层, E]` 槽位表；单格式时全 0（不读）。
+    slot_map_alt: CudaSlice<i32>,
+    /// 混档每 (层, 专家) 格式表：0 = 主（Q4）、1 = 次（Q3）。**静态**，启动刷一次。
+    fmt_dev: CudaSlice<i32>,
     /// 上表逐层上传用的**锁页暂存**（每层一块：异步 H2D 的源不能被下一层的写覆掉）
     slot_map_pins: UnsafeCell<Vec<cudarc::driver::PinnedHostSlice<i32>>>,
+    /// 次格式槽位表的逐层锁页暂存
+    slot_map_alt_pins: UnsafeCell<Vec<cudarc::driver::PinnedHostSlice<i32>>>,
     /// Q4 段几何常量（与 `Q4Slots` 同源）
     q4c: lingxi_model::moe::Q4Consts,
-    /// arena 里是否**全部**为 Q4G64F16S（A2 设备路由直接按 Q4 槽读，混格式必须禁用）
+    /// 次格式（混档 = Q3）段几何常量
+    q4c_alt: Option<lingxi_model::moe::Q4Consts>,
+    /// A2 设备路由可用（主格式是 Q4G64/Q3G128；混档**也**可用——双视图 + 格式表）
     q4_ok: bool,
+    /// **簿记串行锁**（2026-10-25，双会话并发 `LINGXI_TALK_SPEC_BATCH`）：SlotCache 的
+    /// victim/insert/touch 是 host 侧裸可变（UnsafeCell），两个线程在同一卡上同时 miss
+    /// 会双发同一槽 ⇒ 权重互相覆写、token 流静默分叉。锁内**不含 GPU 等待**（miss 的
+    /// blob DMA 只是入队），命中路径持锁 ~µs。scratch 双缓冲的"隔层必同步"余量是
+    /// **每线程路径内**的论证（同一条 k0 FIFO + 每层路由同步在各自路径上排干），
+    /// 与并发无关 ⇒ 不需要为 scratch 加锁。
+    op_lock: std::sync::Mutex<()>,
 }
 
 /// 全部按需扩容：decode 每层槽数固定，正常只分配一次；
@@ -333,7 +98,7 @@ struct Scratch {
     ids_pin_alt: [Option<cudarc::driver::PinnedHostSlice<i32>>; 2],
     /// 轮换相位（每次 `load_hits` 取反）。
     ///
-    /// ★ **为什么必须双缓冲**（2026-10-16 抓到的真 bug，PLAN §P15-C）：
+    /// ★ **为什么必须双缓冲**：
     /// `slot_ids` 被上一个 `load_hits` **异步 H2D** 上去后，**上一层的内核还在异步读它**；
     /// 单缓冲时下一次 `load_hits` 会直接把内容覆写成新一层的槽号 ⇒ 上一层读到**别的层的槽号**
     /// ⇒ 取错专家、token 流静默分叉（实测：投机路径第 103 个 token 起与纯贪心不同，而同权重
@@ -348,29 +113,6 @@ struct Scratch {
 unsafe impl Send for ArenaExpertSource<'_> {}
 unsafe impl Sync for ArenaExpertSource<'_> {}
 
-/// arena 所在**介质**的 fs 类型（读 `/proc/mounts` 取最长前缀匹配的挂载点）。
-///
-/// 为什么要它：pin 的安全性**完全取决于介质**（见下面的策略注释），而环境变量本身
-/// 无法表达"这块盘是不是机械盘"。用 fs 类型做硬判据，把"按介质判定"落到代码里。
-fn backing_fs_type(path: &str) -> Option<String> {
-    let canon = std::fs::canonicalize(path).ok()?;
-    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
-    let mut best: Option<(usize, String)> = None;
-    for line in mounts.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(_dev), Some(mnt), Some(fstype)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let m = std::path::Path::new(mnt);
-        if canon.starts_with(m) {
-            let depth = m.components().count();
-            if best.as_ref().map_or(true, |(d, _)| depth >= *d) {
-                best = Some((depth, fstype.to_string()));
-            }
-        }
-    }
-    best.map(|(_, t)| t)
-}
 
 impl<'a> ArenaExpertSource<'a> {
     /// `layers`：本份 arena **只服务**的层区间（钉表/重钉都只看它）。
@@ -387,17 +129,17 @@ impl<'a> ArenaExpertSource<'a> {
         let arena = ExpertArena::open(arena_path)?;
         // ── pin 策略：**按介质判定**（2026-10-16 改；事故见 project_memory）──────────
         // 旧策略"默认 0 = 不 pin + 允许给任意 GiB 上限"有两个问题（都已实测）：
-        //   1. 分开源 ⇒ 驱动只能走内部 staging 的**同步**拷贝 ⇒ 慢 28% 且 p50 掉到 8.8 tok/s
-        //      （实测 34.4 ms/29 tok/s vs 整段锁页 26.7 ms/37.4 tok/s，p50 29 ms/34.5 tok/s）；
-        //   2. **部分 pin 是坏的** ⇒ `LINGXI_ARENA_PIN_GIB=16` 会在 decode 第 15 个 token 崩
-        //      `arena blob H2D: CUDA_ERROR_INVALID_VALUE`（同一 mmap 只注册一段时，
-        //      落到注册区间之外的拷贝源会被驱动拒）。
+        // 1. 分开源 ⇒ 驱动只能走内部 staging 的**同步**拷贝 ⇒ 慢 28% 且 p50 掉到 8.8 tok/s
+        // （实测 34.4 ms/29 tok/s vs 整段锁页 26.7 ms/37.4 tok/s，p50 29 ms/34.5 tok/s）；
+        // 2. **部分 pin 是坏的** ⇒ `LINGXI_ARENA_PIN_GIB=16` 会在 decode 第 15 个 token 崩
+        // `arena blob H2D: CUDA_ERROR_INVALID_VALUE`（同一 mmap 只注册一段时，
+        // 落到注册区间之外的拷贝源会被驱动拒）。
         // 新策略：
-        //   * 介质是 **RAM（tmpfs/ramfs）** ⇒ 注册不触发任何磁盘读（前提：swap 关）
-        //     ⇒ **允许且默认整段 pin**（`LINGXI_ARENA_PIN_GIB` 不设 = 整段）；
-        //   * 介质**不是 RAM** ⇒ **硬禁**（2026-10-14 那次整机重启就是机械盘被 60 GiB
-        //     major-fault 持续顺序读 15 min+ 触发固件假死）——要关 pin 请显式 `=0`；
-        //   * 只支持"整段或 0"：给中间值直接报错（不再留到运行中段崩）。
+        // * 介质是 **RAM（tmpfs/ramfs）** ⇒ 注册不触发任何磁盘读（前提：swap 关）
+        // ⇒ **允许且默认整段 pin**（`LINGXI_ARENA_PIN_GIB` 不设 = 整段）；
+        // * 介质**不是 RAM** ⇒ **硬禁**（2026-10-14 那次整机重启就是机械盘被 60 GiB
+        // major-fault 持续顺序读 15 min+ 触发固件假死）——要关 pin 请显式 `=0`；
+        // * 只支持"整段或 0"：给中间值直接报错（不再留到运行中段崩）。
         let fs_type = backing_fs_type(arena_path);
         let on_ram = matches!(fs_type.as_deref(), Some("tmpfs") | Some("ramfs"));
         let arena_bytes = arena.data_region().len() as u64;
@@ -432,9 +174,9 @@ impl<'a> ArenaExpertSource<'a> {
                 arena_bytes as f64 / 1073741824.0
             );
         }
-        // ★ **DMA 注册**（`LINGXI_ARENA_PIN_DMA=1`，§P13.9b）：先拿一份**可写**别名映射，
-        //    再用 `PORTABLE` 注册 ⇒ 从它发起的 H2D 才是 copy-engine DMA（**可重叠**）。
-        //    老行为（READ_ONLY 注册）实测：8.6 GB/s 且与 kernel 完全不可重叠。
+        // ★ **DMA 注册**（`LINGXI_ARENA_PIN_DMA=1`，）：先拿一份**可写**别名映射，
+        // 再用 `PORTABLE` 注册 ⇒ 从它发起的 H2D 才是 copy-engine DMA（**可重叠**）。
+        // 老行为（READ_ONLY 注册）实测：8.6 GB/s 且与 kernel 完全不可重叠。
         let alias = if lingxi_model::flag("LINGXI_ARENA_PIN_DMA") && want_bytes > 0 {
             Some(
                 lingxi_artifact::expert_arena::mmap_shared_rw(arena_path)
@@ -525,6 +267,12 @@ impl<'a> ArenaExpertSource<'a> {
             arena.n_layers as usize,
             arena.n_experts as usize,
         )?;
+        // ★ 2026-10-25：预算按"余量吃满"算（ledger 上"占用 = 余"），槽位本身是一次性大块
+        // `cudaMalloc` ⇒ 偶发 `CUDA_ERROR_OUT_OF_MEMORY`（实测 200 token 跑里约 1/20 起不来，
+        // 栈顶就在 `SlotCache::new`）。`SlotCache::new` 现在 OOM 会逐级退让，这里**回读实际槽数**，
+        // 让下游（钉表/ledger/命中统计）用真值而不是请求值。
+        let pri_want = pri_slots;
+        let pri_slots = cache.n_slots;
         let mut cache_alt = if mixed {
             Some(UnsafeCell::new(SlotCache::new(
                 k,
@@ -536,8 +284,19 @@ impl<'a> ArenaExpertSource<'a> {
         } else {
             None
         };
+        let alt_want = alt_slots;
+        let alt_slots = match &cache_alt {
+            Some(c) => unsafe { (*c.get()).n_slots },
+            None => 0,
+        };
+        if pri_slots != pri_want || alt_slots != alt_want {
+            eprintln!(
+                "[arena] ⚠️ 槽位分配 OOM，已向下夹紧：Q4 {pri_slots}/{pri_want} + \
+                 Q3 {alt_slots}/{alt_want}（预算按「余量吃满」算，属已知紧度）"
+            );
+        }
         // ── `LINGXI_ARENA_PREWARM=<hist.csv>`：**预热 + 钉住**每层最热的 N 个专家 ──
-        // 依据（实测，见 docs/speedup-audit.md §11）：**工作集 ≈ 槽数**（bench 负载 6774 个
+        // 依据：**工作集 ≈ 槽数**（bench 负载 6774 个
         // (层,专家) / 7000 槽）⇒ 纯 LRU 会抖，稳定命中率只有 93%，而且那 7% 里绝大部分是
         // **首触（compulsory）**——LRU 再聪明也躲不掉"第一次见到它"。
         // 直方图显示每层 top-145 覆盖 99.65% 的请求 ⇒ 把这批**提前搬进显存并钉住**，
@@ -586,7 +345,7 @@ impl<'a> ArenaExpertSource<'a> {
             }
             // ★ **钉哪些槽：两种口径**（`LINGXI_PREWARM_GLOBAL=1` 走全局贪心，默认仍是一刀切）
             //
-            // 为什么全局贪心更对（PLAN §P15 ②）：一刀切"每层 top-`n_pin`"是**按层平均**分配槽，
+            // 为什么全局贪心更对：一刀切"每层 top-`n_pin`"是**按层平均**分配槽，
             // 于是 `distinct` 少的层会把槽花在 `count=1` 的长尾上，而 `distinct` 多的层
             // （实测 182~411，差一倍多）的 `count=2~3` 专家反而钉不上。
             // 静态钉表下"最小化总 miss 次数"的最优贪心是：**把全部 (层,专家) 按 count 降序，
@@ -652,9 +411,9 @@ impl<'a> ArenaExpertSource<'a> {
                     None => arena.bytes(&(b.gu.start..b.down.end)),
                 };
                 // ⚠️ 与 `maybe_repin` 同一条纪律：预热的字节数**必须**正好一个 blob。
-                //    缺这条断言时（2026-10-16 排查中发现），一旦 `gu.start..down.end` 不是
-                //    恰好 blob 长，就会**静默多拷/少拷**，钉进去的专家权重与懒加载不一致 ⇒
-                //    token 流在几十个 token 后分叉。这里补上（并且是真检查，不只是打印）。
+                // 缺这条断言时（2026-10-16 排查中发现），一旦 `gu.start..down.end` 不是
+                // 恰好 blob 长，就会**静默多拷/少拷**，钉进去的专家权重与懒加载不一致 ⇒
+                // token 流在几十个 token 后分叉。这里补上（并且是真检查，不只是打印）。
                 if done == 0 {
                     eprintln!(
                         "[prewarm] 首个 blob 长度核对：src.len()={} blob={} gu.start={} down.end={} gu_bytes={} down_bytes={}",
@@ -815,6 +574,69 @@ impl<'a> ArenaExpertSource<'a> {
             }
             }
         }
+        // ── ★ 2026-10-25`LINGXI_ARENA_PRELOAD_ALL`：把本卡服务层的
+        // **全部专家**一次搬进显存（幂等：已驻留的跳过）。
+        //
+        // 动机（实测）：`[htime-spike]` 里那笔"prep 4.4 ms/轮"其实是**首触补槽** ——
+        // `prep` 从 `t_pre_pairs` 起算，而 miss 时第 2 次 attempt 会把它连
+        // `load_missing` 的整段 DMA 一起算进去（`[prep-prof]` 四个子步骤全是 0 µs 就是铁证）。
+        // 全驻留后 decode 期 miss=0 ⇒ 这笔钱变成启动时一次性搬完。
+        // 代价：启动多 5~7 s（本卡 ~32 GB over PCIe）；而 tok/s 口径**不含启动** ⇒ 净赚。
+        if lingxi_model::flag("LINGXI_ARENA_PRELOAD_ALL") && !prewarm_off {
+            let t0 = std::time::Instant::now();
+            k.ctx.bind_to_thread()?;
+            let (mut n_new, mut n_skip) = (0usize, 0usize);
+            for l in lo..hi.min(arena.n_layers) {
+                for e in 0..arena.n_experts {
+                    let Some(b) = arena.routed(l, e)? else { continue };
+                    let use_alt = mixed && Some(b.format) == fmt2;
+                    let (cache, cblob): (&mut SlotCache, usize) = if use_alt {
+                        (cache_alt.as_mut().unwrap().get_mut(), blob_alt)
+                    } else {
+                        (&mut cache, blob_pri)
+                    };
+                    if cache.flat_get((l, e)).is_some() {
+                        n_skip += 1;
+                        continue;
+                    }
+                    // 池满了就**停**，不要用 `victim` 去淘汰 —— 那会把 prewarm 钉住的
+                    // 热专家挤出去（`victim` 的兜底会解钉最旧的那个）。剩下的懒加载即可。
+                    if cache.next_free >= cache.n_slots {
+                        break;
+                    }
+                    let Some(sl) = cache.victim(&[]) else { break };
+                    let src = match alias.as_ref() {
+                        Some(al) => &al[b.gu.start..b.down.end],
+                        None => arena.bytes(&(b.gu.start..b.down.end)),
+                    };
+                    anyhow::ensure!(
+                        src.len() == cblob,
+                        "preload 字节数不符：src.len()={} cblob={cblob}（layer {l} expert {e}）",
+                        src.len()
+                    );
+                    {
+                        let sv = cache.slots.slice(sl * cblob..(sl + 1) * cblob);
+                        let (dptr, _g) = sv.device_ptr(&k.stream);
+                        unsafe {
+                            cudarc::driver::result::memcpy_htod_async(
+                                dptr, src, k.stream.cu_stream(),
+                            )
+                            .context("preload blob H2D")?;
+                        }
+                    }
+                    cache.insert((l, e), sl);
+                    n_new += 1;
+                }
+            }
+            k.stream.synchronize()?;
+            eprintln!(
+                "[preload] 全驻留：新搬 {n_new}／已驻留 {n_skip}（Q4 槽 {} / Q3 槽 {}）用时 {:.1}s",
+                cache.n_slots,
+                // SAFETY：循环已结束、没有任何存活的 &mut/& 借用（与 loader 其它处同一约定）。
+                cache_alt.as_ref().map(|c| unsafe { (*c.get()).n_slots }).unwrap_or(0),
+                t0.elapsed().as_secs_f64()
+            );
+        }
         eprintln!(
             "arena: {} | {} 层 x {} 专家 | blob {} B{} | 设备槽 {} ({:.1} GiB) | fstype={:?} | arena_pinned={} ({:.1} GiB) | 服务层 {:?}",
             arena_path,
@@ -838,14 +660,13 @@ impl<'a> ArenaExpertSource<'a> {
         let n_experts = arena.n_experts as usize;
         let rows_gu = 2 * arena.n_ff as usize;
         let rows_dn = arena.n_in as usize;
-        // 格式已在上方扫描（含混档双 cache 分流）。A2 设备路由只在**单格式** Q4G64/Q3G128
-        // arena 上开（混合态 q4_ok=false ⇒ q4_dev() 返回 None，路由回退 host 路径）。
+        // 格式已在上方扫描（含混档双 cache 分流）。A2 设备路由在主格式是 Q4G64/Q3G128 时可用；
+        // 混档走**双视图**（主/次各一张槽表 + 格式表），单格式时次视图全 0。
         let arena_fmt = pri_fmt;
-        let q4_ok = !mixed
-            && matches!(
-                arena_fmt,
-                BlobFormat::Q4G64F16S | BlobFormat::Q3G128F16S
-            );
+        let q4_ok = matches!(
+            arena_fmt,
+            BlobFormat::Q4G64F16S | BlobFormat::Q3G128F16S
+        );
         let gu_lay = matrix_layout(arena_fmt, rows_gu as u64, arena.n_in as u64)
             .context("gu 段几何非法")?;
         let dn_lay = matrix_layout(arena_fmt, rows_dn as u64, arena.n_ff as u64)
@@ -863,10 +684,50 @@ impl<'a> ArenaExpertSource<'a> {
             dn_k_pad: kpad(arena.n_ff as usize),
             bits: arena_fmt.bits(),
         };
+        // 混档案：次格式（Q3）的段几何常量 + 每 (层,专家) 格式表（静态，启动刷一次）。
+        let q4c_alt = match fmt2 {
+            Some(f) => {
+                let gu2 = matrix_layout(f, rows_gu as u64, arena.n_in as u64)
+                    .context("alt gu 段几何非法")?;
+                let dn2 = matrix_layout(f, rows_dn as u64, arena.n_ff as u64)
+                    .context("alt dn 段几何非法")?;
+                Some(lingxi_model::moe::Q4Consts {
+                    blob: blob_alt as u64,
+                    gu_seg: 0,
+                    dn_seg: gu2.payload_bytes,
+                    gu_scale: gu2.scale_offset,
+                    dn_scale: dn2.scale_offset,
+                    gu_k_pad: kpad(arena.n_in as usize),
+                    dn_k_pad: kpad(arena.n_ff as usize),
+                    bits: f.bits(),
+                })
+            }
+            None => None,
+        };
         let slot_map = k.stream.alloc_zeros::<i32>(n_layers * n_experts)?;
+        let slot_map_alt = k.stream.alloc_zeros::<i32>(n_layers * n_experts)?;
+        // 格式表：0 = 主（Q4），1 = 次（Q3）；服务区间外的层填 -1（永远不会被读）。
+        let mut fmt_host = vec![-1i32; n_layers * n_experts];
+        if mixed {
+            for l in layers.start..layers.end.min(arena.n_layers) {
+                for e in 0..arena.n_experts {
+                    let is_alt = matches!(
+                        arena.routed(l, e),
+                        Ok(Some(b)) if b.format == fmt2.unwrap()
+                    );
+                    fmt_host[l as usize * n_experts + e as usize] = if is_alt { 1 } else { 0 };
+                }
+            }
+        }
+        let mut fmt_dev = k.stream.alloc_zeros::<i32>(n_layers * n_experts)?;
+        k.stream.memcpy_htod(&fmt_host, &mut fmt_dev)?;
         let mut slot_map_pins = Vec::with_capacity(n_layers);
+        let mut slot_map_alt_pins = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
             slot_map_pins.push(unsafe {
+                k.stream.context().alloc_pinned_with_flags::<i32>(n_experts.max(1), 0)?
+            });
+            slot_map_alt_pins.push(unsafe {
                 k.stream.context().alloc_pinned_with_flags::<i32>(n_experts.max(1), 0)?
             });
         }
@@ -901,16 +762,25 @@ impl<'a> ArenaExpertSource<'a> {
             repin_n,
             layers,
             slot_map,
+            slot_map_alt,
+            fmt_dev,
             slot_map_pins: UnsafeCell::new(slot_map_pins),
+            slot_map_alt_pins: UnsafeCell::new(slot_map_alt_pins),
             q4c,
+            q4c_alt,
             q4_ok,
+            op_lock: std::sync::Mutex::new(()),
         };
         // 初始表：把预热后的全部层刷一次（之后只有 legacy load_hits / load_missing 会改它）。
         me.slot_map_sync_dirty()?;
         k.stream.synchronize()?;
         eprintln!(
-            "[arena] A2 设备路由{}：槽位表 {} 层 x {} 专家（{:.0} KiB）",
-            if q4_ok { "可用（全 Q4G64 / 全 Q3G128）" } else { "禁用（非量化格式）" },
+            "[arena] A2 设备路由{}：槽位表 {} 层 x {} 专家（{:.0} KiB/表）",
+            if q4_ok {
+                if mixed { "可用（混档双视图）" } else { "可用（全 Q4G64 / 全 Q3G128）" }
+            } else {
+                "禁用（非量化格式）"
+            },
             n_layers,
             n_experts,
             (n_layers * n_experts * 4) as f64 / 1024.0,
@@ -946,6 +816,27 @@ impl<'a> ArenaExpertSource<'a> {
             )
             .context("A2 slot_map H2D")?;
         }
+        // 混档：次格式 cache 的同一层也要刷（两者是**独立**槽号空间）。
+        if let Some(alt) = self.cache_alt.as_ref() {
+            let cache_alt = unsafe { &*alt.get() };
+            let pins_alt = unsafe { &mut *self.slot_map_alt_pins.get() };
+            {
+                let buf = pins_alt[layer as usize].as_mut_slice()?;
+                for j in 0..e {
+                    buf[j] = cache_alt.flat[base + j] as i32;
+                }
+            }
+            let (dp_alt, _g2) = self.slot_map_alt.device_ptr(&self.k.stream);
+            let src_alt = pins_alt[layer as usize].as_slice()?;
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    dp_alt + (base * 4) as u64,
+                    &src_alt[..e],
+                    self.k.stream.cu_stream(),
+                )
+                .context("A2 slot_map_alt H2D")?;
+            }
+        }
         Ok(())
     }
 
@@ -959,6 +850,47 @@ impl<'a> ArenaExpertSource<'a> {
         }
         let cache = unsafe { &mut *self.cache.get() };
         cache.dirty.fill(false);
+        if let Some(alt) = self.cache_alt.as_ref() {
+            let cache_alt = unsafe { &mut *alt.get() };
+            for l in 0..cache_alt.dirty.len() {
+                if cache_alt.dirty[l] {
+                    self.slot_map_sync_sublayer(l as u32)?;
+                }
+            }
+            cache_alt.dirty.fill(false);
+        }
+        Ok(())
+    }
+
+    /// 只刷**次格式** cache 的某一层（上表已刷主格式；避免 `slot_map_sync_dirty` 里重复刷主表）。
+    fn slot_map_sync_sublayer(&self, layer: u32) -> Result<()> {
+        let Some(alt) = self.cache_alt.as_ref() else {
+            return Ok(());
+        };
+        let cache_alt = unsafe { &*alt.get() };
+        let e = cache_alt.n_experts;
+        if layer as usize >= self.arena.n_layers as usize {
+            return Ok(());
+        }
+        let base = layer as usize * e;
+        let pins_alt = unsafe { &mut *self.slot_map_alt_pins.get() };
+        {
+            let buf = pins_alt[layer as usize].as_mut_slice()?;
+            for j in 0..e {
+                buf[j] = cache_alt.flat[base + j] as i32;
+            }
+        }
+        self.bind_ctx()?;
+        let (dp_alt, _g2) = self.slot_map_alt.device_ptr(&self.k.stream);
+        let src_alt = pins_alt[layer as usize].as_slice()?;
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                dp_alt + (base * 4) as u64,
+                &src_alt[..e],
+                self.k.stream.cu_stream(),
+            )
+            .context("A2 slot_map_alt H2D")?;
+        }
         Ok(())
     }
 
@@ -1041,17 +973,17 @@ impl<'a> ArenaExpertSource<'a> {
             for k in to_unpin {
                 if let Some(sl) = cache.index.get(&k).copied() {
                     cache.pinned[sl] = false;
-                    // ⚠️ **必须放回 LRU 队**：`victim()` 只从 `order` 取，钉住的槽从不进队，
-                    //    所以解钉后不入队 ⇒ `order` 会逐渐空 ⇒ `victim()` 走到 `return 0` 的兜底
-                    //    ⇒ 多个 key 撞在 0 号槽（实测 `驻留 9166/9000` 就是这么来的）。
+                    // ⚠️ **必须放回 LRU 队**：`victim` 只从 `order` 取，钉住的槽从不进队，
+                    // 所以解钉后不入队 ⇒ `order` 会逐渐空 ⇒ `victim` 走到 `return 0` 的兜底
+                    // ⇒ 多个 key 撞在 0 号槽（实测 `驻留 9166/9000` 就是这么来的）。
                     cache.touch(k, sl);
                 }
             }
             // 4) 新钉：**已经在缓存里的直接钉住（零搬运）**，不在的才取槽 + H2D
             //
             // ⚠️ 第一版没有这一步，而且踩了个真坑：`(l,e)` 可能已在 `index` 里（挂在未钉的槽上），
-            //    这时再 `victim()` 拿新槽会**覆盖 `index[key]` 而旧槽永远回收不了** ⇒ 槽泄漏
-            //    （实测 `驻留 9000 → 6299` 一路掉、命中率 84.8% → 73.9%、tok/s 32.5 → 19.7）。
+            // 这时再 `victim` 拿新槽会**覆盖 `index[key]` 而旧槽永远回收不了** ⇒ 槽泄漏
+            // （实测 `驻留 9000 → 6299` 一路掉、命中率 84.8% → 73.9%、tok/s 32.5 → 19.7）。
             // 本次重钉已发出去的槽同样要保护（理由见 `victim` 的 `prot` 说明）。
             let mut prot: Vec<usize> = Vec::new();
             for (l, e) in to_pin {
@@ -1111,7 +1043,7 @@ impl<'a> ArenaExpertSource<'a> {
         let stats_on = lingxi_model::flag("LINGXI_ARENA_STATS");
         let hist_on = lingxi_model::flag("LINGXI_ARENA_HIST");
         // ⚠️ 两个开关**各管各的**：以前这里是"STATS 没开就直接 return"，
-        //    那样单开 HIST 会静默什么都不落（本轮写完才发现，已修）。
+        // 那样单开 HIST 会静默什么都不落（本轮写完才发现，已修）。
         if !stats_on && !hist_on {
             return;
         }
@@ -1134,10 +1066,10 @@ impl<'a> ArenaExpertSource<'a> {
             let _ = tot;
             // `LINGXI_ARENA_HIST=<path>`：把 (层,专家,请求数) 落盘。
             // ⚠️ **必须合并而不是整文件覆写**（2026-10-18 实测踩到）：双卡 layer-split 下
-            //   有**两个** ArenaExpertSource（GPU0 管 0..24、GPU1 管 24..48），各自只统计自己
-            //   那段层；整文件覆写会让后写的那份把另一半层抹掉 ⇒ 用这种残缺表做 prewarm
-            //   实测 43.9 tok/s（完整表 48.5）。这里改成"读回旧表 → 只替换本实例负责的层 →
-            //   写回"，并用全局锁串行化两个实例的写入。
+            // 有**两个** ArenaExpertSource（GPU0 管 0..24、GPU1 管 24..48），各自只统计自己
+            // 那段层；整文件覆写会让后写的那份把另一半层抹掉 ⇒ 用这种残缺表做 prewarm
+            // 实测 43.9 tok/s（完整表 48.5）。这里改成"读回旧表 → 只替换本实例负责的层 →
+            // 写回"，并用全局锁串行化两个实例的写入。
             if let Ok(path) = std::env::var("LINGXI_ARENA_HIST") {
                 use std::sync::{Mutex, OnceLock};
                 static W: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1188,10 +1120,23 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
             return None;
         }
         let cache = unsafe { &*self.cache.get() };
+        let alt = match (self.cache_alt.as_ref(), self.q4c_alt) {
+            (Some(c), Some(cs)) => {
+                let ca = unsafe { &*c.get() };
+                Some(lingxi_model::moe::Q4DevAlt {
+                    slots: &ca.slots,
+                    slot_map: &self.slot_map_alt,
+                    consts: cs,
+                })
+            }
+            _ => None,
+        };
         Some(lingxi_model::moe::Q4DevView {
             slots: &cache.slots,
             slot_map: &self.slot_map,
             consts: self.q4c,
+            alt,
+            fmt: if self.mixed { Some(&self.fmt_dev) } else { None },
         })
     }
 
@@ -1199,60 +1144,86 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
         ArenaExpertSource::slot_map_sync_layer(self, layer)
     }
 
+    /// EP 均衡分配：直接给该 (层, 专家) 的槽步长（Q4 热 2.6 MB / Q3 冷 1.92 MB）。
+    /// 不碰设备、不做任何 IO（arena 索引常驻）⇒ 构建一次分配表几乎零成本。
+    fn slot_bytes(&self, layer: u32, expert: u32) -> Option<u64> {
+        if layer >= self.arena.n_layers || expert >= self.arena.n_experts {
+            return None;
+        }
+        let b = match self.arena.routed(layer, expert) {
+            Ok(Some(b)) => b,
+            _ => return None,
+        };
+        Some(if Some(b.format) == self.fmt2 {
+            self.blob_alt as u64
+        } else {
+            self.blob_pri as u64
+        })
+    }
+
     /// ㊺ A2：补槽。与 `load_hits` 的 miss 分支同一条纪律（victim 带保护集、blob 整段 H2D），
     /// 但**只搬缺的**、不做解量化、不填 scratch。返回时槽位表已对设备可见。
-    fn load_missing(&self, layer: u32, experts: &[u32], protect: &[usize]) -> Result<()> {
+    /// 混档按各专家自己的格式落到主/次 cache（两者的槽号空间独立、保护集也分开）。
+    fn load_missing(
+        &self,
+        layer: u32,
+        experts: &[u32],
+        prot_pri: &[usize],
+        prot_alt: &[usize],
+    ) -> Result<()> {
         if experts.is_empty() {
             return Ok(());
         }
-        anyhow::ensure!(
-            !self.mixed,
-            "混档 arena 不支持 A2 设备路由补槽（q4_dev 已返回 None，不该走到这里）"
-        );
-        let blob = (self.arena.gu_bytes + self.arena.down_bytes) as usize;
+        // 双会话并发下的簿记串行化（见字段 `op_lock` 的注释）。
+        let _op = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.bind_ctx()?;
-        let mut prot: Vec<usize> = protect.to_vec();
+        let mut prot: Vec<usize> = prot_pri.to_vec();
+        let mut prot2: Vec<usize> = prot_alt.to_vec();
         let mut n_new = 0usize;
-        {
-            let cache = unsafe { &mut *self.cache.get() };
-            for &e in experts {
-                mark_expert(layer, e);
-                let key = (layer, e);
-                if let Some(sl) = cache.flat_get(key) {
-                    EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
-                    cache.touch(key, sl);
-                    continue;
-                }
-                EXPERT_MISSES.fetch_add(1, Ordering::Relaxed);
-                let b = self
-                    .arena
-                    .routed(layer, e)?
-                    .with_context(|| format!("arena 缺专家 layer {layer} expert {e}"))?;
-                let sl = cache.victim(&prot).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "arena 槽位耗尽（A2 补槽）：layer {layer} 需要新槽，但 {} 个槽全被本批/钉表占用",
-                        cache.n_slots
-                    )
-                })?;
-                prot.push(sl);
-                let src = self.src_bytes(&(b.gu.start..b.down.end));
-                anyhow::ensure!(src.len() == blob, "A2 补槽字节数不符");
-                {
-                    let sv = cache.slots.slice(sl * blob..(sl + 1) * blob);
-                    let (dp, _g) = sv.device_ptr(&self.k.stream);
-                    unsafe {
-                        cudarc::driver::result::memcpy_htod_async(
-                            dp,
-                            src,
-                            self.k.stream.cu_stream(),
-                        )
-                        .context("A2 补槽 blob H2D")?;
-                    }
-                }
-                cache.insert(key, sl);
-                cache.misses += 1;
-                n_new += 1;
+        for &e in experts {
+            mark_expert(layer, e);
+            let key = (layer, e);
+            let b = self
+                .arena
+                .routed(layer, e)?
+                .with_context(|| format!("arena 缺专家 layer {layer} expert {e}"))?;
+            let is_alt = self.fmt2 == Some(b.format);
+            // 两 cache 是**不同**的 UnsafeCell：分别取可变引用（同一时刻只动一个）。
+            let (cache, blob, prot_ref): (&mut SlotCache, usize, &mut Vec<usize>) = if is_alt {
+                (
+                    unsafe { &mut *self.cache_alt.as_ref().unwrap().get() },
+                    self.blob_alt,
+                    &mut prot2,
+                )
+            } else {
+                (unsafe { &mut *self.cache.get() }, self.blob_pri, &mut prot)
+            };
+            if let Some(sl) = cache.flat_get(key) {
+                EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
+                cache.touch(key, sl);
+                continue;
             }
+            EXPERT_MISSES.fetch_add(1, Ordering::Relaxed);
+            let sl = cache.victim(prot_ref).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "arena 槽位耗尽（A2 补槽）：layer {layer} 需要新槽，但 {} 个槽全被本批/钉表占用",
+                    cache.n_slots
+                )
+            })?;
+            prot_ref.push(sl);
+            let src = self.src_bytes(&(b.gu.start..b.down.end));
+            anyhow::ensure!(src.len() == blob, "A2 补槽字节数不符");
+            {
+                let sv = cache.slots.slice(sl * blob..(sl + 1) * blob);
+                let (dp, _g) = sv.device_ptr(&self.k.stream);
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(dp, src, self.k.stream.cu_stream())
+                        .context("A2 补槽 blob H2D")?;
+                }
+            }
+            cache.insert(key, sl);
+            cache.misses += 1;
+            n_new += 1;
         }
         if n_new > 0 {
             self.slot_map_sync_dirty()?;
@@ -1273,6 +1244,8 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
         if s == 0 {
             bail!("ArenaExpertSource::load_hits 收到空专家列表");
         }
+        // 双会话并发下的簿记串行化（见字段 `op_lock` 的注释）。
+        let _op = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.tick_stats();
         // `LINGXI_ARENA_HIST`：记每 `(层, 专家)` 的**请求**次数（含命中与未命中）。
         // 这是"每层该钉多少个热专家"的唯一依据（P1）。
@@ -1306,7 +1279,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
 
         // 1) 槽位定位：命中直接用；未命中 → H2D 填进（未用/被淘汰的）槽
     // ★ P15-⑱：本批簿记走 thread_local 复用（原来每次 4 个容器分配）；`prot` 改 `Vec`
-    //    线性扫（本批对数 ≤ 64，`victim` 里 HashSet 哈希反而慢）。语义全同。
+    // 线性扫（本批对数 ≤ 64，`victim` 里 HashSet 哈希反而慢）。语义全同。
     thread_local! {
         static LH_WS: std::cell::RefCell<(
             Vec<BlobFormat>, Vec<usize>, Vec<usize>, Vec<bool>, Vec<u8>, Vec<usize>,
@@ -1324,19 +1297,19 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
     hit_flag.clear();
     which.clear();
     prot_alt.clear();
-    // **本批已分配的槽**（传给它 `victim()`，见那里的说明）：同一次调用里已经发出去的槽
+    // **本批已分配的槽**（传给它 `victim`，见那里的说明）：同一次调用里已经发出去的槽
     // 绝不能又被"淘汰"给另一个专家 —— 否则两个专家共用一块权重、数学静默出错。
     // 每个条目是命中还是未命中 —— `LINGXI_MOE_OVERLAP` 按它切"命中组 / 未命中组"。
     let mut n_miss = 0usize;
         // 裸 `memcpy_htod_async` 前必须绑本源的上下文（见 `bind_ctx`）。
         self.bind_ctx()?;
         // ★ **专家段重叠**（`LINGXI_MOE_OVERLAP`）：把 miss 的 blob H2D 挪到**第二流**上飞，
-        //    compute 流先算命中组 ⇒ 两边并行（§P4；`NOH2D` 实测这一趟值 28 ms/轮）。
+        // compute 流先算命中组 ⇒ 两边并行（；`NOH2D` 实测这一趟值 28 ms/轮）。
         let ov_stream = if overlap { Some(self.k.stream2.clone()) } else { None };
         if let Some(s2) = ov_stream.as_ref() {
             // 跨流门：`stream2` 上的覆写必须等 compute 流上**更早那些读同一个槽的 GEMV** 跑完。
-            // （现在它是空转：MoE 的路由读取每层都会 `stream.synchronize()`，队列本来就是空的；
-            //   留着是为了不依赖那个巧合。）
+            // （现在它是空转：MoE 的路由读取每层都会 `stream.synchronize`，队列本来就是空的；
+            // 留着是为了不依赖那个巧合。）
             self.k.ev_mo_pre.record(&self.k.stream)?;
             s2.wait(&self.k.ev_mo_pre)?;
         }
@@ -1424,7 +1397,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                             .context("arena blob H2D")?;
                     }
                     // [探针] `LINGXI_ARENA_SLOT_CHECK=<layer>`：把刚灌进去的槽回读 64 B 与 arena 源字节比对，
-                    //   并在 slot_ids 上传后核对其回读 —— 一次判掉"槽内容/槽号到底对不对"。
+                    // 并在 slot_ids 上传后核对其回读 —— 一次判掉"槽内容/槽号到底对不对"。
                     if lingxi_model::flag("LINGXI_ARENA_SLOT_CHECK")
                         && std::env::var("LINGXI_ARENA_SLOT_CHECK")
                             .ok()
@@ -1454,9 +1427,9 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                         }
                     }
                     // ★ 判决性诊断（`LINGXI_ARENA_SYNC_H2D=1`）：每次 miss 的 H2D 立刻同步。
-                    //   用途：如果"同一份权重、只差命中/未命中"就能让 token 流分叉，那要么是
-                    //   **字节不同**、要么是 **H2D 与后续 GEMV 之间没有真正可见**。这条开关把
-                    //   后一种可能一刀排除（同步之后就不可能有"还没到位"这回事）。
+                    // 用途：如果"同一份权重、只差命中/未命中"就能让 token 流分叉，那要么是
+                    // **字节不同**、要么是 **H2D 与后续 GEMV 之间没有真正可见**。这条开关把
+                    // 后一种可能一刀排除（同步之后就不可能有"还没到位"这回事）。
                     if lingxi_model::flag("LINGXI_ARENA_SYNC_H2D") {
                         self.k.stream.synchronize()?;
                     }
@@ -1496,7 +1469,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
         }
 
         // 2) 从**设备槽**解量化：全 Q4G64 / 全 Q3G128（统一格式）走**批量版**（2 次 launch/层，
-        //    而非 2S 次）；否则逐专家（含 BF16 原样直落）。
+        // 而非 2S 次）；否则逐专家（含 BF16 原样直落）。
         let all_q4 = !fmts.is_empty()
             && fmts.iter().all(|f| *f == fmts[0])
             && matches!(fmts[0], BlobFormat::Q4G64F16S | BlobFormat::Q3G128F16S);
@@ -1709,11 +1682,13 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                 let pin_a = sc.ids_pin_alt[ph].as_mut().unwrap();
                 let buf_a = pin_a.as_mut_slice()?;
                 for j in 0..s {
+                    // ★ 2026-10-22 单 launch 化：他格式段从哨兵 0 改成 **-1**（0 是合法槽号，
+                    // 会在整段单 launch 下被当真槽读）。核里 `slot < 0` 早退跳过。
                     if which[j] == 0 {
                         buf[j] = slot_ids[j] as i32;
-                        buf_a[j] = 0;
+                        buf_a[j] = -1;
                     } else {
-                        buf[j] = 0;
+                        buf[j] = -1;
                         buf_a[j] = slot_ids[j] as i32;
                     }
                 }

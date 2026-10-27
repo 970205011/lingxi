@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 half.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
 cudarc.workspace = true
 lingxi-ids.workspace = true
 lingxi-artifact.workspace = true

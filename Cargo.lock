@@ -279,7 +279,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "lingxi-artifact"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "lingxi-ids",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "lingxi-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "lingxi-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -319,14 +319,14 @@ dependencies = [
 
 [[package]]
 name = "lingxi-ids"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "lingxi-kernels"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "lingxi-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cudarc",
@@ -345,28 +345,20 @@ dependencies = [
  "lingxi-ids",
  "lingxi-kernels",
  "lingxi-plan",
+ "memmap2",
+ "rayon",
 ]
 
 [[package]]
 name = "lingxi-plan"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lingxi-ids",
-]
-
-[[package]]
-name = "lingxi-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "lingxi-driver",
- "lingxi-ids",
- "lingxi-model",
 ]
 
 [[package]]
 name = "lingxi-tokenize"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "tokenizers",

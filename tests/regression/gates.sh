@@ -8,7 +8,7 @@
 # gate3 paged_bail：分页窗口 < 工作集必须响亮报错而非脏值（protect_step 的门）。
 set -u
 cd "$(dirname "$0")/../.."
-export LD_LIBRARY_PATH="${LINGXI_CUDA_LIBS:-/root/cu12/nvidia/cublas/lib:/root/cu12/nvidia/cuda_nvrtc/lib:${CUDA_HOME:-/usr/local/cuda-12.8}/targets/x86_64-linux/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${LINGXI_CUDA_LIBS:-${CUDA_HOME:-/usr/local/cuda-12.8}/targets/x86_64-linux/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ART=${ART:-${LINGXI_ARTIFACT:-/models/qwen4_exp-artifact/qwen4_exp.ninfer}}
 pass=0; fail=0
 ok()  { echo "GATE-PASS  $1"; pass=$((pass+1)); }
@@ -22,14 +22,14 @@ mix_arena=${LINGXI_EXPERT_ARENA:-/dev/shm/qwen4_exp.expert-arena.mix64.bin}
 PY=${PYTHON:-python3}
 # ninfer 检出位置：可 NINFER_REPO= 覆盖；默认在常见位置里挑第一个存在的
 if [ -z "${NINFER_REPO:-}" ]; then
-  for d in "$HOME/ninfer" /data/models/ninfer "$HOME/ninfer-dev"; do
+  for d in "$HOME/ninfer" /models/ninfer "$HOME/ninfer-dev"; do
     [ -d "$d" ] && NINFER_REPO=$d && break
   done
 fi
 if PYTHONPATH="$NINFER_REPO" "$PY" tools/golden/mix_arena_check.py \
-        "$mix_arena" docs/bench-logs/hist_top64.csv \
-        "${Q4_ARENA:-/data/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin}" \
-        "${Q3_ARENA:-/data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin}" \
+        "$mix_arena" /hist_top64.csv \
+        "${Q4_ARENA:-/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin}" \
+        "${Q3_ARENA:-/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin}" \
         > /tmp/gate1.log 2>&1 && grep -qa "MIX_ARENA_CHECK PASS" /tmp/gate1.log; then
     ok gate1
 else

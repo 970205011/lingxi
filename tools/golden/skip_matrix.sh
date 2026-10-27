@@ -2,7 +2,7 @@
 # 分层剥离耗时矩阵：用 LINGXI_SKIP 逐块关掉子块，反推每块的净耗时。
 # 一律带上 `ple`——PLE 每 token 会从 95 GiB 大表按 ngram 哈希随机取行（表在机械盘上），
 # 跳过子块后输出是乱码 token，会把"冷随机读"混进计时里。
-# 用法（测试机 内）：bash tools/golden/skip_matrix.sh [max_new]
+# 用法（CT141 内）：bash tools/golden/skip_matrix.sh [max_new]
 set -u
 cd /models/lingxi
 MAX=${1:-24}

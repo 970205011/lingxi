@@ -1,13 +1,13 @@
 //! 单层主干前向组装。数学对齐 HF `Qwen4ExpTextDecoderLayer.forward`：
-//! ```text
+//! `text
 //! hyper = hc_count 路残差流（[T, hc*H]）
-//! mixed, injw = attn_gr(hyper)            # GR 读出单流
-//! a           = attn(mixed) | gdn(mixed)  # QSA 或 GDN
-//! hyper      += injw ⊗ a                  # 注入回 hc 路
+//! mixed, injw = attn_gr(hyper) # GR 读出单流
+//! a = attn(mixed) | gdn(mixed) # QSA 或 GDN
+//! hyper += injw ⊗ a # 注入回 hc 路
 //! mixed, injw = mlp_gr(hyper)
-//! m           = moe(mixed)
-//! hyper      += injw ⊗ m
-//! ```
+//! m = moe(mixed)
+//! hyper += injw ⊗ m
+//! `
 //! PLE（仅个别层）在 GR 之前对 `hyper` 做一次加性注入，见 `plet` 模块。
 
 use anyhow::Result;
@@ -63,7 +63,7 @@ pub struct LayerEnv<'a> {
     /// MoE 瘦身路径的按需专家源；`None` = 用层权重里预装的全量专家张量
     pub experts: Option<&'a dyn moe::ExpertSource>,
     /// **跨卡 MoE**（`LINGXI_MOE_SPLIT`）：`Some` 时把落在 `layers` 区间内的层的 MoE
-    /// 交给 GPU1 跑（见 `moe::RemoteMoe` 与 `docs/PLAN.md` §P13.1c）。`None` = 现状逐位不变。
+    /// 交给 GPU1 跑。`None` = 现状逐位不变。
     pub remote: Option<&'a moe::RemoteMoe<'a>>,
 }
 
@@ -133,7 +133,7 @@ pub fn layer_forward(
     }
     let moe_out = moe::sparse_moe_forward(
         k, &w.moe, &mixed, t, s.hidden, s.num_experts, s.top_k, s.inter, None,
-        layer, env.experts, env.remote,
+        layer, env.experts, env.remote, None,
     )?
     .out;
     let injw = injw.expect("mlp_gr 必须带 block_inject");
@@ -231,7 +231,7 @@ pub fn layer_step(
 /// 与 [`layer_step`] 相同，但把 **GDN 的内部输入（投影的输出 `qkv/z/a/b`）录下来**
 /// （`rec.replay == false`）或**从录像重放**（`rec.replay == true`）。见 [`crate::gdn::GdnRec`]。
 ///
-/// 为什么要它（PLAN §P15-F）：投机验证是"验完 t 行 → 回卷 → 把 GDN 状态挪到 `accept` 行处"。
+/// 为什么要它：投机验证是"验完 t 行 → 回卷 → 把 GDN 状态挪到 `accept` 行处"。
 /// `gdn_step` 的三步（投影 / 卷积 / 递推）**全是 `mixed` 的纯函数** ⇒ 把**投影的输出**录下来，
 /// 重放时就只跑「卷积 + 递推」两个小核，**跳过投影那笔最大的权重读**（~30 MB/层）。
 /// 录 5 MB（`t_max=7` × 36 层），比"逐行快照整个状态"那条（500 MB）省 99%。
@@ -263,8 +263,35 @@ pub fn layer_step_rec(
     r
 }
 
-/// 见 [`layer_step_rec`]。
-fn layer_step_inner(
+/// [`layer_dense_step`] 的产物：残差流 + 已经取出、**必须**由 [`layer_moe_finish`]
+/// （或 [`layer_moe_apply`]）归还的 MoE GR 固定槽。`t_*` 只给 `LINGXI_PROF` 用。
+pub struct DenseStepOut {
+    pub hyper: CudaSlice<bf16>,
+    pub mixed_m: CudaSlice<bf16>,
+    pub injw_m: CudaSlice<bf16>,
+    pub(crate) t0: std::time::Instant,
+    pub(crate) t_agr: std::time::Duration,
+    pub(crate) t_attn: std::time::Duration,
+    pub(crate) t_mgr: std::time::Duration,
+}
+
+/// [`layer_dense_step`] + MoE 的产物（`hyper` 已加上 MoE 输出）。
+pub struct MoeFinishOut {
+    pub hyper: CudaSlice<bf16>,
+    pub(crate) t_moe: std::time::Instant,
+}
+
+/// EP 用的"半场 MoE"产物：`out` 是本卡负责的专家区间的**部分和**（卡 0 另含 shared）。
+pub struct MoePartialOut {
+    pub out: CudaSlice<bf16>,
+    pub(crate) t_moe: std::time::Instant,
+}
+
+/// **稠密段**（evprof 段 0..2）：入口 + attn_GR、attn、gr_write + mlp_GR。
+/// 原 `layer_step_inner` 的 seg0..seg2 原样搬过来；返回残差流与尚未归还的 MoE GR 槽，
+/// 数学/事件顺序与拆分前逐位一致。
+#[allow(clippy::too_many_arguments)]
+pub fn layer_dense_step(
     k: &Kernels,
     w: &LayerWeights,
     s: &LayerShape,
@@ -274,9 +301,8 @@ fn layer_step_inner(
     states: &mut LayerStates,
     layer: u32,
     rec: Option<crate::gdn::GdnRec<'_>>,
-) -> Result<CudaSlice<bf16>> {
+) -> Result<DenseStepOut> {
     let dim = s.hc * s.hidden;
-    let prof = crate::flag("LINGXI_PROF");
     let t0 = std::time::Instant::now();
     // `LINGXI_EVPROF=1`：逐段记 GPU 事件（**不排空流水**，口径干净；见 lingxi_kernels::evprof）
     let ep = k.evprof.as_ref();
@@ -306,9 +332,11 @@ fn layer_step_inner(
             }
             let t_ple0 = std::time::Instant::now();
             let pst = states.ple.as_mut().expect("PLE 层必须带 PleState");
+            crate::gr_prof::ple_begin(k)?;
             let ple_out = plet::ple_step(k, pw, &hyper, env.ids, t, pst)?;
             let mut summed = scratch::bf16(k, t * dim)?;
             k.add_bf16(&hyper, &ple_out, &mut summed, t * dim)?;
+            crate::gr_prof::ple_end(k)?;
             if kts_ple {
                 k.stream.synchronize()?;
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -342,6 +370,7 @@ fn layer_step_inner(
         k.stream.memset_zeros(&mut mixed_m)?;
         k.stream.memset_zeros(&mut injw_m)?;
     } else {
+    crate::gr_prof::begin(k, t as u32, crate::gr_prof::Chain::Attn)?;
     gr::gated_residual_forward_into(
         k, &w.attn_gr, &hyper, &mut mixed_a, Some(&mut injw_a), t as u32,
         dim, s.hidden, s.hc, s.lowrank, s.eps, tkey + 1,
@@ -351,6 +380,8 @@ fn layer_step_inner(
     if crate::flag("LINGXI_KTS") {
         k.stream.synchronize()?;
     }
+    crate::mtp_prof::mark(k, 1)?; // 段 1 = attn_gr 结束（仅 MTP 哨兵层生效）
+    crate::draft_prof::mark(k, 1)?; // 同上（`LINGXI_DRAFT_PROF`，正确边界版）
     let t_agr = t0.elapsed();
     if let Some(p) = ep {
         p.end(layer, 0, &k.stream);
@@ -359,6 +390,23 @@ fn layer_step_inner(
     let attn_out = if skip_has("attn") {
         k.stream.alloc_zeros::<bf16>(t * s.hidden)?
     } else {
+        // `LINGXI_ATTN_SYNC=1`：attn 段六分探针（流内事件，层末一次 sync；见 `attn_prof`）
+        crate::attn_prof::info(
+            t,
+            match &states.attn {
+                AttnState::Qsa(st) => st.len,
+                AttnState::Gdn(_) => 0,
+            },
+        );
+        crate::attn_prof::begin(
+            k,
+            layer,
+            if matches!(w.attn, AttnWeights::Qsa { .. }) {
+                crate::attn_prof::Kind::Qsa
+            } else {
+                crate::attn_prof::Kind::Gdn
+            },
+        )?;
         match (&w.attn, &mut states.attn) {
             (AttnWeights::Qsa { attn, indexer }, AttnState::Qsa(st)) => qsa::attention_step(
                 k, attn, indexer, &mixed_a, env.cos, env.sin, env.cos_host, env.sin_host,
@@ -375,6 +423,8 @@ fn layer_step_inner(
     if crate::flag("LINGXI_KTS") {
         k.stream.synchronize()?;
     }
+    crate::mtp_prof::mark(k, 2)?; // 段 2 = attention 结束
+    crate::draft_prof::mark(k, 2)?;
     let t_attn = t0.elapsed();
     if let Some(p) = ep {
         p.end(layer, 1, &k.stream);
@@ -391,6 +441,7 @@ fn layer_step_inner(
 
     // ── MLP 块 ──
     if !skip_has("gr") {
+        crate::gr_prof::begin(k, t as u32, crate::gr_prof::Chain::Mlp)?;
         gr::gated_residual_forward_into(
             k, &w.mlp_gr, &hyper, &mut mixed_m, Some(&mut injw_m), t as u32,
             dim, s.hidden, s.hc, s.lowrank, s.eps, tkey + 2,
@@ -399,9 +450,31 @@ fn layer_step_inner(
     if crate::flag("LINGXI_KTS") {
         k.stream.synchronize()?;
     }
+    crate::mtp_prof::mark(k, 3)?; // 段 3 = mlp_gr 结束（含 attn 输出的 gr_write）
+    crate::draft_prof::mark(k, 3)?;
     let t_mgr = t0.elapsed();
     if let Some(p) = ep {
         p.end(layer, 2, &k.stream);
+    }
+    // `LINGXI_GR_PROF=1`：层末**一次** sync 读回两条 GR 链 + PLE 的逐核事件。
+    crate::gr_prof::flush(k, layer)?;
+    Ok(DenseStepOut { hyper, mixed_m, injw_m, t0, t_agr, t_attn, t_mgr })
+}
+
+/// **MoE 段**（evprof 段 3..4）：路由 + host 段 + 专家段。输出是"本卡半边"的部分和；
+/// `ep = Some(..)` 时只算分配表里属于本卡的专家（见 `moe::sparse_moe_forward`）。
+#[allow(clippy::too_many_arguments)]
+pub fn layer_moe_partial(
+    k: &Kernels,
+    w: &LayerWeights,
+    s: &LayerShape,
+    mixed_m: &CudaSlice<bf16>,
+    t: usize,
+    env: &LayerEnv,
+    layer: u32,
+    ep: Option<moe::EpSlice<'_>>,
+) -> Result<MoePartialOut> {
+    if let Some(p) = k.evprof.as_ref() {
         // 段 3 = MoE 的"路由 + host 段"，段 4 = "专家段"（边界记在 `moe::sparse_moe_forward` 里）
         p.begin(layer, 3, &k.stream);
     }
@@ -409,8 +482,8 @@ fn layer_step_inner(
         k.stream.alloc_zeros::<bf16>(t * s.hidden)?
     } else {
         let mo = moe::sparse_moe_forward(
-            k, &w.moe, &mixed_m, t, s.hidden, s.num_experts, s.top_k, s.inter, None,
-            layer, env.experts, env.remote,
+            k, &w.moe, mixed_m, t, s.hidden, s.num_experts, s.top_k, s.inter, None,
+            layer, env.experts, env.remote, ep,
         )?;
         if let Some(l) = mo.router_logits {
             scratch::put_bf16(l);
@@ -422,8 +495,24 @@ fn layer_step_inner(
     if crate::flag("LINGXI_KTS") {
         k.stream.synchronize()?;
     }
-    let t_moe = t0.elapsed();
-    if let Some(p) = ep {
+    let t_moe = std::time::Instant::now();
+    Ok(MoePartialOut { out: moe_out, t_moe })
+}
+
+/// **收尾段**（evprof 段 5）：把 MoE 输出写回残差流，并归还 MoE 的两个 GR 固定槽。
+#[allow(clippy::too_many_arguments)]
+pub fn layer_moe_apply(
+    k: &Kernels,
+    s: &LayerShape,
+    mut hyper: CudaSlice<bf16>,
+    moe_out: CudaSlice<bf16>,
+    mixed_m: CudaSlice<bf16>,
+    injw_m: CudaSlice<bf16>,
+    t: usize,
+    layer: u32,
+) -> Result<CudaSlice<bf16>> {
+    let tkey = (layer as u64) * 8 + ((1u64 + t as u64) << 40);
+    if let Some(p) = k.evprof.as_ref() {
         p.end(layer, 4, &k.stream);
         p.begin(layer, 5, &k.stream);
     }
@@ -433,21 +522,77 @@ fn layer_step_inner(
     graph::give_fixed(k, tkey, 2, mixed_m);
     graph::give_fixed(k, tkey, 3, injw_m);
     scratch::put_bf16(moe_out);
-    if let Some(p) = ep {
+    if let Some(p) = k.evprof.as_ref() {
         p.end(layer, 5, &k.stream);
     }
-    if prof {
+    if crate::flag("LINGXI_LAYER_NAN_CHK") {
+        // 诊断（`LINGXI_LAYER_NAN_CHK=1`）：逐层核 hidden/hyper 是否有非有限值并报出行号。
+        // 用途：定位"某行 NaN 从哪一层开始"（NaN 会让设备 top-k 的 ids 尾部留残渣，
+        // 进而把后续 pair 核带到越界读）。每层一次 D2H，仅排障时开。
+        let dim = s.hc * s.hidden;
+        let v: Vec<bf16> = k.stream.clone_dtoh(&hyper)?;
+        let mut rows_bad = Vec::new();
+        for r in 0..t {
+            if v[r * dim..(r + 1) * dim].iter().any(|x| !x.to_f32().is_finite()) {
+                rows_bad.push(r);
+            }
+        }
+        if !rows_bad.is_empty() {
+            eprintln!("[nanchk] layer {layer} t={t} rows_bad={rows_bad:?}");
+        }
+    }
+    Ok(hyper)
+}
+
+/// **MoE + 收尾**（evprof 段 3..5）：等价于 `layer_moe_partial` + `layer_moe_apply`。
+/// 非 EP 路径用它，保持与拆分前同一调用序列/同一数学。
+#[allow(clippy::too_many_arguments)]
+pub fn layer_moe_finish(
+    k: &Kernels,
+    w: &LayerWeights,
+    s: &LayerShape,
+    hyper: CudaSlice<bf16>,
+    mixed_m: CudaSlice<bf16>,
+    injw_m: CudaSlice<bf16>,
+    t: usize,
+    env: &LayerEnv,
+    layer: u32,
+    ep: Option<moe::EpSlice<'_>>,
+) -> Result<MoeFinishOut> {
+    let part = layer_moe_partial(k, w, s, &mixed_m, t, env, layer, ep)?;
+    crate::mtp_prof::mark(k, 4)?; // 段 4 = MoE（路由+shared+专家+归并）
+    crate::draft_prof::mark(k, 4)?;
+    let hyper = layer_moe_apply(k, s, hyper, part.out, mixed_m, injw_m, t, layer)?;
+    crate::mtp_prof::mark(k, 5)?; // 段 5 = 收尾（MoE 输出的 gr_write）
+    crate::draft_prof::mark(k, 5)?;
+    Ok(MoeFinishOut { hyper, t_moe: part.t_moe })
+}
+
+/// 见 [`layer_step_rec`]。
+fn layer_step_inner(
+    k: &Kernels,
+    w: &LayerWeights,
+    s: &LayerShape,
+    x: &CudaSlice<bf16>,
+    t: usize,
+    env: &LayerEnv,
+    states: &mut LayerStates,
+    layer: u32,
+    rec: Option<crate::gdn::GdnRec<'_>>,
+) -> Result<CudaSlice<bf16>> {
+    let d = layer_dense_step(k, w, s, x, t, env, states, layer, rec)?;
+    let mo = layer_moe_finish(k, w, s, d.hyper, d.mixed_m, d.injw_m, t, env, layer, None)?;
+    if crate::flag("LINGXI_PROF") {
         eprintln!(
             "    [step] 层 {layer:2} 入口+attn_gr {:.1} attn {:.1} mlp_gr {:.1} moe {:.1} 合计 {:.1} µs",
-            t_agr.as_secs_f64() * 1e6,
-            (t_attn - t_agr).as_secs_f64() * 1e6,
-            (t_mgr - t_attn).as_secs_f64() * 1e6,
-            (t_moe - t_mgr).as_secs_f64() * 1e6,
-            t0.elapsed().as_secs_f64() * 1e6,
+            d.t_agr.as_secs_f64() * 1e6,
+            (d.t_attn - d.t_agr).as_secs_f64() * 1e6,
+            (d.t_mgr - d.t_attn).as_secs_f64() * 1e6,
+            (mo.t_moe - d.t0).saturating_sub(d.t_mgr).as_secs_f64() * 1e6,
+            (mo.t_moe - d.t0).as_secs_f64() * 1e6,
         );
     }
-
-    Ok(hyper)
+    Ok(mo.hyper)
 }
 
 /// 调试：把显存张量写成 `<dir>/<name>.f32`（仅 `LINGXI_LAYER_DEBUG_DIR` 打开时调用）。

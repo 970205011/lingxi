@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 单卡单实例（部署用）：serve_single.sh <gpu> <port> [slots] [max_ctx]
-#   - LINGXI_LAYER_SPLIT=0：48 层全放在一张卡上
-#   - LINGXI_DEVICE=<gpu>：选卡
-#   - 前缀缓存默认开；槽位按 max_ctx 留给 KV 的余量调
+# - LINGXI_LAYER_SPLIT=0：48 层全放在一张卡上
+# - LINGXI_DEVICE=<gpu>：选卡
+# - 前缀缓存默认开；槽位按 max_ctx 留给 KV 的余量调
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -24,7 +24,7 @@ export LINGXI_SERVE_CACHE_MIN_TOKENS="${LINGXI_SERVE_CACHE_MIN_TOKENS:-8192}"
 export LINGXI_ARENA_HIST="${LINGXI_ARENA_HIST:-run/hist_live-$PORT.csv}"
 # MTP 投机：冷请求开，命中前缀缓存的请求自动退回自回归
 export LINGXI_SERVE_SPEC="${LINGXI_SERVE_SPEC:-1}"
-export LINGXI_MTP_ARTIFACT="${LINGXI_MTP_ARTIFACT:-/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer}"
+export LINGXI_MTP_ARTIFACT="${LINGXI_MTP_ARTIFACT:-/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer}"
 ART=${LINGXI_ARTIFACT:-/models/qwen4_exp-artifact/qwen4_exp.ninfer}
 
 exec ./start.sh ./bin/lingxi-bench serve \

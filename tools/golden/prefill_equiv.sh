@@ -8,15 +8,15 @@
 # 把这一类 bug 钉住。
 #
 # 用法：
-#   bash tools/golden/prefill_equiv.sh <prompt_file> <expected_first_token> [env=val ...]
+# bash tools/golden/prefill_equiv.sh <prompt_file> <expected_first_token> [env=val ...]
 #
 # 已知基准（2026-10-18，内核修复后；**分块已逐位不变，所以 1 chunk 与默认 512 同值**）：
-#   /tmp/p700.txt         (867 token)   → 96133
-#   /tmp/parity_prompt.txt (4167 token) → 332
-#   /tmp/ctx64.txt        (23673 token) → 95835
+# /tmp/p700.txt (867 token) → 96133
+# /tmp/parity_prompt.txt (4167 token) → 332
+# /tmp/ctx64.txt (23673 token) → 95835
 # 想额外证明"分块不变"，可同一条 prompt 跑两遍：
-#   prefill_equiv.sh <pf> <tok>
-#   prefill_equiv.sh <pf> <tok> LINGXI_PREFILL_CHUNK=8192
+# prefill_equiv.sh <pf> <tok>
+# prefill_equiv.sh <pf> <tok> LINGXI_PREFILL_CHUNK=8192
 #
 # 判据：首 token 完全相等；不等就退出码 1（可直接挂 CI/提交前自检）。
 set -u

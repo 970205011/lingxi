@@ -1,13 +1,13 @@
 //! GR（GatedResidual / hyper-connection）前向。
 //!
 //! 数学严格对齐 HF `Qwen4ExpTextGatedResidual.forward`：
-//! ```text
-//! xn   = hc_norm(hyper_input)                       # 分组 RMSNorm（gamma 已烘焙）
-//! d    = mix_down(xn) / hc                          # [lowrank]
-//! imw  = sigmoid(mix_up(silu(d)))                   # [hc*hidden]
-//! mixed = mean_g( imw[g*H+i] * xn[g*H+i] )          # [hidden]
-//! injw  = 2 * sigmoid(block_inject(xn) / hc)        # [hc]
-//! ```
+//! `text
+//! xn = hc_norm(hyper_input) # 分组 RMSNorm（gamma 已烘焙）
+//! d = mix_down(xn) / hc # [lowrank]
+//! imw = sigmoid(mix_up(silu(d))) # [hc*hidden]
+//! mixed = mean_g(imw[g*H+i] * xn[g*H+i]) # [hidden]
+//! injw = 2 * sigmoid(block_inject(xn) / hc) # [hc]
+//! `
 
 use anyhow::{Context as _, Result};
 use cudarc::driver::CudaSlice;
@@ -20,7 +20,7 @@ use crate::scratch;
 
 /// 一个 GR 块的权重（都已烘焙 / 无需运行时转换）。
 pub struct GrWeights {
-    /// [dim]        分组归一化 gamma
+    /// [dim] 分组归一化 gamma
     pub hc_norm: CudaSlice<bf16>,
     /// [lowrank, dim]
     pub mix_down: CudaSlice<bf16>,
@@ -92,7 +92,12 @@ pub fn gated_residual_forward_into(
         gkey.wrapping_add((1u64 + rows as u64) << 40)
     };
     // `LINGXI_NO_GR_GRAPH=1`：只禁 GR 的图（二分"spec+graph 数值错"的罪魁用）。
-    let capture = graph::enabled() && gkey != graph::NO_CAPTURE && !crate::flag("LINGXI_NO_GR_GRAPH");
+    // `LINGXI_GR_PROF=1` 时也**不录图**：`cuEventRecord` 不能出现在 capture 区里
+    // （会 STREAM_CAPTURE_UNJOINED），而探针本身要逐核事件。
+    let capture = graph::enabled()
+        && gkey != graph::NO_CAPTURE
+        && !crate::flag("LINGXI_NO_GR_GRAPH")
+        && !crate::gr_prof::on();
     let take = |slot: usize, len: usize| -> Result<CudaSlice<bf16>> {
         graph::take_fixed(k, gkey, slot, len)
     };
@@ -120,6 +125,16 @@ pub fn gated_residual_forward_into(
         graph::give_fixed_f32(k, gkey, 9, rmsg);
         return Ok(());
     }
+    // ── 通用档融合（rows 2..=8）：5 发 → 3 发 ──
+    // 见 `cuda/gr_ops.cu` 的 `lingxi_gr_down_inject_bf16` / `lingxi_gr_up_mix_fuse_bf16`。
+    // 逐位等价（同一个 per-列/per-行的累加次序与归约树、同样保留 imw 的 bf16 舍入点），
+    // 微基准 `t9_gr_shape_bw` 在 rows=5/6/7 上对拍 0 不一致。
+    // 门控：`LINGXI_NO_GR_FUSE2=1` 回退；`LINGXI_F32X_PROJ` 开时走旧路（保住 f32x 的既有语义）。
+    let fuse2 = (2..=8).contains(&rows)
+        && w.block_inject.is_some()
+        && !crate::flag("LINGXI_NO_GR_FUSE2")
+        && !crate::flag("LINGXI_F32X_PROJ")
+        && !crate::flag("LINGXI_KTS");
     // ⚠️ **图的输入必须来自私有缓冲**：图把设备指针烘死，而 `x`（残差流）是从 scratch
     // 池按**同尺寸 LIFO** 借的 —— 一个 token 里 `put(旧 hyper)`/`hyper=next` 的轮转会让
     // 各层看到的两块缓冲奇偶交替（实测 layer 47 的 `hyper` 地址每 token 在
@@ -141,6 +156,29 @@ pub fn gated_residual_forward_into(
         let mut xn = take(0, r * dim)?;
         k.grouped_rmsnorm_bf16(x, &w.hc_norm, &mut xn, rows, dim, hidden, eps)
             .context("gr: rmsnorm")?;
+        crate::gr_prof::mark(k, 1)?;
+        if fuse2 {
+            // 3 发：rmsnorm（上面）→ down+inject → up+mix
+            let inv_hc = 1.0 / (hc as f32);
+            let wi = w.block_inject.as_ref().expect("fuse2 要求 block_inject");
+            let injw = out_injw
+                .as_deref_mut()
+                .ok_or_else(|| anyhow::anyhow!("GR 融合档需要 block_inject 输出缓冲"))?;
+            let mut d = take(1, r * lowrank)?;
+            k.gr_down_inject_bf16(
+                &w.mix_down, wi, &xn, &mut d, injw,
+                lowrank, hc, dim, r, inv_hc,
+            ).context("gr: down+inject fuse")?;
+            crate::gr_prof::mark(k, 2)?;
+            let opb = if hidden % 2 == 0 { 2 } else { 1 };
+            k.gr_up_mix_fuse_bf16(
+                &w.mix_up, &d, &xn, out_mixed, lowrank, hidden, hc, r, opb,
+            ).context("gr: up+mix fuse")?;
+            crate::gr_prof::mark(k, 3)?;
+            graph::give_fixed(k, gkey, 0, xn);
+            graph::give_fixed(k, gkey, 1, d);
+            return Ok(());
+        }
         if kts {
             k.stream.synchronize()?;
             tk[0] = ta.elapsed().as_secs_f64() * 1e6;
@@ -163,6 +201,7 @@ pub fn gated_residual_forward_into(
             ta = std::time::Instant::now();
         }
 
+        crate::gr_prof::mark(k, 2)?;
         // imw = sigmoid(mix_up(d))
         let mut imw = take(2, r * dim)?;
         // ★ P15-⑨ **未解之谜**：mix_up 的 f32x（[20480,320] epi=2）在 `f32x-check` 里
@@ -176,6 +215,7 @@ pub fn gated_residual_forward_into(
             ta = std::time::Instant::now();
         }
 
+        crate::gr_prof::mark(k, 3)?;
         // mixed = mean_g(imw * xn)（一次覆盖所有行）
         k.mix_mean_bf16(&imw, &xn, out_mixed, hc, hidden, rows)
             .context("gr: mix_mean")?;
@@ -185,6 +225,7 @@ pub fn gated_residual_forward_into(
             ta = std::time::Instant::now();
         }
 
+        crate::gr_prof::mark(k, 4)?;
         // injw = 2 * sigmoid(block_inject(xn) / hc)
         if let (Some(w_inj), Some(dst)) = (&w.block_inject, out_injw.as_deref_mut()) {
             match xn_f.as_ref() {
@@ -206,6 +247,8 @@ pub fn gated_residual_forward_into(
                 );
             }
         }
+
+        crate::gr_prof::mark(k, 5)?;
 
         graph::give_fixed(k, gkey, 0, xn);
         graph::give_fixed(k, gkey, 1, d);

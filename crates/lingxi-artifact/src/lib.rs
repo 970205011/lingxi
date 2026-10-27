@@ -1,12 +1,12 @@
 //! `lingxi-artifact` — ninfer v2 容器（`.ninfer`）的读取器/写入器。
 //!
-//! **格式与 ninfer 完全兼容，直接读现成产物**（`ARCHITECTURE.md` §0.5 复用铁律）：
-//! ```text
+//! **格式与 ninfer 完全兼容，直接读现成产物**（`ARCHITECTURE.md` 复用铁律）：
+//! `text
 //! magic(8B "NINFER\0\x02") | json_bytes(u64 LE) | JSON directory | pad→4096 | payload
 //! directory = {"identity":{"model_id","weights_id"},"objects":[...]}
-//!   tensor   : {name,kind:"tensor",shape,format,layout,offset,bytes}
-//!   resource : {name,kind:"resource",encoding,offset,bytes}
-//! ```
+//! tensor: {name,kind:"tensor",shape,format,layout,offset,bytes}
+//! resource: {name,kind:"resource",encoding,offset,bytes}
+//! `
 //! offset 相对 payload 起点；tensor 按 layout 的 256B 对齐，resource 按 1B。
 //!
 //! 职责边界：**只做容器解析与结构校验；不量化、不重转、不碰 CUDA。**

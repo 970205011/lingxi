@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """探测专家权重对象的形状/格式（自研压缩"压缩率↔误差"前沿量测的第一步）。
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/quant_probe.py

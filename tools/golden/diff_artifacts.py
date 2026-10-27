@@ -4,7 +4,7 @@
 import json, struct, mmap, collections
 
 A = "/models/qwen4_exp-artifact/qwen4_exp.ninfer"
-B = "/data/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer"
+B = "/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer"
 
 def load(path):
     f = open(path, "rb")

@@ -16,6 +16,8 @@ artifacts/
 
 # 构建产物（make build 负责 cp 到 bin/ 供容器内运行）
 bin/
+# 发布包（make dist 产出，不入库）
+dist/
 
 # 部署运行时（pid / 日志）
 /run/

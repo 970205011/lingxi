@@ -11,9 +11,9 @@
 
 用法：
   python3 tools/golden/mix_arena_check.py \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.mix64.bin \
-    /tmp/hot64.csv /data/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin [N=64]
+    /models/lingxi-assets/qwen4_exp.expert-arena.mix64.bin \
+    /tmp/hot64.csv /models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin \
+    /models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin [N=64]
 """
 from __future__ import annotations
 

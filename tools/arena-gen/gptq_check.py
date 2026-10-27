@@ -8,9 +8,9 @@ Cholesky 因子做高效输出误差（eigendecomposition: ||A||_H² = ||Lᵀ A�
 
 用法：
   PYTHONPATH=~/ninfer python3 tools/arena-gen/gptq_check.py \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin \
-    /data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.gptq.bin \
-    /data/models/lingxi-assets/gptq-hessians
+    /models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin \
+    /models/lingxi-assets/qwen4_exp.expert-arena.q3g128.gptq.bin \
+    /models/lingxi-assets/gptq-hessians
 """
 from __future__ import annotations
 

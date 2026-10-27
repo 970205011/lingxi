@@ -14,7 +14,7 @@
 
 > **⭐⭐ MTP 0/n 的真正根因（已定位、已复现、已修复）**
 >
-> **`$LINGXI_ASSETS/qwen4_exp.mtp.ninfer` 里 `mtp/embedding_norm` 与 `mtp/hidden_norm`
+> **`/data/models/lingxi-assets/qwen4_exp.mtp.ninfer` 里 `mtp/embedding_norm` 与 `mtp/hidden_norm`
 > 漏了 wplus 的 `+1`。**
 >
 > 这个模型族的 safetensors 把 **RMSNorm 的 gamma 存成 `γ−1`**，ninfer 转换的 **`wplus` 步骤负责 +1 还原成 γ**；
@@ -42,18 +42,18 @@
 > 用仓库里的转换器从原始 safetensors 重新生成：
 > ```
 > python3 tools/convert/hf2lingxi.py mtp \
->     --src $MODELS/nvfp4/Qwen3.8-Flash-Next \
->     --out $LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer --strict
+>     --src /models/nvfp4/Qwen3.8-Flash-Next \
+>     --out /data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer --strict
 > ```
 > （自带两道自检：**gamma 必须全为正**、**qkv 必须是真置换**。两条自检正好各抓一个 bug。）
-> 产物：`$LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer`。旧的那份 `$LINGXI_ASSETS/qwen4_exp.mtp.ninfer`
+> 产物：`/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer`。旧的那份 `/data/models/lingxi-assets/qwen4_exp.mtp.ninfer`
 > **保留未动**（未删除、未覆盖）。
 >
 > **为什么之前所有白盒都"通过"却查不出来**：三个 oracle（stem/attn/GR）以及所有对拍都**用同一份产物的权重**
 > 去比 Rust —— **是循环论证**，权重本身错了永远测不出来；而主干侧没有 stem norm，所以主干判据也照不到。
 >
-> **⚠️ 现有可用产物**：`$LINGXI_ASSETS/qwen4_exp.mtp.fixed.ninfer`（= 原产物 + 2 个 stem norm 的 +1）。
-> `$LINGXI_ASSETS/qwen4_exp.mtp.ninfer` **仍是坏的**（未删除，也未覆盖；要换请显式改名）。
+> **⚠️ 现有可用产物**：`/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer`（= 原产物 + 2 个 stem norm 的 +1）。
+> `/data/models/lingxi-assets/qwen4_exp.mtp.ninfer` **仍是坏的**（未删除，也未覆盖；要换请显式改名）。
 > 重建脚本见 `tools/golden/mtp_fix_stem_norm.py`（幂等），完整 HF→ninfer 打包映射见 §5.5。
 >
 > **⇒ 但仍不是"能用"**：`mtp-accept` 只量**接受率**；要拿到吞吐，引擎里还必须有
@@ -108,13 +108,13 @@
 
 ## 2. 环境与常用命令
 
-* 引擎在**宿主** **``** = **测试容器 的** **`$MODELS/lingxi`**（同一挂载）。一切容器操作走
+* 引擎在**宿主** **`/root/lingxi`** = **容器 141 的** **`/models/lingxi`**（同一挂载）。一切容器操作走
   `pct exec 141 -- bash -lc '...'`。
 
 * GPU：Tesla V100-PCIE-32GB（sm\_70），**容器内无 ncu/nvprof**（所以块账靠 SKIP/PROF/KTS 反推）。
 
-* 产物：`$MODELS/qwen4_exp-artifact/qwen4_exp.ninfer`（主干）；
-  MTP 小产物 `"$LINGXI_ASSETS/qwen4_exp.mtp.ninfer"`（27 张量 / 4.86 GiB，由 `mtp-pack` 生成）。
+* 产物：`/models/qwen4_exp-artifact/qwen4_exp.ninfer`（主干）；
+  MTP 小产物 `"/data/models/lingxi-assets/qwen4_exp.mtp.ninfer"`（27 张量 / 4.86 GiB，由 `mtp-pack` 生成）。
 
 * 常用 env：
 
@@ -132,7 +132,7 @@ export LINGXI_Q4_CACHE=/dev/shm/lingxi-q4cache      # W4 权重缓存：启动 4
 
 ### 铁律（血的教训，别破）
 
-1. **`机械盘`（6T 机械盘）单块持续读写 ≤15 分钟**，必须切块 + 歇息。
+1. **`/dev/sdb`（6T 机械盘）单块持续读写 ≤15 分钟**，必须切块 + 歇息。
    **专家 arena 的 pin 按「介质」判定**（2026-10-16 起由代码硬判，见 §1.1）：
    * arena 在 **RAM（tmpfs/ramfs）** ⇒ ✅ 允许且**默认整段 pin**（不设 `LINGXI_ARENA_PIN_GIB` 即整段）——
      分开源会慢 28% 且 p50 掉到 8.8 tok/s；

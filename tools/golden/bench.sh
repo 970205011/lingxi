@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# 单流 decode 计时（**低噪声版**）。
+# 单流 AR decode 计时（**低噪声版，p10 口径**）。
+#
+# ⚠️ 分工（2026-10-22 划定）：投机吞吐 → spec_bench.sh；接受率诊断 → spec_ab.sh；
+# 一键全套（AR+双 spec+trace+HTML）：按 bench.sh / spec_bench.sh / trace_report.py 组合。
 #
 # 为什么重写：旧版只打一个"后段中位数"，而实测**相邻两次同口径测量就能差 5%**
 # （min/p10/med 在 0.026~0.031 之间摆），而大多数优化的收益是 1~3% ——
 # 也就是**尺子比被测物还粗**。新版做四件事：
-#   1. 报完整分布（min/p10/p50/p90/max/mean/σ）并给出**离散度判据**；
-#   2. 跑 R 轮，报「每轮 p50」和「R 轮里最好的 p50」——后者对系统抖动更稳；
-#   3. 默认丢掉前 20% 的 token（冷启动 + PLE 冷读）；
-#   4. 默认叠 `LINGXI_FIXED_IDS`（若给了 id 文件）——**A/B 必须用同一 token 流**，
-#      否则采样差异会改变路由，两个配置根本不是同一负载。
+# 1. 报完整分布（min/p10/p50/p90/max/mean/σ）并给出**离散度判据**；
+# 2. 跑 R 轮，报「每轮 p50」和「R 轮里最好的 p50」——后者对系统抖动更稳；
+# 3. 默认丢掉前 20% 的 token（冷启动 + PLE 冷读）；
+# 4. 默认叠 `LINGXI_FIXED_IDS`（若给了 id 文件）——**A/B 必须用同一 token 流**，
+# 否则采样差异会改变路由，两个配置根本不是同一负载。
 #
 # 用法：bash tools/golden/bench.sh <tag> <tokens> [R] [env=val ...]
-#   IDS=/tmp/fixed400.txt bash tools/golden/bench.sh base 400 3
+# IDS=/tmp/fixed400.txt bash tools/golden/bench.sh base 400 3
 set -u
 cd /models/lingxi
 TAG=${1:?用法: bench.sh <tag> <tokens> [R] [env=val ...]}
@@ -22,10 +25,11 @@ export LINGXI_EXPERT_ARENA=${LINGXI_EXPERT_ARENA:-/dev/shm/qwen4_exp.expert-aren
 export LINGXI_ARENA_SLOTS=${LINGXI_ARENA_SLOTS:-9600}   # ★㊿-⑧ 9600/10000：钉表 + 4K prefill 兼顾
 export LINGXI_LAYER_SPLIT_SLOTS=${LINGXI_LAYER_SPLIT_SLOTS:-10000}
 # 生产默认：钉表（㊿-⑤）。想量"不钉表"的基线就 LINGXI_ARENA_PREWARM_N=0。
-export LINGXI_ARENA_PREWARM=${LINGXI_ARENA_PREWARM:-/models/lingxi/docs/bench-logs/hist_spec.csv}
+# 钉表需要一份历史 (层,专家,频次) CSV（本仓库不带实测流量数据）；有就取消注释：
+# export LINGXI_ARENA_PREWARM=${LINGXI_ARENA_PREWARM:-<hist.csv>}
 export LINGXI_ARENA_PREWARM_N=${LINGXI_ARENA_PREWARM_N:-200}
 export LINGXI_ARENA_PIN_GIB=${LINGXI_ARENA_PIN_GIB:-64}
-# **生产/计时路径默认开三档 W4**（§3.49）：实测整机 p10 27,576 → 24,763 µs（−10.2%），
+# **生产/计时路径默认开三档 W4**：实测整机 p10 27,576 → 24,763 µs（−10.2%），
 # 且贪心 token 序列**逐位不变**。代价：载入时多 ~25 s 的主机端在线量化（10.0s → 36.9s）。
 # 想量 bf16 基线就 `LINGXI_DENSE_Q4=0`（三档一起关）。
 export LINGXI_DENSE_Q4=${LINGXI_DENSE_Q4:-1}
@@ -33,8 +37,13 @@ export LINGXI_DENSE_Q4_QSA=${LINGXI_DENSE_Q4_QSA:-1}
 export LINGXI_HEAD_Q4=${LINGXI_HEAD_Q4:-1}
 # W4 量化产物落盘缓存：首次算+存，之后**只读**（省 ~27 s 启动量化，且读的字节少 4 倍）。
 export LINGXI_Q4_CACHE=${LINGXI_Q4_CACHE:-/dev/shm/lingxi-q4cache}
+# ★ 2026-10-25：本脚本直接调 ./bin/lingxi-bench（不经 start.sh），宿主上 cublas/nvrtc
+# 不在 ld 默认路径会崩 "Unable to dynamically load libcublas"。这里补与 start.sh 同源的
+# LD_LIBRARY_PATH（${VAR:+...} 不覆盖调用方已有值）。
+LINGXI_CUDA_LIBS="${LINGXI_CUDA_LIBS:-${CUDA_HOME:-/usr/local/cuda-12.8}/targets/x86_64-linux/lib}"
+export LD_LIBRARY_PATH="${LINGXI_CUDA_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ART=/models/qwen4_exp-artifact/qwen4_exp.ninfer
-WARM=$(( N / 5 ))                       # 丢前 20%
+WARM=$((N / 5 ))                       # 丢前 20%
 if [ -n "${IDS:-}" ] && [ -f "$IDS" ]; then
   export LINGXI_FIXED_IDS="$(cat "$IDS")"
 fi
@@ -47,7 +56,7 @@ for r in $(seq 1 "$R"); do
   env "$@" ./bin/lingxi-bench talk "$ART" "The capital of France is" "$N" > "$OUT" 2>&1
   tr '\r' '\n' < "$OUT" | grep -a 'µs/token' \
     | sed -E 's/.*[[:space:]]([0-9]+\.[0-9]+) µs\/token.*/\1/' \
-    | tail -n +$(( WARM + 1 )) | sort -n \
+    | tail -n +$((WARM + 1 )) | sort -n \
     | awk -v t="$TAG" -v r="$r" '
       { v[NR] = $1; s += $1; ss += $1*$1 }
       END {

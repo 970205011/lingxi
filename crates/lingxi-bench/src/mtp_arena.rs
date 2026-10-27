@@ -1,7 +1,7 @@
 //! **MTP 专家的小 arena**：把 MTP 的 512 个 routed 专家从 **bf16（5.03 GiB）量化成 Q4G64（1.34 GiB）**
 //! 放进设备，作为 [`ExpertSource`] 供 MTP 层**直读**（全部常驻、零 DMA、零 LRU、零驱逐）。
 //!
-//! 目的（`docs/PLAN.md` §P11.3）：给 GPU0 **腾出 ~3.7 GB** ⇒ 换成更多专家槽
+//! 目的：给 GPU0 **腾出 ~3.7 GB** ⇒ 换成更多专家槽
 //! （真语料：槽位 7000→~8400，每层 145→175，覆盖率 83.8%→~88%，miss 19.4%→~11.7%）。
 //! 这比"把 MTP 搬去 GPU1"省事得多，也没有跨卡把驱动搞崩的风险。
 //!
@@ -64,10 +64,10 @@ impl<'a> MtpArena<'a> {
         let (gu_rows, hidden) = shape_of(&gu_name)?;
         let (dn_rows, dn_cols) = shape_of(&dn_name)?;
         // 产物里的实际形状（`lingxi-bench list` 实测）：
-        //   `routed_gate_up` = `[E*2I, H]` = [655360, 2560]
-        //   `routed_down`    = `[E*H, I]`  = [1310720, 640]
+        // `routed_gate_up` = `[E*2I, H]` = [655360, 2560]
+        // `routed_down` = `[E*H, I]` = [1310720, 640]
         // ⚠️ 这两个的"列/行"关系是**交叉**的（gu 的列 = H；dn 的行/E = H；dn 的列 = I），
-        //    第一版按"gu 的列 == dn 的行"校验 ⇒ 直接报错。
+        // 第一版按"gu 的列 == dn 的行"校验 ⇒ 直接报错。
         anyhow::ensure!(
             dn_rows % hidden == 0,
             "dn 行数 {dn_rows} 不是 hidden {hidden} 的倍数"
@@ -95,43 +95,145 @@ impl<'a> MtpArena<'a> {
             unsafe { std::slice::from_raw_parts(dn_pay.as_ptr() as *const u16, dn_pay.len() / 2) };
 
         let t0 = std::time::Instant::now();
-        // 先量化第 0 个专家，拿到段长与偏移（所有专家一致）
-        let (g0, gu_k_pad, gu_scale) =
-            lingxi_model::q4::quantize_bf16_bits(&gu_bits[..e_gu], 2 * inter, hidden)?;
-        let (d0, dn_k_pad, dn_scale) =
-            lingxi_model::q4::quantize_bf16_bits(&dn_bits[..e_dn], hidden, inter)?;
-        let gu_bytes = g0.len() as u64;
-        let dn_bytes = d0.len() as u64;
-        let blob = gu_bytes + dn_bytes;
-        let total = (blob * n_experts as u64) as usize;
-        let mut host = Vec::<u8>::with_capacity(total);
-        host.extend_from_slice(&g0);
-        host.extend_from_slice(&d0);
-        for e in 1..n_experts as usize {
-            let (g, _, _) = lingxi_model::q4::quantize_bf16_bits(
-                &gu_bits[e * e_gu..(e + 1) * e_gu],
-                2 * inter,
-                hidden,
-            )?;
-            let (d, _, _) =
-                lingxi_model::q4::quantize_bf16_bits(&dn_bits[e * e_dn..(e + 1) * e_dn], hidden, inter)?;
-            anyhow::ensure!(
-                g.len() as u64 == gu_bytes && d.len() as u64 == dn_bytes,
-                "专家 {e} 段长与第 0 个不一致（布局假设被打破）"
-            );
-            host.extend_from_slice(&g);
-            host.extend_from_slice(&d);
+        // ── 落盘缓存（2026-10-27，用户原则"量化转化时间=0"）：量化是**确定性函数**
+        // （固定产物 + 固定量化器）⇒ 结果可缓存。默认 /dev/shm（容器/宿主天然共享、
+        // 重启即热）；设 LINGXI_MTP_Q4_CACHE=<路径> 改位置，设 =off 关闭。
+        // 指纹 = 形状五元组 + 源 payload 稀疏采样 XOR（对"同形状换权重"有足够防护，
+        // 见 Z）。头：magic8 | fp8 | len8 | payload。
+        let cache_path = std::env::var("LINGXI_MTP_Q4_CACHE")
+            .unwrap_or_else(|_| "/dev/shm/lingxi-mtp-q4cache.bin".to_string());
+        let fingerprint = {
+            let mut h = gu_rows as u64 ^ dn_rows as u64 ^ hidden as u64 ^ inter as u64
+                ^ (n_experts as u64) << 32;
+            // 每 1 MiB 采样一个 u64 做 XOR（约 5K 个采样点，防"同形状换权重"）
+            let mix = |p: &[u8], h: &mut u64| {
+                let n = p.len();
+                let mut i = 0usize;
+                while i + 8 <= n {
+                    let v = u64::from_le_bytes(p[i..i + 8].try_into().unwrap());
+                    *h = (*h).rotate_left(7) ^ v;
+                    i += 1 << 20;
+                }
+            };
+            mix(gu_pay, &mut h);
+            mix(dn_pay, &mut h);
+            h
+        };
+        let mut host: Vec<u8>;
+        let mut cache_hit = false;
+        if cache_path != "off" {
+            if let Ok(mut f) = std::fs::File::open(&cache_path) {
+                use std::io::Read as _;
+                let mut magic = [0u8; 8];
+                let mut fp = [0u8; 8];
+                let mut len = [0u8; 8];
+                if f.read_exact(&mut magic).is_ok()
+                    && magic == *b"LXMTQ4v1"
+                    && f.read_exact(&mut fp).is_ok()
+                    && u64::from_le_bytes(fp) == fingerprint
+                    && f.read_exact(&mut len).is_ok()
+                {
+                    let total = u64::from_le_bytes(len) as usize;
+                    let mut payload = vec![0u8; total];
+                    if f.read_exact(&mut payload).is_ok() {
+                        host = payload;
+                        cache_hit = true;
+                    } else {
+                        host = Vec::new();
+                    }
+                } else {
+                    host = Vec::new();
+                }
+            } else {
+                host = Vec::new();
+            }
+        } else {
+            host = Vec::new();
         }
-        anyhow::ensure!(host.len() == total, "拼装长度不符 {} ≠ {total}", host.len());
+        let (gu_bytes, dn_bytes, total, blob, gu_scale, dn_scale, gu_k_pad, dn_k_pad);
+        if cache_hit {
+            // 布局参数从缓存头推不出（k_pad/scale 在量化产物内、调用方不依赖），
+            // 但必须和 device 侧一致 ⇒ 读缓存也需量化第 0 个专家拿参数（~1s，仍远快于全量）。
+            let (g0, gkp, gsc) =
+                lingxi_model::q4::quantize_bf16_bits(&gu_bits[..e_gu], 2 * inter, hidden)?;
+            let (d0, dkp, dsc) =
+                lingxi_model::q4::quantize_bf16_bits(&dn_bits[..e_dn], hidden, inter)?;
+            gu_bytes = g0.len() as u64;
+            dn_bytes = d0.len() as u64;
+            blob = gu_bytes + dn_bytes;
+            total = host.len();
+            gu_k_pad = gkp;
+            dn_k_pad = dkp;
+            gu_scale = gsc;
+            dn_scale = dsc;
+            anyhow::ensure!(
+                total as u64 == blob * n_experts as u64,
+                "MTP Q4 缓存长度与形状不符（{} vs {}）——删缓存重跑",
+                total,
+                blob * n_experts as u64
+            );
+        } else {
+            // 先量化第 0 个专家，拿到段长与偏移（所有专家一致）
+            let (g0, gkp, gsc) =
+                lingxi_model::q4::quantize_bf16_bits(&gu_bits[..e_gu], 2 * inter, hidden)?;
+            let (d0, dkp, dsc) =
+                lingxi_model::q4::quantize_bf16_bits(&dn_bits[..e_dn], hidden, inter)?;
+            gu_bytes = g0.len() as u64;
+            dn_bytes = d0.len() as u64;
+            blob = gu_bytes + dn_bytes;
+            total = (blob * n_experts as u64) as usize;
+            gu_k_pad = gkp;
+            dn_k_pad = dkp;
+            gu_scale = gsc;
+            dn_scale = dsc;
+            host = Vec::<u8>::with_capacity(total);
+            host.extend_from_slice(&g0);
+            host.extend_from_slice(&d0);
+            for e in 1..n_experts as usize {
+                let (g, _, _) = lingxi_model::q4::quantize_bf16_bits(
+                    &gu_bits[e * e_gu..(e + 1) * e_gu],
+                    2 * inter,
+                    hidden,
+                )?;
+                let (d, _, _) =
+                    lingxi_model::q4::quantize_bf16_bits(&dn_bits[e * e_dn..(e + 1) * e_dn], hidden, inter)?;
+                anyhow::ensure!(
+                    g.len() as u64 == gu_bytes && d.len() as u64 == dn_bytes,
+                    "专家 {e} 段长与第 0 个不一致（布局假设被打破）"
+                );
+                host.extend_from_slice(&g);
+                host.extend_from_slice(&d);
+            }
+            anyhow::ensure!(host.len() == total, "拼装长度不符 {} ≠ {total}", host.len());
+            // 写缓存（tmp + rename，防半截文件）
+            if cache_path != "off" {
+                let tmp = format!("{cache_path}.tmp");
+                if let Ok(mut f) = std::fs::File::create(&tmp) {
+                    use std::io::Write as _;
+                    let ok = f.write_all(b"LXMTQ4v1").is_ok()
+                        && f.write_all(&fingerprint.to_le_bytes()).is_ok()
+                        && f.write_all(&(total as u64).to_le_bytes()).is_ok()
+                        && f.write_all(&host).is_ok();
+                    drop(f);
+                    if ok {
+                        let _ = std::fs::rename(&tmp, &cache_path);
+                    } else {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
+            }
+        }
         let slots = k.stream.clone_htod(&host)?;
         drop(host);
         eprintln!(
-            "[mtp-arena] {} 个 MTP 专家量化完成：bf16 {} MiB → Q4G64 {} MiB（**省 {:.2} GiB 显存**），用时 {:.1}s",
+            "[mtp-arena] {} 个 MTP 专家{}：bf16 {} MiB → Q4G64 {} MiB（**省 {:.2} GiB 显存**），用时 {:.1}s{}",
             n_experts,
+            if cache_hit { "Q4 缓存命中（转化时间≈0）" } else { "量化完成" },
             (gu_pay.len() + dn_pay.len()) / 1048576,
             total / 1048576,
             (gu_pay.len() + dn_pay.len()) as f64 / 1073741824.0 - total as f64 / 1073741824.0,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            if cache_hit { format!("（缓存 {}）", cache_path) } else { String::new() }
         );
 
         let ids = MtpIds {

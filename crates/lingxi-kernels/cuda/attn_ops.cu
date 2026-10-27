@@ -5,6 +5,8 @@
 
 using bf16 = __nv_bfloat16;
 
+#include "attn_gather_v3.cuh"
+
 // ── E4M3(FP8) 编解码（P15-㊶ KV 压缩 `LINGXI_KV_K8V4`，有损、env 门控）────────
 // sm_70 没有 cvt 指令 ⇒ 手写 satfinite + RNE。码本与 PLE 表同一 E4M3（±448、
 // denorm 步长 2^-9）。encode 以"值/scale"量化（scale = amax/448，按 (行, kv头) 存 f32）。
@@ -157,13 +159,13 @@ extern "C" __global__ void lingxi_rope_partial_stride_bf16(bf16* __restrict__ x,
 }
 
 // 带加性掩码的多头注意力（GQA，token-major 布局，batch=1）：
-//   q[T, H, D], k/v[Tk, KVH, D], mask[1, T, Tk]（float 加性），scale
+// q[T, H, D], k/v[Tk, KVH, D], mask[1, T, Tk]（float 加性），scale
 // 布局按 token-major 是为了直接消费投影结果，避免额外转置。
 // ─────────── 稀疏注意力（重写版，2026-10-15）───────────
 //
 // ⚠️ **上一版是个 O(head_dim²·Tk) 的算法事故**：它的第三段（加权求和）写成
-//   `for (d = tid; d < head_dim; d += blockDim) { for (j = 0; j < Tk; ++j) { s = Σ_dd q·k;  ← 重算点积
-//      acc += exp(s)·v[j][d]; } }`
+// `for (d = tid; d < head_dim; d += blockDim) { for (j = 0; j < Tk; ++j) { s = Σ_dd q·k; ← 重算点积
+// acc += exp(s)·v[j][d]; } }`
 // 也就是**每个输出维度都把所有 key 的 QK 点积重算一遍**。head_dim=256 时，
 // 每个 (head, token) 要做 `Tk·head_dim² = 192·65536 ≈ 12.6 M` 次 FMA，而正确量是 `Tk·head_dim = 49 K`
 // ——**256 倍**。实测 `tk=192` 时单核 **1240 µs**（tk=4096 时 32.6 ms），
@@ -489,10 +491,10 @@ extern "C" __global__ void lingxi_attn2s_sparse_kvq8_bf16(const bf16* __restrict
 //
 // 改法：一个 block 负责 R 行 × 1 头，K/V 只流一遍喂 R 行 ⇒ 流量 ÷R。
 // **bit-safe 论证**：每行内部的全部归约次序与 attn2 逐项相同——
-//   ① 点积：lane 沿 d0=lane*8 的 8 元 FMA 链 + 同一 shuffle 树（R 行只是复用同一
-//      次 kv load 各算各的，互不干扰）；
-//   ② max：fmax 无舍入，同集合任意次序结果逐位相同；
-//   ③ exp/lsum/acc：sp 值相同，求和循环（strided-by-blockDim / 顺序 j）原样保留。
+// ① 点积：lane 沿 d0=lane*8 的 8 元 FMA 链 + 同一 shuffle 树（R 行只是复用同一
+// 次 kv load 各算各的，互不干扰）；
+// ② max：fmax 无舍入，同集合任意次序结果逐位相同；
+// ③ exp/lsum/acc：sp 值相同，求和循环（strided-by-blockDim / 顺序 j）原样保留。
 // 只改"哪些行共享 K 读"，不改任何一行的数学。
 //
 // 约束：head_dim == 256 == blockDim（调用方保证，否则回退 attn2）；T 任意（尾部行守卫）。
@@ -544,10 +546,10 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
     int nr = T - i0; if (nr > R) nr = R;
 
     // 跳块状态（仅 SPARSE 使用）：对绝对位置 pos、行 i0+r 返回
-    //   0 = 计算点积（pos < vis 且 [尾区 ∨ keep 选中]）
-    //   1 = 跳过、mask 值 -FLT_MAX（dense 的 s*scale 被吸附后的精确等价：可见未选中 /
-    //       超 vis 但选中 —— 两者的 dense mask 都是恰 -FLT_MAX）
-    //   2 = 跳过、mask 值 -inf（超 vis 且未选中）
+    // 0 = 计算点积（pos < vis 且 [尾区 ∨ keep 选中]）
+    // 1 = 跳过、mask 值 -FLT_MAX（dense 的 s*scale 被吸附后的精确等价：可见未选中 /
+    // 超 vis 但选中 —— 两者的 dense mask 都是恰 -FLT_MAX）
+    // 2 = 跳过、mask 值 -inf（超 vis 且未选中）
     // dense 版对跳过位置 sp1=mask 值（吸附）、sp2=__expf(mask-mx)——非退化 mx 有限 ⇒ 0，
     // 退化（整行无可见位，mx=-FLT_MAX）⇒ (1)=1 / (2)=0，本写法逐位复刻（含退化）。
     auto state_j = [&](int r, int pos) -> int {
@@ -1030,7 +1032,7 @@ extern "C" __global__ void lingxi_attn_masked_bf16(const bf16* __restrict__ q,
 // ───────────────────── QSA indexer 选块（GPU 版，替换 host 路径） ─────────────────────
 //
 // 与 host 参考 `lingxi-model/src/qsa.rs::build_indexer_mask` 逐条对应：
-//   池化(mean→bf16) → RMSNorm → RoPE(块起点位置) → 打分 Σ_h relu(q·p)/√hd → top-k 块 → 掩码。
+// 池化(mean→bf16) → RMSNorm → RoPE(块起点位置) → 打分 Σ_h relu(q·p)/√hd → top-k 块 → 掩码。
 // 四步各一个 kernel，全在同一 stream 上，无 D2H 同步。
 
 // 1) 把一个压缩块的 raw key 求均值并 round 到 bf16：pooled[d] = bf16(Σ_j rk[row0+j][d] / compress)
@@ -1049,7 +1051,7 @@ extern "C" __global__ void lingxi_qsa_pool_block_bf16(const bf16* __restrict__ r
 }
 
 // 1b) **批量池化**：一次 launch 处理 nb 个新块（原来每块一条链 4 个 launch ⇒ 128 块
-//     = 512 次 launch/层/chunk，256K 下光 launch 就要 ~10 分钟）。数学与逐块版逐项相同。
+// = 512 次 launch/层/chunk，256K 下光 launch 就要 ~10 分钟）。数学与逐块版逐项相同。
 extern "C" __global__ void lingxi_qsa_pool_blocks_bf16(const bf16* __restrict__ rk,
                                                        bf16* __restrict__ out,   // [nb, hd] 临时缓冲
                                                        int b0, int nb, int compress, int hd) {
@@ -1068,13 +1070,71 @@ extern "C" __global__ void lingxi_qsa_pool_blocks_bf16(const bf16* __restrict__ 
     out[(size_t)lb * hd + d] = __float2bfloat16(acc / (float)compress);
 }
 
+// 1c) **池化 + RMSNorm + RoPE + 落盘 四发合一**（，2026-10-24）。
+// 分母：线上每个新块要发 4 个 launch（pool / rmsnorm / rope_stride / memcpy），
+// 微基准 23.5 µs，而 work 只有 1 个块 × 128 个元素 ⇒ **全是发射地板**（每发 ~5.9 µs）。
+// 逐位：三步的算式与 `lingxi_qsa_pool_blocks_bf16`（j 升序累加 + `bf16(acc/compress)`）、
+// `lingxi_grouped_rmsnorm_bf16`（256 槽 shared 归约树、`rsqrtf(ss/hd+eps)`、
+// `bf16(f32(x)*rms*f32(gamma))`）、`lingxi_rope_partial_stride_bf16`（pos = b*compress）
+// **逐字相同**；中间结果按同一个 bf16 舍入后留在 shared（原路径是写 global 再读回）。
+// 最后一发原来是把 pool_tmp2 memcpy 到 pooled 的对应段，这里直接写到 `pooled + lb*hd`。
+extern "C" __global__ void lingxi_qsa_pool_norm_rope_bf16(const bf16* __restrict__ rk,
+                                                          bf16* __restrict__ pooled,
+                                                          const bf16* __restrict__ gamma,
+                                                          const bf16* __restrict__ cos,
+                                                          const bf16* __restrict__ sin,
+                                                          int b0, int compress, int hd, int rot,
+                                                          float eps) {
+    const int lb = blockIdx.x;
+    const int b = b0 + lb;
+    const int row0 = b * compress;
+    extern __shared__ float sdata[];
+    __shared__ bf16 srow[256];
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < compress; ++j) {
+            acc += __bfloat162float(rk[(size_t)(row0 + j) * hd + d]);
+        }
+        const bf16 pv = __float2bfloat16(acc / (float)compress);
+        srow[d] = pv;
+        const float pvf = __bfloat162float(pv);
+        ss += pvf * pvf;
+    }
+    sdata[threadIdx.x] = ss;
+    __syncthreads();
+    for (int st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sdata[threadIdx.x] += sdata[threadIdx.x + st];
+        __syncthreads();
+    }
+    const float rms = rsqrtf(sdata[0] / (float)hd + eps);
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        const float v = __bfloat162float(srow[d]) * rms * __bfloat162float(gamma[d]);
+        srow[d] = __float2bfloat16(v);
+    }
+    __syncthreads();
+    // ⚠️ 目标按**绝对块号** b 落盘（old 路径是 memcpy 到 `pooled[b0*hd ..]`，不是 lb*hd）。
+    bf16* out = pooled + (size_t)b * hd;
+    const int pos = b * compress;
+    const int half = rot >> 1;
+    for (int d = threadIdx.x; d < half; d += blockDim.x) {
+        const float c = __bfloat162float(cos[(size_t)pos * rot + d]);
+        const float s = __bfloat162float(sin[(size_t)pos * rot + d]);
+        const float x0 = __bfloat162float(srow[d]);
+        const float x1 = __bfloat162float(srow[d + half]);
+        out[d] = __float2bfloat16(x0 * c - x1 * s);
+        out[d + half] = __float2bfloat16(x1 * c + x0 * s);
+    }
+    for (int d = rot + threadIdx.x; d < hd; d += blockDim.x) out[d] = srow[d];
+}
+
 // 2) 每个 (query 行, 块) 一个线程：scores[row][b] = (Σ_h max(Σ_d q[row,h,d]·p[b,d], 0)) / √hd
-//    grid = (nblocks 方向, t_q)；`q` 是 [t_q, heads, hd]
+// grid = (nblocks 方向, t_q)；`q` 是 [t_q, heads, hd]
 extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict__ q,
                                                           const bf16* __restrict__ pooled,
                                                           float* __restrict__ scores,
                                                           int t_q, int nblocks, int heads, int hd,
-                                                          float sqrt_hd) {
+                                                          float sqrt_hd, int fast) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y;
     if (b >= nblocks || row >= t_q) {
@@ -1083,10 +1143,92 @@ extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict
     const bf16* qr = q + (size_t)row * heads * hd;
     const bf16* p = pooled + (size_t)b * hd;
     float s = 0.0f;
+    // ★ 2026-10-23：8 宽向量读（int4）**实测是负结果，默认关**（`LINGXI_IDX_SCORES_VEC=1`
+    // 才走）：nblocks=130 时 54.5→42.1 µs（−23%），但 nblocks=29（线上短上下文）
+    // **20.0→34.2 µs（+71%）**——活跃线程只有 174 个，64 次 int4 load 的展开把
+    // 延迟隐藏变成了调度开销。累加次序仍是 d 升序、表达式不变 ⇒ 两条路逐位一致。
+    const bool vec = fast && ((hd & 7) == 0)
+                     && ((reinterpret_cast<size_t>(p) & 15u) == 0u)
+                     && ((reinterpret_cast<size_t>(q) & 15u) == 0u);
+    // ★ 2026-10-24：`heads == 4`（本模型）时把 4 个 head 的点积**展开成 4 条独立累加链**。
+    // 原来 `for h` 是运行期循环 ⇒ 只有一条 512 MAC 的依赖链，每元素 2 次 cvt + FMA、
+    // 延迟全额暴露（微基准 `t17_qsa_bw` 19.6 µs，而同形纯读也是 19.4 ⇒ 纯延迟受限）。
+    // 4 条链交错发射后 **11.0 µs**（−44%）。逐位：每个 head 内部仍是 d 升序、
+    // `max` 与 `s +=` 仍按 h 升序、`/sqrt_hd` 一字未改（`t17_idxsel_bits` 0 位不同）。
+    if (heads == 4) {
+        const bf16* q0 = qr;
+        const bf16* q1 = qr + hd;
+        const bf16* q2 = qr + 2 * hd;
+        const bf16* q3 = qr + 3 * hd;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        if (vec) {
+            // 4 条链 + 8 宽对齐读（`LINGXI_IDX_SCORES_VEC=1`）：每条链的 d 升序不变
+            for (int d = 0; d + 8 <= hd; d += 8) {
+                const int4 q0v = *reinterpret_cast<const int4*>(q0 + d);
+                const int4 q1v = *reinterpret_cast<const int4*>(q1 + d);
+                const int4 q2v = *reinterpret_cast<const int4*>(q2 + d);
+                const int4 q3v = *reinterpret_cast<const int4*>(q3 + d);
+                const int4 pv4 = *reinterpret_cast<const int4*>(p + d);
+                const unsigned short* pv = reinterpret_cast<const unsigned short*>(&pv4);
+                const unsigned short* a0 = reinterpret_cast<const unsigned short*>(&q0v);
+                const unsigned short* a1 = reinterpret_cast<const unsigned short*>(&q1v);
+                const unsigned short* a2 = reinterpret_cast<const unsigned short*>(&q2v);
+                const unsigned short* a3 = reinterpret_cast<const unsigned short*>(&q3v);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float pvv = __bfloat162float(__ushort_as_bfloat16(pv[u]));
+                    d0 += __bfloat162float(__ushort_as_bfloat16(a0[u])) * pvv;
+                    d1 += __bfloat162float(__ushort_as_bfloat16(a1[u])) * pvv;
+                    d2 += __bfloat162float(__ushort_as_bfloat16(a2[u])) * pvv;
+                    d3 += __bfloat162float(__ushort_as_bfloat16(a3[u])) * pvv;
+                }
+            }
+            for (int d = (hd & ~7); d < hd; ++d) {
+                const float pvv = __bfloat162float(p[d]);
+                d0 += __bfloat162float(q0[d]) * pvv;
+                d1 += __bfloat162float(q1[d]) * pvv;
+                d2 += __bfloat162float(q2[d]) * pvv;
+                d3 += __bfloat162float(q3[d]) * pvv;
+            }
+        } else {
+            for (int d = 0; d < hd; ++d) {
+                const float pv1 = __bfloat162float(p[d]);
+                d0 += __bfloat162float(q0[d]) * pv1;
+                d1 += __bfloat162float(q1[d]) * pv1;
+                d2 += __bfloat162float(q2[d]) * pv1;
+                d3 += __bfloat162float(q3[d]) * pv1;
+            }
+        }
+        float s4 = fmaxf(d0, 0.0f);
+        s4 += fmaxf(d1, 0.0f);
+        s4 += fmaxf(d2, 0.0f);
+        s4 += fmaxf(d3, 0.0f);
+        scores[(size_t)row * nblocks + b] = s4 / sqrt_hd;
+        return;
+    }
     for (int h = 0; h < heads; ++h) {
         const bf16* qh = qr + (size_t)h * hd;
         float dot = 0.0f;
-        for (int d = 0; d < hd; ++d) {
+        int d = 0;
+        if (vec) {
+            for (; d + 8 <= hd; d += 8) {
+                const int4 q4 = *reinterpret_cast<const int4*>(qh + d);
+                const int4 p4 = *reinterpret_cast<const int4*>(p + d);
+                const unsigned* qu = reinterpret_cast<const unsigned*>(&q4);
+                const unsigned* pu = reinterpret_cast<const unsigned*>(&p4);
+                float qv[8], pv[8];
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    qv[2 * u] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(qu[u] & 0xffffu)));
+                    qv[2 * u + 1] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(qu[u] >> 16)));
+                    pv[2 * u] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(pu[u] & 0xffffu)));
+                    pv[2 * u + 1] = __bfloat162float(__ushort_as_bfloat16((unsigned short)(pu[u] >> 16)));
+                }
+#pragma unroll
+                for (int u = 0; u < 8; ++u) dot += qv[u] * pv[u];
+            }
+        }
+        for (; d < hd; ++d) {
             dot += __bfloat162float(qh[d]) * __bfloat162float(p[d]);
         }
         s += fmaxf(dot, 0.0f);
@@ -1094,8 +1236,8 @@ extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict
     scores[(size_t)row * nblocks + b] = s / sqrt_hd;
 }
 
-// 3) 名次：rank(row,b) = #{b' : score[row][b'] > score[row][b] 或 (相等且 b' < b)}；rank < topk 则保留
-//    grid = (nblocks 方向, t_q)
+// 3) 名次：rank(row,b) = #{b': score[row][b'] > score[row][b] 或 (相等且 b' < b)}；rank < topk 则保留
+// grid = (nblocks 方向, t_q)
 extern "C" __global__ void lingxi_qsa_indexer_rank_f32(const float* __restrict__ scores,
                                                        unsigned char* __restrict__ keep,
                                                        int t_q, int nblocks, int topk) {
@@ -1122,9 +1264,9 @@ extern "C" __global__ void lingxi_qsa_indexer_rank_f32(const float* __restrict__
 // 扫完 nblocks 条分数 ⇒ 单 chunk O(t·nblocks²)，跨 chunk 累加 ≈ O(S³)。256K 下 nblocks=65536，
 // 这一项单独就要几十分钟；同时 `scores` 要 t×nblocks×4B（2048×65536=537MB/层×12 层 ≈ 6.4GB）
 // 把显存顶爆。本实现把"选块"做成**每行一个 block 的流式基数选择**：
-//   - 分数只算不存（5 遍：3 遍直方图定位阈值 + 2 遍填 keep），零 scores 缓冲；
-//   - 分数恒 ≥ 0 ⇒ IEEE-754 正浮点位型与数值同序，可直接对 u32 位型做 11+11+10 位基数选择；
-//   - 并列语义与旧 rank 完全一致：同分按块下标升序取前 (topk - cnt_gt) 个。
+// - 分数只算不存（5 遍：3 遍直方图定位阈值 + 2 遍填 keep），零 scores 缓冲；
+// - 分数恒 ≥ 0 ⇒ IEEE-754 正浮点位型与数值同序，可直接对 u32 位型做 11+11+10 位基数选择；
+// - 并列语义与旧 rank 完全一致：同分按块下标升序取前 (topk - cnt_gt) 个。
 // 开关 `LINGXI_QSA_KEEP_RADIX`（默认开；=0 回旧 scores+rank 路径做 A/B）。
 
 __device__ __forceinline__ float qsa_score1(const bf16* __restrict__ qr,
@@ -1724,17 +1866,29 @@ extern "C" __global__ void lingxi_qsa_keep_fill_scores(const float* __restrict__
 // 语义：列表里只放 keep=1 的块；因果可见性与尾部不完整块由注意力核按 `vis` 过滤/补扫。
 
 // 3a) 每行一个 block：把 keep=1 的块号按升序压进 `sel[row*stride + j]`，个数写 `sel_cnt[row]`。
-extern "C" __global__ void lingxi_qsa_sel_build(const unsigned char* __restrict__ keep,
+// `all_kept`：`nblocks ≤ stride` 时 `rank(b) ≤ nblocks-1 < topk` ⇒ keep 恒全 1
+// （与 `keep_select` / `keep_from_scores` 里同样的早退条件），此时列表恒为 `[0..nblocks)`，
+// 一次把 keep / sel / sel_cnt 全写掉 —— 省掉打分 + 名次两发，结果逐位相同。
+extern "C" __global__ void lingxi_qsa_sel_build(unsigned char* __restrict__ keep,
                                                 int* __restrict__ sel,
                                                 int* __restrict__ sel_cnt,
-                                                int nblocks, int stride) {
+                                                int nblocks, int stride, int fast,
+                                                int all_kept) {
     __shared__ int cnt[1024];
     __shared__ int off[1024];
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthr = blockDim.x;
-    const unsigned char* kp = keep + (size_t)row * nblocks;
+    unsigned char* kp = keep + (size_t)row * nblocks;
     int* sp = sel + (size_t)row * stride;
+    if (all_kept) {
+        for (int b = tid; b < nblocks; b += nthr) {
+            kp[b] = 1u;
+            if (b < stride) sp[b] = b;
+        }
+        if (tid == 0) sel_cnt[row] = nblocks < stride ? nblocks : stride;
+        return;
+    }
     const int per = (nblocks + nthr - 1) / nthr;
     const int lo = tid * per;
     const int hi = min(nblocks, lo + per);
@@ -1742,7 +1896,22 @@ extern "C" __global__ void lingxi_qsa_sel_build(const unsigned char* __restrict_
     for (int b = lo; b < hi; ++b) c += (kp[b] != 0u);
     cnt[tid] = c;
     __syncthreads();
-    if (tid == 0) {
+    // ★ 2026-10-23：原来这里是 `if (tid==0)` 的 **1024 次串行累加**（依赖链 ≈ 20 µs，
+    // 比整个选块段还贵；`t6_attn_shape_bw` 实测 sel_build 27.5 µs）。改成 shared 上的
+    // Hillis-Steele 前缀和：**整数加法**，与旧串行累加同一个交换律运算 ⇒ `off[]` /
+    // `sel_cnt[]` **逐位相同**（列表次序因此也不变）。
+    // `fast==0`（`LINGXI_NO_SELBUILD_FAST=1`）回退到旧串行实现做 A/B。
+    if (fast) {
+        for (int step = 1; step < nthr; step <<= 1) {
+            const int v = (tid >= step) ? cnt[tid - step] : 0;
+            __syncthreads();
+            cnt[tid] += v;
+            __syncthreads();
+        }
+        const int inc = cnt[tid];   // inclusive 前缀（含本线程的 c）
+        off[tid] = inc - c;         // exclusive 前缀 = 旧 `off[tid]`
+        if (tid == nthr - 1) sel_cnt[row] = inc;
+    } else if (tid == 0) {
         int acc = 0;
         for (int i = 0; i < nthr; ++i) { off[i] = acc; acc += cnt[i]; }
         sel_cnt[row] = acc;
@@ -1754,17 +1923,25 @@ extern "C" __global__ void lingxi_qsa_sel_build(const unsigned char* __restrict_
     }
 }
 
+// 3a') `nblocks ≤ topk` ⇒ keep 全 1（与上面 all_kept 同一早退条件）。非 gather 路径也要写 keep。
+extern "C" __global__ void lingxi_qsa_keep_all_bf16(unsigned char* __restrict__ keep,
+                                                    int nblocks, int t_q) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (b < nblocks && row < t_q) keep[(size_t)row * nblocks + b] = 1u;
+}
+
 // 3b) gather 注意力：每个 (row, head) 一个 block（256 线程 = head_dim）。
-//     第 1 遍按列表算点积并把分数留在 shared（不重读 K）；第 2 遍只读 V 做加权和。
-//     `vis = vis_base + row + 1`；列表里超出 vis 的块跳过；尾部不完整块（pos ≥ nblocks<<cshift）
-//     恒可见，放在列表之后补扫。
+// 第 1 遍按列表算点积并把分数留在 shared（不重读 K）；第 2 遍只读 V 做加权和。
+// `vis = vis_base + row + 1`；列表里超出 vis 的块跳过；尾部不完整块（pos ≥ nblocks<<cshift）
+// 恒可见，放在列表之后补扫。
 //
 // ★ 2026-10-18：**NH 个 q-head 合并进一个 block**。本模型 heads=24 / kv_heads=2 ⇒
-//   12 个 q-head 共用同一份 K/V；旧版每个 (row, head) 各读一遍 K/V（实测 gather 60ms/层，
-//   49GB/层 ≈ 816GB/s 正好打满 HBM）⇒ **12× 冗余搬运**。现在一个 block 处理同一 kv-group
-//   内的 NH 个 head：K/V 只读一次、喂 NH 个点积/累加（NH=4 ⇒ K/V 流量 ÷4）。
-//   **逐位一致**：每个 head 的点积仍是 lane 内 z=0..7 顺序累加 + 同一 warp shuffle；
-//   softmax 的 max/分母/加权和仍按 idx 升序、每个 head 独立。
+// 12 个 q-head 共用同一份 K/V；旧版每个 (row, head) 各读一遍 K/V（实测 gather 60ms/层，
+// 49GB/层 ≈ 816GB/s 正好打满 HBM）⇒ **12× 冗余搬运**。现在一个 block 处理同一 kv-group
+// 内的 NH 个 head：K/V 只读一次、喂 NH 个点积/累加（NH=4 ⇒ K/V 流量 ÷4）。
+// **逐位一致**：每个 head 的点积仍是 lane 内 z=0..7 顺序累加 + 同一 warp shuffle；
+// softmax 的 max/分母/加权和仍按 idx 升序、每个 head 独立。
 // P2 Stage 1（2026-10-20）：KV 块表间接寻址——`blk_tab[逻辑块号] = 物理槽号`。
 // Stage 1 表恒等映射（槽号==逻辑块号，零行为变化），为 Stage 2 host 分页铺路；
 // 间接粒度 = indexer 块（ctok = 1<<cshift，与 sel 单位 1:1）。
@@ -1773,7 +1950,7 @@ __device__ __forceinline__ int kv_phys_row(int pos, const int* __restrict__ blk_
     return blk_tab[pos >> cshift] * ctok + (pos & (ctok - 1));
 }
 
-template <int NH>
+template <int NH, int V2>
 __device__ __forceinline__ void attn_gather_body(const bf16* __restrict__ q,
                                                  const bf16* __restrict__ k,
                                                  const bf16* __restrict__ v,
@@ -1891,14 +2068,56 @@ __device__ __forceinline__ void attn_gather_body(const bf16* __restrict__ q,
         float acc[NH];
 #pragma unroll
         for (int g = 0; g < NH; ++g) acc[g] = 0.0f;
-        // 每个线程固定一个 d，按 idx 升序累加；V 只读一次、NH 个 head 共用
-        for (int idx = 0; idx < total; ++idx) {
-            const int pos = pos_of(idx);
-            const int phys = kv_phys_row(pos, blk_tab, cshift, ctok);
-            const bf16* vv = v + ((size_t)phys * kv_heads + kh) * head_dim + tid;
-            const float vx = __bfloat162float(vv[0]);
+        // 每个线程固定一个 d，按 idx 升序累加；V 只读一次、NH 个 head 共用。
+        // ★ 2026-10-24（，`LINGXI_NO_ATTN_V2=1` 回退）：原来按 `pos_of(idx)` 逐个 token
+        // 取 V —— 每 token 一次 `blk_tab` load + 一次 2 B load，且**全串行**（每线程 120 次）。
+        // 实测（`t17_qsa_bw`，len118/nblocks29）第二遍单独要 44 µs，而"只读 V"同形是 22 µs、
+        // 第一遍（K 走 warp 并行 int4）只 10 µs ⇒ 瓶颈是**第二遍的串行取数**，不是带宽。
+        // 改成"按选块分组、块内 4 token 一起发 load"：`blk_tab` 每 4 token 只读一次，
+        // 4 个 V 地址先取齐再累加。**逐位不变**：acc 的累加次序仍是 idx 升序、
+        // `sp[idx]*vx` 的表达式一字未改，不可见 token 也照样乘 0 分累加（同旧版）。
+        const size_t vstride = (size_t)kv_heads * head_dim;
+        int idx = 0;
+        if (V2) {
+            for (int j = 0; j < nsel; ++j) {
+                const int blk = srow[j];
+                const bf16* vrow =
+                    v + (size_t)blk_tab[blk] * ctok * vstride + (size_t)kh * head_dim + tid;
+                if (ctok == 4) {
+                    float vx[4];
 #pragma unroll
-            for (int g = 0; g < NH; ++g) acc[g] += sp[g * span + idx] * vx;
+                    for (int k = 0; k < 4; ++k) vx[k] = __bfloat162float(vrow[(size_t)k * vstride]);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+                        for (int g = 0; g < NH; ++g) acc[g] += sp[g * span + idx + k] * vx[k];
+                    }
+                    idx += ctok;
+                } else {
+                    for (int k = 0; k < ctok; ++k, ++idx) {
+                        const float vx = __bfloat162float(vrow[(size_t)k * vstride]);
+#pragma unroll
+                        for (int g = 0; g < NH; ++g) acc[g] += sp[g * span + idx] * vx;
+                    }
+                }
+            }
+            for (int t2 = 0; t2 < ntail; ++t2, ++idx) {
+                const int pos = tail0 + t2;
+                const int phys = kv_phys_row(pos, blk_tab, cshift, ctok);
+                const bf16* vv = v + ((size_t)phys * kv_heads + kh) * head_dim + tid;
+                const float vx = __bfloat162float(vv[0]);
+#pragma unroll
+                for (int g = 0; g < NH; ++g) acc[g] += sp[g * span + idx] * vx;
+            }
+        } else {
+            for (int idx2 = 0; idx2 < total; ++idx2) {
+                const int pos = pos_of(idx2);
+                const int phys = kv_phys_row(pos, blk_tab, cshift, ctok);
+                const bf16* vv = v + ((size_t)phys * kv_heads + kh) * head_dim + tid;
+                const float vx = __bfloat162float(vv[0]);
+#pragma unroll
+                for (int g = 0; g < NH; ++g) acc[g] += sp[g * span + idx2] * vx;
+            }
         }
 #pragma unroll
         for (int g = 0; g < NH; ++g) {
@@ -1923,8 +2142,28 @@ extern "C" __global__ void lingxi_attn_gather_bf16(const bf16* __restrict__ q,
                                                    int nblocks,
                                                    int cshift,
                                                    int stride) {
-    attn_gather_body<1>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
-                        scale, vis_base, nblocks, cshift, stride);
+    attn_gather_body<1, 1>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
+}
+
+// 旧档（逐 token `pos_of` 取 V）：`LINGXI_NO_ATTN_V2=1` 回退做 A/B。
+extern "C" __global__ void lingxi_attn_gather_v1_bf16(const bf16* __restrict__ q,
+                                                      const bf16* __restrict__ k,
+                                                      const bf16* __restrict__ v,
+                                                      const int* __restrict__ blk_tab,
+                                                      const int* __restrict__ sel,
+                                                      const int* __restrict__ sel_cnt,
+                                                      bf16* __restrict__ out,
+                                                      int heads,
+                                                      int kv_heads,
+                                                      int head_dim,
+                                                      float scale,
+                                                      int vis_base,
+                                                      int nblocks,
+                                                      int cshift,
+                                                      int stride) {
+    attn_gather_body<1, 0>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
 }
 
 // NH=4：同一 kv-group 的 4 个 q-head 合并（K/V 流量 ÷4）。
@@ -1943,12 +2182,94 @@ extern "C" __global__ void lingxi_attn_gather4_bf16(const bf16* __restrict__ q,
                                                     int nblocks,
                                                     int cshift,
                                                     int stride) {
-    attn_gather_body<4>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
-                        scale, vis_base, nblocks, cshift, stride);
+    attn_gather_body<4, 1>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
+}
+
+// 旧档 NH=4（同上，A/B 用）。
+extern "C" __global__ void lingxi_attn_gather4_v1_bf16(const bf16* __restrict__ q,
+                                                       const bf16* __restrict__ k,
+                                                       const bf16* __restrict__ v,
+                                                       const int* __restrict__ blk_tab,
+                                                       const int* __restrict__ sel,
+                                                       const int* __restrict__ sel_cnt,
+                                                       bf16* __restrict__ out,
+                                                       int heads,
+                                                       int kv_heads,
+                                                       int head_dim,
+                                                       float scale,
+                                                       int vis_base,
+                                                       int nblocks,
+                                                       int cshift,
+                                                       int stride) {
+    attn_gather_body<4, 0>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
+}
+
+// NH=2：介于两者之间（K/V 流量 ×2、block 数 ×2）。`LINGXI_ATTN_GATHER_H=2` 选它。
+extern "C" __global__ void lingxi_attn_gather2_bf16(const bf16* __restrict__ q,
+                                                    const bf16* __restrict__ k,
+                                                    const bf16* __restrict__ v,
+                                                    const int* __restrict__ blk_tab,
+                                                    const int* __restrict__ sel,
+                                                    const int* __restrict__ sel_cnt,
+                                                    bf16* __restrict__ out,
+                                                    int heads,
+                                                    int kv_heads,
+                                                    int head_dim,
+                                                    float scale,
+                                                    int vis_base,
+                                                    int nblocks,
+                                                    int cshift,
+                                                    int stride) {
+    attn_gather_body<2, 1>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
+}
+
+// ── v3 生产核（2026-10-26）：prefill 形态（t≥16）gather 重排 ──
+// 与 `attn_gather_body` 逐位等价、调用契约相同（grid=(t_q, heads/NH)、256 线程、
+// smem = (stride·2^cshift + 2^cshift)·NH·4B）。判决实验链与逐位论证见
+// `attn_gather_v3.cuh` 头注与。`LINGXI_NO_ATTN_GATHER_V3=1` 回退旧核。
+extern "C" __global__ void lingxi_attn_gather_v3_2_bf16(const bf16* __restrict__ q,
+                                                        const bf16* __restrict__ k,
+                                                        const bf16* __restrict__ v,
+                                                        const int* __restrict__ blk_tab,
+                                                        const int* __restrict__ sel,
+                                                        const int* __restrict__ sel_cnt,
+                                                        bf16* __restrict__ out,
+                                                        int heads,
+                                                        int kv_heads,
+                                                        int head_dim,
+                                                        float scale,
+                                                        int vis_base,
+                                                        int nblocks,
+                                                        int cshift,
+                                                        int stride) {
+    attn_gather_v3_body<2>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
+}
+
+extern "C" __global__ void lingxi_attn_gather_v3_4_bf16(const bf16* __restrict__ q,
+                                                        const bf16* __restrict__ k,
+                                                        const bf16* __restrict__ v,
+                                                        const int* __restrict__ blk_tab,
+                                                        const int* __restrict__ sel,
+                                                        const int* __restrict__ sel_cnt,
+                                                        bf16* __restrict__ out,
+                                                        int heads,
+                                                        int kv_heads,
+                                                        int head_dim,
+                                                        float scale,
+                                                        int vis_base,
+                                                        int nblocks,
+                                                        int cshift,
+                                                        int stride) {
+    attn_gather_v3_body<4>(q, k, v, blk_tab, sel, sel_cnt, out, heads, kv_heads, head_dim,
+                           scale, vis_base, nblocks, cshift, stride);
 }
 
 // 4) 掩码填充：可见 = 因果前缀 ∧ (选中块 ∨ 尾部不完整块)；未选中再叠加 min
-//    grid = (t_kv 方向, t_q)；`vis = len + row + 1`
+// grid = (t_kv 方向, t_q)；`vis = len + row + 1`
 extern "C" __global__ void lingxi_qsa_mask_fill_f32(const unsigned char* __restrict__ keep,
                                                     float* __restrict__ mask,
                                                     int t_q, int t_kv, int nblocks, int compress,
@@ -1967,3 +2288,137 @@ extern "C" __global__ void lingxi_qsa_mask_fill_f32(const unsigned char* __restr
     }
     mask[(size_t)row * t_kv + j] = v;
 }
+
+// ═════════════════ QSA 小发射合并（，2026-10-24） ═════════════════
+//
+// 分母（`t17_qsa_bw`，len118/t=6）：idxprep 整段 29.7 µs 里，两发 bf16 投影占 26.0
+// （640 行 15.9 + 128 行 10.1，而同形纯读只有 5.4 ⇒ **128 行那一发几乎全是发射地板**），
+// `norm+rope` 两发占 11.1 µs（work 只有 24×128 个元素）。⇒ 合并发射是本段的唯一杠杆。
+//
+// 1) `lingxi_gemm_bf16_row_pair`：同一份 x、两块不同权重（n1 / n2 行）合成**一发**。
+// 每块的算式/线程 k 划分/归约树/epi 与 `lingxi_gemm_skinny_row_bf16`（grid.y=1、
+// epi=0 档）**逐字相同**，只是按 blockIdx.x 落到各自的 w/y ⇒ 逐位相同。
+// 2) `lingxi_rmsnorm_rope_bf16`：分组 RMSNorm（group=head_dim）+ partial RoPE 合成一发。
+// RMSNorm 的 256 槽 shared 归约树、`rsqrtf(ss/group+eps)`、`bf16(f32(x)*rms*f32(gamma))`
+// 与 `gr_ops.cu::lingxi_grouped_rmsnorm_bf16` 逐字相同；RoPE 的 cos/sin 取值与
+// `lingxi_rope_partial_inplace_bf16` 逐字相同，中间结果按**同一个 bf16 舍入**落在
+// shared（原路径是写 global 再读回）⇒ 逐位相同。
+extern "C" __global__ void lingxi_gemm_bf16_row_pair(const bf16* __restrict__ w1,
+                                                     bf16* __restrict__ y1, int n1,
+                                                     const bf16* __restrict__ w2,
+                                                     bf16* __restrict__ y2, int n2,
+                                                     const bf16* __restrict__ x,
+                                                     int k, int m) {
+    int row = (int)blockIdx.x;
+    const bf16* w;
+    bf16* y;
+    int n;
+    if (row < n1) {
+        w = w1; y = y1; n = n1;
+    } else {
+        row -= n1;                     // ⚠️ 落到第二块缓冲后行号必须**减去 n1**（各自紧凑）
+        if (row >= n2) {
+            return;
+        }
+        w = w2; y = y2; n = n2;
+    }
+    // grid.y == 1（m ≤ 8）恒成立：调用方保证；mt = m。
+    const int mt = m;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);
+    const bf16* wr = w + (size_t)row * (size_t)k;
+    float acc[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) acc[s] = 0.0f;
+    int c0 = tid * 8;
+    for (; c0 + 8 <= k; c0 += (int)blockDim.x * 8) {
+        const int4 wv = *reinterpret_cast<const int4*>(wr + c0);
+        const bf16* wp = reinterpret_cast<const bf16*>(&wv);
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s >= mt) break;
+            const int4 xv = *reinterpret_cast<const int4*>(x + (size_t)s * (size_t)k + c0);
+            const bf16* xp = reinterpret_cast<const bf16*>(&xv);
+            float d = 0.0f;
+#pragma unroll
+            for (int z = 0; z < 8; ++z) d += __bfloat162float(wp[z]) * __bfloat162float(xp[z]);
+            acc[s] += d;
+        }
+    }
+    for (; c0 < k; c0 += (int)blockDim.x * 8) {
+        for (int i = 0; i < 8 && c0 + i < k; ++i) {
+            const float wf = __bfloat162float(wr[c0 + i]);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                if (s >= mt) break;
+                acc[s] += wf * __bfloat162float(x[(size_t)s * (size_t)k + c0 + i]);
+            }
+        }
+    }
+    __shared__ float sred[32][8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        if (s >= mt) break;
+        float v = acc[s];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) sred[warp][s] = v;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int s = 0; s < mt; ++s) {
+            float v = (lane < nwarp) ? sred[lane][s] : 0.0f;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (lane == 0) y[(size_t)s * (size_t)n + row] = __float2bfloat16(v);
+        }
+    }
+}
+
+// 一格 = 一个 (row, head)：group RMSNorm → bf16 → RoPE(绝对位置 = row + pos_offset)。
+// `rows` = token 数、`heads` = 每 token 的头数、`hd` = 每头宽、`rot` = 旋转维（偶数）。
+extern "C" __global__ void lingxi_rmsnorm_rope_bf16(const bf16* __restrict__ x,
+                                                    const bf16* __restrict__ gamma,
+                                                    const bf16* __restrict__ cos,
+                                                    const bf16* __restrict__ sin,
+                                                    bf16* __restrict__ y,
+                                                    int heads, int hd, int rot, int pos_offset,
+                                                    float eps) {
+    const int rh = (int)blockIdx.x;             // row * heads + head
+    const int row = rh / heads;
+    const bf16* xr = x + (size_t)rh * (size_t)hd;
+    bf16* yr = y + (size_t)rh * (size_t)hd;
+    extern __shared__ float sdata[];
+    __shared__ bf16 srow[512];                  // hd ≤ 512（本模型 128/256）
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        acc += v * v;
+    }
+    sdata[threadIdx.x] = acc;
+    __syncthreads();
+    for (int st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sdata[threadIdx.x] += sdata[threadIdx.x + st];
+        __syncthreads();
+    }
+    const float rms = rsqrtf(sdata[0] / (float)hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]) * rms * __bfloat162float(gamma[i]);
+        srow[i] = __float2bfloat16(v);
+    }
+    __syncthreads();
+    const int pos = row + pos_offset;
+    const int half = rot >> 1;
+    for (int d = threadIdx.x; d < half; d += blockDim.x) {
+        const float c = __bfloat162float(cos[(size_t)pos * rot + d]);
+        const float s = __bfloat162float(sin[(size_t)pos * rot + d]);
+        const float x0 = __bfloat162float(srow[d]);
+        const float x1 = __bfloat162float(srow[d + half]);
+        yr[d] = __float2bfloat16(x0 * c - x1 * s);
+        yr[d + half] = __float2bfloat16(x1 * c + x0 * s);
+    }
+    for (int i = rot + threadIdx.x; i < hd; i += blockDim.x) yr[i] = srow[i];
+}
+

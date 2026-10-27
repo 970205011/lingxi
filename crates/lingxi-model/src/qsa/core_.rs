@@ -161,11 +161,11 @@ pub struct QsaState {
     /// 已缓存 token 数
     pub len: usize,
     /// **当前已分配**的容量（≤ max_cap；㊿-P1 弹性 KV 起为懒分配，按需几何增长）。
-    /// 设备缓冲恒为 `cap × 对应维度`（增长时全量拷贝）⇒ `kn.len()/cap == kv_dim` 不变式保持。
+    /// 设备缓冲恒为 `cap × 对应维度`（增长时全量拷贝）⇒ `kn.len/cap == kv_dim` 不变式保持。
     pub cap: usize,
     /// 容量上限（= 建局时的 rope 容量；RoPE 表只建到这么长，不能越界）
     pub(crate) max_cap: usize,
-    /// `kv_heads * head_dim`（= 每行元素数；分页模式下 kn.len()/cap 不再等于它，
+    /// `kv_heads * head_dim`（= 每行元素数；分页模式下 kn.len/cap 不再等于它，
     /// 一律以本字段为准）
     pub kv_dim: usize,
     /// `kv_heads`（K8V4 的 scale 平面增长用）
@@ -288,7 +288,7 @@ impl QsaState {
     /// ㊿-P1 弹性 KV：按需几何增长（alloc + 全量拷贝 + 换绑）。
     /// - append-only 语义 ⇒ 倍增策略的摊销拷贝 ≈ 2× 最终体积；
     /// - 只在同一条 stream 上排队，顺序由 stream 保证；所有 kernel 按**调用时**指针启动，
-    ///   专家段图用的是独立固定槽、不引用本池 ⇒ 换缓冲对数学与图都不可见（逐位等价）；
+    /// 专家段图用的是独立固定槽、不引用本池 ⇒ 换缓冲对数学与图都不可见（逐位等价）；
     /// - `need > max_cap` 按旧口径报错（RoPE 表只建到 max_cap，越界会读到垃圾）。
 
     pub fn ensure_cap(&mut self, k: &Kernels, need: usize) -> Result<()> {

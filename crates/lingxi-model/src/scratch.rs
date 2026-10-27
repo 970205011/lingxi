@@ -1,17 +1,17 @@
 //! 设备 scratch 池：**按 (元素类型, 元素数) 复用**，专治 decode 热路径上的
 //! `cuMemAlloc/cuFree` 风暴。
 //!
-//! 动机（实测）：cudarc 的 `CudaStream::alloc` 每次都会 `bind_to_thread()` + 驱动分配，
+//! 动机（实测）：cudarc 的 `CudaStream::alloc` 每次都会 `bind_to_thread` + 驱动分配，
 //! `CudaSlice` 析构再释放一次。一层里 GR/MoE 的中间张量加起来二十来个，
 //! 一个 token 48 层 → 上千次分配/释放，CPU 侧开销远大于这些小张量的实际算力。
 //! `LINGXI_SKIP=attn,moe` 实测纯 GR 地板就有 **0.25 ms/层**（≈12 ms/token）。
 //!
 //! 用法是显式 take / put：
-//! ```ignore
-//! let mut xn = scratch::bf16(k, r * dim)?;   // 池里有就复用，没有才真分配
+//! `ignore
+//! let mut xn = scratch::bf16(k, r * dim)?; // 池里有就复用，没有才真分配
 //! k.grouped_rmsnorm_bf16(x, gamma, &mut xn, ...)?;
-//! scratch::put_bf16(xn);                      // 放回池里等下次
-//! ```
+//! scratch::put_bf16(xn); // 放回池里等下次
+//! `
 //! **正确性前提**：同一个 CUDA stream 上的操作是顺序执行的，所以"放回池里的缓冲被
 //! 后续 kernel 覆写"一定发生在"先前读它的 kernel"之后。反过来，**忘记 put 只是不复用，
 //! 不会出错**（池空时自动退回真分配），所以逐步改造是安全的。
@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaEvent, CudaSlice};
 use half::bf16;
 
 use lingxi_kernels::Kernels;
@@ -44,7 +44,7 @@ thread_local! {
     static POOL: RefCell<Pool> = RefCell::new(Pool::default());
 }
 
-/// 设备号：cudarc 0.19 的 `CudaSlice::context()` 携带其分配上下文 ⇒ take/put 两边都能拿到，
+/// 设备号：cudarc 0.19 的 `CudaSlice::context` 携带其分配上下文 ⇒ take/put 两边都能拿到，
 /// 不需要任何注册表。
 fn dev_of(k: &Kernels) -> usize {
     k.ctx.ordinal()
@@ -98,6 +98,19 @@ fn pool_off() -> bool {
     POOL_OFF.with(|c| c.get())
 }
 
+/// `LINGXI_SCRATCH_STATS=1`：每次池未命中、真正走驱动分配时打一行耗时（诊断尖峰来源）。
+#[inline]
+fn stats_on() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("LINGXI_SCRATCH_STATS").map(|s| s == "1").unwrap_or(false))
+}
+
+fn note_alloc(t: std::time::Instant, kind: &str, len: usize) {
+    if stats_on() {
+        eprintln!("[scratch] {kind} len={len} 实分配 {:.0}µs", t.elapsed().as_secs_f64() * 1e6);
+    }
+}
+
 /// 借一块 `bf16` 设备缓冲。
 pub fn bf16(k: &Kernels, len: usize) -> Result<CudaSlice<bf16>> {
     if NO_POOL.with(|c| c.get()) || pool_off() || pool_forced_off() {
@@ -109,7 +122,12 @@ pub fn bf16(k: &Kernels, len: usize) -> Result<CudaSlice<bf16>> {
     });
     let s = match s {
         Some(s) => s,
-        None => unsafe { k.stream.alloc::<bf16>(len) }?,
+        None => {
+            let t = std::time::Instant::now();
+            let s = unsafe { k.stream.alloc::<bf16>(len) }?;
+            note_alloc(t, "bf16", len);
+            s
+        }
     };
     Ok(s)
 }
@@ -132,7 +150,12 @@ pub fn f32(k: &Kernels, len: usize) -> Result<CudaSlice<f32>> {
     });
     let s = match s {
         Some(s) => s,
-        None => unsafe { k.stream.alloc::<f32>(len) }?,
+        None => {
+            let t = std::time::Instant::now();
+            let s = unsafe { k.stream.alloc::<f32>(len) }?;
+            note_alloc(t, "f32", len);
+            s
+        }
     };
     Ok(s)
 }
@@ -155,7 +178,12 @@ pub fn i32(k: &Kernels, len: usize) -> Result<CudaSlice<i32>> {
     });
     let s = match s {
         Some(s) => s,
-        None => unsafe { k.stream.alloc::<i32>(len) }?,
+        None => {
+            let t = std::time::Instant::now();
+            let s = unsafe { k.stream.alloc::<i32>(len) }?;
+            note_alloc(t, "i32", len);
+            s
+        }
     };
     Ok(s)
 }
@@ -178,7 +206,12 @@ pub fn u8(k: &Kernels, len: usize) -> Result<CudaSlice<u8>> {
     });
     let s = match s {
         Some(s) => s,
-        None => unsafe { k.stream.alloc::<u8>(len) }?,
+        None => {
+            let t = std::time::Instant::now();
+            let s = unsafe { k.stream.alloc::<u8>(len) }?;
+            note_alloc(t, "u8", len);
+            s
+        }
     };
     Ok(s)
 }
@@ -190,6 +223,47 @@ pub fn put_u8(s: CudaSlice<u8>) {
     let key = (dev_of_slice(&s), s.len());
     POOL.with(|p| p.borrow_mut().u8.entry(key).or_default().push(s));
 }
+
+// ───────────── `*_keep`：无视 `disable_pool_forever` 的常驻复用 take/put ─────────────
+//
+// 动机：批量设备路由（`LINGXI_ROUTE_FULLDEV=1`）
+// 在 `route_spin` 之后做 ~20 个 scratch 分配；而 bench/serve 入口全局
+// `disable_pool_forever` 把池关掉 ⇒ 每层 ~110MB 直连 VMM 分配/释放全部暴露在
+// GPU 空窗上（墙钟 +1.35s 的主嫌疑）。池键自 P15-㉞ 起**已含设备号**，
+// layer-split 下两卡各用各的桶，跨设备串味的前提早已消掉 ⇒ 这段路径可以安全地
+// 无视全局禁池、常驻复用。只在批量设备路由里使用（调用处另由
+// `LINGXI_ROUTE_FULLDEV_BIG` 门控）；`fo` 等要移交所有权的缓冲**不**走这里。
+macro_rules! keep_pool_impl {
+    ($take:ident, $put:ident, $field:ident, $ty:ty) => {
+        /// 与 `bf16/f32/i32/u8` 相同的池化取缓冲，但**无视 `disable_pool_forever`**。
+        pub fn $take(k: &Kernels, len: usize) -> Result<CudaSlice<$ty>> {
+            if NO_POOL.with(|c| c.get()) || pool_forced_off() {
+                return Ok(unsafe { k.stream.alloc::<$ty>(len) }?);
+            }
+            let dev = dev_of(k);
+            let s = POOL.with(|p| {
+                p.borrow_mut().$field.get_mut(&(dev, len)).and_then(|v| v.pop())
+            });
+            match s {
+                Some(s) => Ok(s),
+                None => Ok(unsafe { k.stream.alloc::<$ty>(len) }?),
+            }
+        }
+
+        /// `$take` 的归还侧，必须成对使用（同一大小的缓冲进出同一个池桶）。
+        pub fn $put(s: CudaSlice<$ty>) {
+            if NO_POOL.with(|c| c.get()) || pool_forced_off() {
+                return; // 直接释放
+            }
+            let key = (dev_of_slice(&s), s.len());
+            POOL.with(|p| p.borrow_mut().$field.entry(key).or_default().push(s));
+        }
+    };
+}
+keep_pool_impl!(bf16_keep, put_bf16_keep, bf16, bf16);
+keep_pool_impl!(f32_keep, put_f32_keep, f32, f32);
+keep_pool_impl!(i32_keep, put_i32_keep, i32, i32);
+keep_pool_impl!(u8_keep, put_u8_keep, u8, u8);
 
 // ───────────── 锁页 host 暂存：小规模 H2D 必须走锁页，否则驱动会退化成同步拷贝 ─────────────
 //
@@ -215,18 +289,18 @@ fn same_ctx<T>(p: &cudarc::driver::PinnedHostSlice<T>, k: &Kernels) -> bool {
     std::sync::Arc::ptr_eq(p.context(), k.stream.context())
 }
 
-// ⚠️⚠️ **不要跨调用复用单个锁页中转缓冲**（2026-10-16 定位到的真 bug，见 PLAN §P15-C）：
-//   `memcpy_htod` 是**异步**的，而这个缓冲是**主机侧**写的 ⇒ 主机完全可能在下一次调用里
-//   覆写它（长度相同就复用同一个缓冲），或者因为长度变了**把它 free 掉**——两者都可能
-//   发生在"上一次的拷贝还在飞"的时候 ⇒ 设备拿到的不是这一次的字节 ⇒ **静默取错专家/取错行号**。
-//   实测症状：同权重下投机路径（t>1 的组列表 MoE）从第 103 个 token 起与纯贪心分叉，
-//   而同权重的 t=1 路径完全正常；**加 host 同步能治好、换成设备侧 event 等待治不好**
-//   ⇒ 确认是主机侧覆写时序。
+// ⚠️⚠️ **不要跨调用复用单个锁页中转缓冲**：
+// `memcpy_htod` 是**异步**的，而这个缓冲是**主机侧**写的 ⇒ 主机完全可能在下一次调用里
+// 覆写它（长度相同就复用同一个缓冲），或者因为长度变了**把它 free 掉**——两者都可能
+// 发生在"上一次的拷贝还在飞"的时候 ⇒ 设备拿到的不是这一次的字节 ⇒ **静默取错专家/取错行号**。
+// 实测症状：同权重下投机路径（t>1 的组列表 MoE）从第 103 个 token 起与纯贪心分叉，
+// 而同权重的 t=1 路径完全正常；**加 host 同步能治好、换成设备侧 event 等待治不好**
+// ⇒ 确认是主机侧覆写时序。
 //
-//   修法：**按长度分桶 + 每桶 N 环轮转**，且**永不 free**。可证正确性：
-//   同一个桶里的缓冲要轮满 `PIN_RING` 次才会被再写，而调用方在每一层之间都有同步点
-//   （MoE router 的 `stream.synchronize`）⇒ 轮回到同一块时，上一次的拷贝早已完成。
-//   换环时再补一次同步（兜底，代价 ~每 N 次上传一次）。
+// 修法：**按长度分桶 + 每桶 N 环轮转**，且**永不 free**。可证正确性：
+// 同一个桶里的缓冲要轮满 `PIN_RING` 次才会被再写，而调用方在每一层之间都有同步点
+// （MoE router 的 `stream.synchronize`）⇒ 轮回到同一块时，上一次的拷贝早已完成。
+// 换环时再补一次同步（兜底，代价 ~每 N 次上传一次）。
 /// 环大小。**不要按长度分桶**（那样长度一变就新建一批锁页缓冲，实测每次上传都在分配，
 /// trunk 多花 6~8 ms/轮）；这里每类型只保留 `PIN_RING` 块**按需长大**的缓冲。
 const PIN_RING: usize = 4;
@@ -249,9 +323,9 @@ macro_rules! pinned_upload_impl {
                     }
                 }
                 // ⚠️ 这里**故意不加同步**：环里有 4 块，而单层的上传次数 ≤ 3，且调用方
-                //    **每层**都有同步点（MoE router 的 `stream.synchronize`）⇒ 轮回到同一块
-                //    时，上一次的拷贝必然早已完成。加同步会把这条本来免费的路径变成
-                //    每 4 次上传排空一次流水（实测 trunk +2.9 ms/轮），不划算。
+                // **每层**都有同步点（MoE router 的 `stream.synchronize`）⇒ 轮回到同一块
+                // 时，上一次的拷贝必然早已完成。加同步会把这条本来免费的路径变成
+                // 每 4 次上传排空一次流水（实测 trunk +2.9 ms/轮），不划算。
                 let buf = &mut st.0[idx];
                 buf.as_mut_slice()?[..n].copy_from_slice(vals);
                 k.stream.memcpy_htod(&buf.as_slice()?[..n], dst)?;
@@ -296,7 +370,7 @@ thread_local! {
 /// `stream.clone_dtoh` 的目标是**可分页**内存，驱动只能用小块 bounce buffer 往返搬 ——
 /// 实测吞吐只有 **~200~450 MB/s**（x16 链路有 12 GB/s）。而投机解码里有两处大 D2H：
 /// - `Sequence::head_argmax_all`（`lingxi-driver`）：`t × vocab` bf16，t=9 时 **4.5 MB**，
-///   紧跟着还要 `map(to_f32)` 出 9 MB 的 f32 再 argmax；
+/// 紧跟着还要 `map(to_f32)` 出 9 MB 的 f32 再 argmax；
 /// - `mtp-accept` 的 `mtp_step`：每枚草稿 `1 × vocab` bf16 = 496 KB。
 ///
 /// 两者加起来在 kd=8 下要吃掉 **~20 ms/轮**，而且**完全落在逐层 prof 的括号之外** ——
@@ -309,7 +383,7 @@ pub fn download_bf16(k: &Kernels, src: &CudaSlice<bf16>) -> Result<Vec<bf16>> {
     PIN_DL.with(|c| -> Result<Vec<bf16>> {
         let mut g = c.borrow_mut();
         // ⚠️ 条件写成 `map_or(true, …)`：空池必须**分配**。
-        //（我第一版写成 `map_or(usize::MAX, |p| p.len()) < n` —— `usize::MAX < n` 恒假，
+        //（我第一版写成 `map_or(usize::MAX, |p| p.len) < n` —— `usize::MAX < n` 恒假，
         // 于是永远不分配 ⇒ 立刻在原地上 panic。与 `pinned_upload_*` 的 `!= n` 语义对齐。）
         // 另外同 `pinned_upload_*`：**上下文不同必须重建**（见 `same_ctx`）。
         if g.as_ref()
@@ -338,8 +412,17 @@ pub fn download_bf16(k: &Kernels, src: &CudaSlice<bf16>) -> Result<Vec<bf16>> {
 struct XferSide {
     /// `CUcontext` 句柄（0 = 这个位置还没被占）
     ctx: usize,
-    pin: Option<cudarc::driver::PinnedHostSlice<bf16>>,
+    /// **多级 staging**（`LINGXI_VERIFY_CHUNKS` 两段流水用）：目标卡的 `memcpy_htod` 是
+    /// 异步排队的，下一轮若复用同一块 staging 就会在 H2D 还没落地时被覆写。轮转使用
+    /// `STAGES` 块互不相同的锁页缓冲即可，代价是每块 `n` 个 bf16（3 行 × 2560 ≈ 15 KB）。
+    pins: Vec<cudarc::driver::PinnedHostSlice<bf16>>,
+    /// 每级 staging 配一个事件：`record(本卡流)` 后 `synchronize` 只等"这一层的 D2H
+    /// 落地"（含它之前的 MoE kernel），**不是** `stream.synchronize` 那种整条流排空。
+    evs: Vec<CudaEvent>,
 }
+
+/// 跨卡 staging 的轮转级数（≥ 一次流水里的最大 chunk 数）。
+pub const XFER_STAGES: usize = 8;
 
 #[derive(Default)]
 struct Xfer {
@@ -351,8 +434,8 @@ thread_local! {
 }
 
 impl Xfer {
-    /// 给 `k` 找（或占）一个专属的 staging 位置，并保证容量 ≥ `n`。
-    fn side_for(&mut self, k: &Kernels, n: usize) -> Result<usize> {
+    /// 给 `k` 找（或占）一个专属的 staging 位置，并保证第 `stage` 级容量 ≥ `n`。
+    fn side_for(&mut self, k: &Kernels, n: usize, stage: usize) -> Result<usize> {
         let key = k.ctx.cu_ctx() as usize;
         let i = match self.sides.iter().position(|s| s.ctx == key) {
             Some(i) => i,
@@ -362,13 +445,17 @@ impl Xfer {
                     .iter()
                     .position(|s| s.ctx == 0)
                     .ok_or_else(|| anyhow::anyhow!("跨卡 staging 只支持两张卡"))?;
-                self.sides[i] = XferSide { ctx: key, pin: None };
+                self.sides[i] = XferSide { ctx: key, pins: Vec::new(), evs: Vec::new() };
                 i
             }
         };
         let s = &mut self.sides[i];
-        if s.pin.as_ref().map_or(true, |p| p.len() < n) {
-            s.pin = Some(unsafe { k.stream.context().alloc_pinned_with_flags::<bf16>(n, 0) }?);
+        while s.pins.len() <= stage {
+            s.pins.push(unsafe { k.stream.context().alloc_pinned_with_flags::<bf16>(n, 0)? });
+            s.evs.push(k.ctx.new_event(None)?);
+        }
+        if s.pins[stage].len() < n {
+            s.pins[stage] = unsafe { k.stream.context().alloc_pinned_with_flags::<bf16>(n, 0)? };
         }
         Ok(i)
     }
@@ -376,18 +463,22 @@ impl Xfer {
 
 /// **跨卡激活搬运** `src`（在 `k_from` 上）→ `dst`（在 `k_to` 上），走各自卡上的锁页 staging。
 /// 同步口径：块内做 3 步（D2H + sync、host memcpy、H2D），`k_to` 的 H2D 是异步的、按流序排队。
-pub fn cross_copy(
+///
+/// `stage`：staging 级号（0..`XFER_STAGES` 轮转）。**两段流水**每次搬运换一级，保证目标卡上
+/// 还没落地的异步 H2D 不会在下一轮被 host 覆写；单发调用固定传 0。
+pub fn cross_copy_staged(
     k_from: &Kernels,
     src: &CudaSlice<bf16>,
     k_to: &Kernels,
     dst: &mut CudaSlice<bf16>,
+    stage: usize,
 ) -> Result<()> {
     let n = src.len();
     anyhow::ensure!(dst.len() >= n, "跨卡搬运：目标缓冲太小（{} < {n}）", dst.len());
     XFER.with(|c| -> Result<()> {
         let mut x = c.borrow_mut();
-        let a = x.side_for(k_from, n)?;
-        let b = x.side_for(k_to, n)?;
+        let a = x.side_for(k_from, n, stage)?;
+        let b = x.side_for(k_to, n, stage)?;
         anyhow::ensure!(a != b, "跨卡搬运的源/目标上下文相同：不是跨卡调用");
         // 取两块**不同**元素的 &mut：`a`/`b` 是运行期下标，用 split_at_mut 切成两半再各取一个。
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
@@ -399,18 +490,102 @@ pub fn cross_copy(
         };
         // 1) 源卡 → 它自己的 staging（`memcpy_dtoh` 异步，必须同步后才能读）
         {
-            let buf = sa.pin.as_mut().unwrap().as_mut_slice()?;
+            let buf = sa.pins[stage].as_mut_slice()?;
             k_from.stream.memcpy_dtoh(src, &mut buf[..n])?;
             k_from.stream.synchronize()?;
         }
         // 2) host 侧两块 staging 之间搬一次（36 KB；`Vec::copy_from_slice` 不走驱动）
         {
-            let sbuf = sb.pin.as_mut().unwrap().as_mut_slice()?;
-            sbuf[..n].copy_from_slice(&sa.pin.as_ref().unwrap().as_slice()?[..n]);
+            let sbuf = sb.pins[stage].as_mut_slice()?;
+            sbuf[..n].copy_from_slice(&sa.pins[stage].as_slice()?[..n]);
         }
         // 3) 目标卡的 staging → 目标卡设备（走目标卡自己的流；事件同上下文，合法）
-        let sbuf = sb.pin.as_ref().unwrap();
+        let sbuf = &sb.pins[stage];
         k_to.stream.memcpy_htod(&sbuf.as_slice()?[..n], dst)?;
+        Ok(())
+    })
+}
+
+/// 单发跨卡搬运（`stage=0`），语义与改造前完全一致。
+pub fn cross_copy(
+    k_from: &Kernels,
+    src: &CudaSlice<bf16>,
+    k_to: &Kernels,
+    dst: &mut CudaSlice<bf16>,
+) -> Result<()> {
+    cross_copy_staged(k_from, src, k_to, dst, 0)
+}
+
+/// **一趟双向**跨卡交换：`src0`（在 `k0` 上）→ `dst1`（在 `k1` 上），
+/// `src1`（在 `k1` 上）→ `dst0`（在 `k0` 上）。
+///
+/// 顺序（也是 EP 每层的时序要求）：两路 D2H **同时**排进各自的流 → 两卡各
+/// `cudaEventRecord` → **只等这两个事件** → host 侧交叉 → 两路 H2D 同时回排。
+///
+/// 为什么用事件而不是 `stream.synchronize`：D2H 之前的 MoE kernel 与 D2H 本身都在
+/// 本卡流里，事件落在 D2H 之后 ⇒ `event.synchronize` 只等"本层 MoE + 这趟拷贝落地"，
+/// 不会把整条流（含本层后面还没发出的 apply）当成屏障；两卡之间也**没有**额外的
+/// 交叉等待，只有在 host 拿数据做交叉拷贝这一步天然汇合。
+///
+/// `stage`：staging **层奇偶**（0/1）。每层各用一对独立的出站/入站锁页缓冲
+/// （级号 `2*stage` / `2*stage+1`），保证下一层的异步 H2D 还没落地时不会覆写同一块
+/// 入站缓冲；隔两层回到同一对时，中间那层的 D2H 事件已经证明了前一次 H2D 完成。
+pub fn cross_copy_pair(
+    k0: &Kernels,
+    src0: &CudaSlice<bf16>,
+    dst0: &mut CudaSlice<bf16>,
+    k1: &Kernels,
+    src1: &CudaSlice<bf16>,
+    dst1: &mut CudaSlice<bf16>,
+    stage: usize,
+) -> Result<()> {
+    let n0 = src0.len();
+    let n1 = src1.len();
+    anyhow::ensure!(dst0.len() >= n1, "跨卡搬运：dst0 太小（{} < {n1}）", dst0.len());
+    anyhow::ensure!(dst1.len() >= n0, "跨卡搬运：dst1 太小（{} < {n0}）", dst1.len());
+    let n = n0.max(n1);
+    let st = (stage % 2) * 2;
+    XFER.with(|c| -> Result<()> {
+        let mut x = c.borrow_mut();
+        // 每张卡按层奇偶用**两对** staging：`st` 级出站，`st+1` 级入站（互不踩踏）。
+        let a = x.side_for(k0, n, st)?;
+        let b = x.side_for(k1, n, st)?;
+        let a2 = x.side_for(k0, n, st + 1)?;
+        let b2 = x.side_for(k1, n, st + 1)?;
+        anyhow::ensure!(a == a2 && b == b2, "跨卡 staging 级索引异常");
+        anyhow::ensure!(a != b, "跨卡搬运的源/目标上下文相同：不是跨卡调用");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let (left, right) = x.sides.split_at_mut(hi);
+        let (sa, sb) = if a < b {
+            (&mut left[lo], &mut right[0])
+        } else {
+            (&mut right[0], &mut left[lo])
+        };
+        // 1) 两路 D2H（各自排进自己的流，互不等待；流序保证排在各自本层 MoE 之后）
+        {
+            let out_a = sa.pins[st].as_mut_slice()?;
+            k0.stream.memcpy_dtoh(src0, &mut out_a[..n0])?;
+            let out_b = sb.pins[st].as_mut_slice()?;
+            k1.stream.memcpy_dtoh(src1, &mut out_b[..n1])?;
+        }
+        // 2) 两卡各记录"本层 MoE + D2H 完成"事件，然后只等自己这个事件
+        // （不是 `stream.synchronize` 的整条流排空）。
+        sa.evs[st].record(&k0.stream)?;
+        sb.evs[st].record(&k1.stream)?;
+        sa.evs[st].synchronize()?;
+        sb.evs[st].synchronize()?;
+        // 3) host 侧交叉（30 KB × 2，~4 µs）。出站/入站两级缓冲借用互不相交。
+        {
+            let (pout_a, pin_a) = sa.pins.split_at_mut(st + 1);
+            let (pout_b, pin_b) = sb.pins.split_at_mut(st + 1);
+            pin_a[0].as_mut_slice()?[..n1]
+                .copy_from_slice(&pout_b[st].as_slice()?[..n1]);
+            pin_b[0].as_mut_slice()?[..n0]
+                .copy_from_slice(&pout_a[st].as_slice()?[..n0]);
+        }
+        // 4) 两路 H2D（各自回流，按流序排在本层后续 kernel 之前）
+        k1.stream.memcpy_htod(&sb.pins[st + 1].as_slice()?[..n0], dst1)?;
+        k0.stream.memcpy_htod(&sa.pins[st + 1].as_slice()?[..n1], dst0)?;
         Ok(())
     })
 }
@@ -438,7 +613,7 @@ thread_local! {
 
 // ───────────── 设备可写的锁页 host 缓冲（零拷贝 D2H 替身）─────────────
 //
-// 动机（实测，见 docs/decode-speed-profile.md）：decode 每层要把 router logits
+// 动机：decode 每层要把 router logits
 // （512×bf16 = 1 KB）取回 host 做 top-k。走 `cuMemcpyDtoHAsync` + `cuStreamSynchronize`
 // 时，**这 1 KB 的拷贝本身就让同步多等 ~0.8 ms**（同一份代码里 sync 中位数：
 // 有拷贝 1.2 ms / 去掉拷贝 0.4 ms），完全不是带宽能解释的量级。
@@ -481,7 +656,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits> MappedHost
     }
 
     /// 读 host 侧内容（该缓冲从未交给 cudarc 的拷贝 API，事件不会被 record，
-    /// 所以这里的 `event.synchronize()` 是空转，不构成额外等待）。
+    /// 所以这里的 `event.synchronize` 是空转，不构成额外等待）。
     pub fn slice(&self) -> Result<&[T]> {
         Ok(self.pin.as_slice()?)
     }

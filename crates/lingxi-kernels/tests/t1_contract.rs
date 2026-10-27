@@ -1,4 +1,4 @@
-//! T1 kernel 契约测试（§6 验证体系）：随机输入 vs torch 参考（同一 pocenv 环境），rel < 2e-3。
+//! T1 kernel 契约测试（验证体系）：随机输入 vs torch 参考（同一 pocenv 环境），rel < 2e-3。
 //!
 //! 门控：`cargo test -p lingxi-kernels --features gpu`
 //! 环境：`LINGXI_PYTHON` 指向 pocenv 的 python（默认 /models/pocenv/bin/python）。

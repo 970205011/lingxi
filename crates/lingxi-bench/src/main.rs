@@ -1,33 +1,24 @@
 //! `lingxi-bench` — 压测 / 对拍 / 检查工具入口。旁路，不进热路径。
 //!
 //! 当前提供：
-//!   `verify <artifact>` — 打开现成 ninfer v2 产物，跑结构自检 + 构建 tensor 目录
-//!   `list   <artifact>` — 打印目录中的张量（名字/形状/格式/布局/角色）
+//! `verify <artifact>` — 打开现成 ninfer v2 产物，跑结构自检 + 构建 tensor 目录
+//! `list <artifact>` — 打印目录中的张量（名字/形状/格式/布局/角色）
 
-use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cudarc::driver::DevicePtr;
-use lingxi_artifact::expert_arena::BlobFormat;
 use lingxi_artifact::Artifact;
 
 mod host_cache;
 mod mtp_arena;
 mod arena_source;
+mod doctor;
+mod moe_gemm_bench;
 mod serve;
 mod spec;
-
-/// 读 prompt 参数：`@<路径>` 从文件读（长上下文 prompt 可能几百 KB，超 argv 上限），否则当文本。
-fn prompt_arg(arg: Option<&String>) -> anyhow::Result<String> {
-    let a = arg.cloned().unwrap_or_else(|| "The capital of France is".to_string());
-    if let Some(path) = a.strip_prefix('@') {
-        Ok(std::fs::read_to_string(path)?)
-    } else {
-        Ok(a)
-    }
-}
+mod vram;
+mod cli;
 
 fn main() {
     // ★ 致命错误必须 process::exit(1) 而不是返回 Err：启动早期 spawn 了分离的
@@ -46,6 +37,19 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // 自报版本：任何环境（无 GPU/无产物）都能跑，支持"你跑的是哪个版本"快速定位。
+    if matches!(
+        args.get(1).map(|s| s.as_str()),
+        Some("version") | Some("--version") | Some("-V")
+    ) {
+        println!(
+            "lingxi-bench {} (git {}, target: {})",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("LINGXI_BUILD_GIT").unwrap_or("unknown"),
+            std::env::consts::ARCH
+        );
+        return Ok(());
+    }
     // 环境开关校验（点名拼错/幽灵开关、拦住已知危险组合）——必须在任何 GPU 初始化之前。
     // `probes` 子命令只打印状态表，不跑别的（但**也要先过一遍校验**，方便在跑之前查配置）。
     lingxi_model::probes::check_env();
@@ -56,7 +60,7 @@ fn run() -> Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         Some("attn-bench") => {
             // ★ P15-㊳ attention 微基准：attn2（每行一块）vs attn3（8 行共享 K/V 读）。
-            // 冷启动单发口径（PLAN 纪律）：每 trial 前先写 48MB 脏缓冲驱逐 L2，单次 launch 计时，取 5 trial 的 min。
+            // 冷启动单发口径：每 trial 前先写 48MB 脏缓冲驱逐 L2，单次 launch 计时，取 5 trial 的 min。
             let dev: usize = std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
             let heads = 24usize;
@@ -307,7 +311,7 @@ fn run() -> Result<()> {
 
             // 对比 0c：**瘦长 GEMM 随 m 的带宽**（t>1 前向的核心 kernel）。
             // 【本轮改】形状换成 **GR 的两个真形状**（[320,10240] mix_down / [10240,320] mix_up），
-            // 并同时量**新旧两个核** —— §3.38 实测 GR 在 t=2 每层要 ~200 µs，而流量只该 ~17 µs/层。
+            // 并同时量**新旧两个核** —— 实测 GR 在 t=2 每层要 ~200 µs，而流量只该 ~17 µs/层。
             // 判据：权重只读一遍 ⇒ m=1/2/4/8 的时间应几乎相同（FLOPs 白送）；
             // 若随 m 显著变慢，说明 m 路展开有问题，t>1 前向就永远快不起来。
             for &(nn, kk) in &[
@@ -643,7 +647,7 @@ fn run() -> Result<()> {
             }
 
             // ── GDN 层小核总账（36 层都走这条；`LINGXI_SKIP=attn` 拆出来是 292 µs/层，
-            //    而 Q4 投影加起来只有 ~90 µs ⇒ 大头在下面这两个核）──
+            // 而 Q4 投影加起来只有 ~90 µs ⇒ 大头在下面这两个核）──
             {
                 let (conv_dim, kk, heads, hk) = (10240usize, 4usize, 48usize, 128usize);
                 let (val_dim, nk) = (heads * hk, 16usize);
@@ -697,7 +701,7 @@ fn run() -> Result<()> {
 
             // ── 专家槽 Q4 GEMV（decode 每层真正的大头：10 个专家 × 2.61 MB）──
             // 之前从没单独量过它。布局按 arena 契约复刻（见 arena_source.rs）：
-            //   blob = gu_bytes + down_bytes；gu=[2*inter,hidden]=[1280,2560]、down=[hidden,inter]=[2560,640]
+            // blob = gu_bytes + down_bytes；gu=[2*inter,hidden]=[1280,2560]、down=[hidden,inter]=[2560,640]
             {
                 let (s_experts, hidden, inter) = (10usize, 2560usize, 640usize);
                 let kpad = |kk: usize| ((kk + 127) / 128) * 128;
@@ -895,12 +899,12 @@ fn run() -> Result<()> {
                     scan("dn", &yg, &mut yd, hidden, inter, dn_k_pad, inter, gu_bytes as u64, dn_scale as u64, dn_bytes as u64)?;
                 }
                 // **微型 launch 探针**：定位「~14.5 µs 地板」的来源。
-                //   S=1,n=8   → 最小 launch（1 block、1 warp）
-                //   S=1,n=2560→ 行数拉满但只 1 个专家
-                //   S=10,n=8  → 专家数拉满但每专家 1 行
-                //   S=10,n=2560 → 真实形状
+                // S=1,n=8 → 最小 launch（1 block、1 warp）
+                // S=1,n=2560→ 行数拉满但只 1 个专家
+                // S=10,n=8 → 专家数拉满但每专家 1 行
+                // S=10,n=2560 → 真实形状
                 // 若四者都是 ~14.5 µs ⇒ 地板是**每次 launch 的固定 GPU 侧成本**（与 S/n 无关）
-                //   ⇒ 正确对策是**减少 launch 次数**（融合 gu+dn / 融合整个 MoE 段），而不是改核内。
+                // ⇒ 正确对策是**减少 launch 次数**（融合 gu+dn / 融合整个 MoE 段），而不是改核内。
                 for &(ss, nn) in &[(1usize, 8usize), (1, 2560), (10, 8), (10, 2560)] {
                     for _ in 0..3 {
                         k.gemv_q4g64_slots_bf16(
@@ -1336,7 +1340,7 @@ fn run() -> Result<()> {
         }
         Some("f32x-check") => {
             // ★ P15-⑨ 对拍台：`gemm_skinny_row_f32x`（x 预转 fp32）vs `gemm_skinny_row`
-            //   的**输出比特**。随机数据、m=7、GDN 真形状；任何一位不同都打印样本。
+            // 的**输出比特**。随机数据、m=7、GDN 真形状；任何一位不同都打印样本。
             let dev: usize =
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
@@ -1441,17 +1445,17 @@ fn run() -> Result<()> {
         }
         Some("bw-ceiling") => {
             //
-            //   ① 纯 memcpy（同字节数）        = **硬件上限**
-            //   ② bf16 GEMV 真实形状 n=1280 k=2560（专家 gu）与 n=2560 k=640（专家 dn）
-            //   ③ bf16 GEMV **大形状** n=39680（= 31 个专家的行拼起来）= 看"网格大小"的影响
-            //   ④ bf16 GEMV **高并行度变体**（`gemv_bf16_block_epi_ptr`，一 block 一行）
+            // ① 纯 memcpy（同字节数） = **硬件上限**
+            // ② bf16 GEMV 真实形状 n=1280 k=2560（专家 gu）与 n=2560 k=640（专家 dn）
+            // ③ bf16 GEMV **大形状** n=39680（= 31 个专家的行拼起来）= 看"网格大小"的影响
+            // ④ bf16 GEMV **高并行度变体**（`gemv_bf16_block_epi_ptr`，一 block 一行）
             //
-            //   Q4 专家 GEMV 不便在这里造布局（要 Q4G64 的 payload/scale 平面），
-            //   所以它的数用**真实 decode 路径的实测**：miss=0 时专家段 78 MB/层 ÷ 0.46 ms
-            //   ≈ **170 GB/s**（见 PLAN §P15-②）。这样三个数直接可比。
+            // Q4 专家 GEMV 不便在这里造布局（要 Q4G64 的 payload/scale 平面），
+            // 所以它的数用**真实 decode 路径的实测**：miss=0 时专家段 78 MB/层 ÷ 0.46 ms
+            // ≈ **170 GB/s**。这样三个数直接可比。
             //
-            //   口径说明：量的是"权重字节 / 墙钟"，墙钟含入队（rep 次一起排队后同步），
-            //   所以小形状的数字里天然含 launch 开销 —— 那正是我们想看清的一部分。
+            // 口径说明：量的是"权重字节 / 墙钟"，墙钟含入队（rep 次一起排队后同步），
+            // 所以小形状的数字里天然含 launch 开销 —— 那正是我们想看清的一部分。
             let dev: usize =
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
@@ -1486,7 +1490,7 @@ fn run() -> Result<()> {
             }
             // 伪随机字节（xorshift64）。**权重必须随机**：全零会让"按权重内容索引 shared 表"
             // 的访问退化成全 lane 同地址广播（无 bank 冲突），把带查表的核严重高估
-            // （实测假象记录见 PLAN §P15-⑥：slotsm 查表版微基准 +27%、整机 −3%）。
+            //。
             fn rnd_bytes(n: usize, seed: u64) -> Vec<u8> {
                 let mut v = Vec::with_capacity(n);
                 let mut s = seed | 1;
@@ -1559,11 +1563,11 @@ fn run() -> Result<()> {
             })?;
             eprintln!("  [bf16 dn] 同形状循环 31 次（像一层）      → **{g:7.1} GB/s**");
             // ── ⑤ ★ 我们的 Q4 GEMV：**形状对照**（= "改布局能不能吃满带宽"的判决）──
-            //   同一份 Q4 核（同一个解包路径），只改矩阵行数：
-            //     n=1280   = 一个专家的 gu（现状：每专家一个小矩阵）
-            //     n=39680  = 31 个专家的 gu **拼成一个连续大矩阵**（用户提的"改布局"）
-            //   字节是 zeros —— 带宽与内容无关，这里只测"几何形状"的影响。
-            //   若 n=39680 明显更高 ⇒ 布局重排（离线做，运行时不付代价）本身就能吃到带宽。
+            // 同一份 Q4 核（同一个解包路径），只改矩阵行数：
+            // n=1280 = 一个专家的 gu（现状：每专家一个小矩阵）
+            // n=39680 = 31 个专家的 gu **拼成一个连续大矩阵**（用户提的"改布局"）
+            // 字节是 zeros —— 带宽与内容无关，这里只测"几何形状"的影响。
+            // 若 n=39680 明显更高 ⇒ 布局重排（离线做，运行时不付代价）本身就能吃到带宽。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 for (tag, n) in
@@ -1589,11 +1593,11 @@ fn run() -> Result<()> {
                 }
             }
             // ── ⑥⑦⑧ ★★ 三种喂法隔离（用户指定的判决）：同一个**专家槽核**，同一份字节 ──
-            //   (a) s=1, n=39680：全部行当一个"大专家" ⇒ **1D 网格(1240块) + 连续内存**
-            //   (b) s=31, n=1280, blob=2.61MB：31 个专家紧挨着（81MB 区内）⇒ **2D 网格(20,31) + 连续**
-            //   (c) s=31, n=1280, blob=64MB：31 个专家**散在 2GB 区**里 ⇒ **2D 网格 + 散布**
-            //   比较：(a)vs(b) 隔离"网格形状"；(b)vs(c) 隔离"寻址散布"。
-            //   字节都是 zeros（带宽与内容无关）。
+            // (a) s=1, n=39680：全部行当一个"大专家" ⇒ **1D 网格(1240块) + 连续内存**
+            // (b) s=31, n=1280, blob=2.61MB：31 个专家紧挨着（81MB 区内）⇒ **2D 网格(20,31) + 连续**
+            // (c) s=31, n=1280, blob=64MB：31 个专家**散在 2GB 区**里 ⇒ **2D 网格 + 散布**
+            // 比较：(a)vs(b) 隔离"网格形状"；(b)vs(c) 隔离"寻址散布"。
+            // 字节都是 zeros（带宽与内容无关）。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 let gslots = |k: &lingxi_kernels::Kernels,
@@ -1656,9 +1660,9 @@ fn run() -> Result<()> {
                 }
             }
             // ── ⑨⑩ ★★ 真实路径用的那两个变体，在**真实 s/e_uniq**下测 ──
-            //   (d) `slots_rows rpw=1`：t=1 路径（应等于 (b) 的 612）
-            //   (e) `slotsm rpw=2`：t=7 批量路径（s=217 对、e_uniq=31、每专家 7 个 token）
-            //       —— **这才是 decode 主力**。若它远低于 (b)，瓶颈就在它身上。
+            // (d) `slots_rows rpw=1`：t=1 路径（应等于 (b) 的 612）
+            // (e) `slotsm rpw=2`：t=7 批量路径（s=217 对、e_uniq=31、每专家 7 个 token）
+            // —— **这才是 decode 主力**。若它远低于 (b)，瓶颈就在它身上。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 let blob: u64 = 2_611_200;
@@ -1677,7 +1681,7 @@ fn run() -> Result<()> {
                 })?;
                 eprintln!("  [d slots_rows rpw=1] s=31 → **{g:7.1} GB/s**");
                 // (e) slotsm rpw=2：s=217 对、31 个唯一专家、每专家 7 个 token。
-                //     ★ bf16 x（现转）vs fp32 预转 x 对照：转换在计时外（提前转化）。
+                // ★ bf16 x（现转）vs fp32 预转 x 对照：转换在计时外（提前转化）。
                 let s_pairs = 31usize * 7;
                 let group_off: Vec<i32> = (0..=31).map(|i| (i * 7) as i32).collect();
                 let gof = k.stream.clone_htod(&group_off)?;
@@ -1734,9 +1738,9 @@ fn run() -> Result<()> {
                     })?;
                     eprintln!("  [m slotsm dp4a ]  s=62  e=31 (m=2) → **{gl2:7.1} GB/s**（int8-x，真实路由≈此）");
                     // (n)(o) ★ P15-④ 判决：dense 核（带 LUT 解码）在**随机权重**下的大/小形状。
-                    //   ⑤ 里的 557 是 alloc_zeros 测的——零权重让 LUT 索引恒定 ⇒ 全 lane
-                    //   同地址广播、零 bank 冲突（P15-⑥ 已证这是假象）。随机权重下若
-                    //   dense n=39680 也 ≈ 389 ⇒ "布局重排 557" 的 premise 不成立。
+                    // ⑤ 里的 557 是 alloc_zeros 测的——零权重让 LUT 索引恒定 ⇒ 全 lane
+                    // 同地址广播、零 bank 冲突（P15-⑥ 已证这是假象）。随机权重下若
+                    // dense n=39680 也 ≈ 389 ⇒ "布局重排 557" 的 premise 不成立。
                     let wl = k.stream.clone_htod(&rnd_bytes(1280 * 31 * 2560 / 2 * 2, 0xD4))?;
                     let mut yl = k.stream.alloc_zeros::<half::bf16>(1280 * 31)?;
                     for (tag, nn) in [("n=39680", 1280 * 31usize), ("n=1280 ", 1280usize)] {
@@ -1754,9 +1758,9 @@ fn run() -> Result<()> {
                     }
                 }
                 // (g) ★ 判定"是每元素指令多"还是"slotsm 结构本身"：**把 m 降到 1**。
-                //     m=1 时每个权重字节只被 1 个 token 用 ⇒ 若 (g) 远高于 (e)，
-                //     说明瓶颈是"每个 (行,列块,token) 那串 转换+FMA"（改嵌套可治）；
-                //     若 (g) 仍 ≈170，说明瓶颈在 slotsm 的结构（加群表/地址算法），另说。
+                // m=1 时每个权重字节只被 1 个 token 用 ⇒ 若 (g) 远高于 (e)，
+                // 说明瓶颈是"每个 (行,列块,token) 那串 转换+FMA"（改嵌套可治）；
+                // 若 (g) 仍 ≈170，说明瓶颈在 slotsm 的结构（加群表/地址算法），另说。
                 let gof1 = k.stream.clone_htod(&(0..=31i32).collect::<Vec<i32>>())?;
                 let ids1 = k.stream
                     .clone_htod(&(0..31i32).collect::<Vec<i32>>())?;
@@ -1805,7 +1809,7 @@ fn run() -> Result<()> {
                     "  [i slotsm rpw=2]   s=62  e=31 (m=2) → bf16 {g2b:7.1} | **xf32 {g2f:7.1} GB/s**（真实路由≈此形状）"
                 );
                 // (j) ★ rpw 隔离：slots 黄金路径用 rpw=1；slotsm 默认 rpw=2。
-                //     若 rpw=1 追平槽核 b(388)，则差距在行分块而非 x 预取，改默认即可。
+                // 若 rpw=1 追平槽核 b(388)，则差距在行分块而非 x 预取，改默认即可。
                 let gjb = bw(&k, rep, 1280 * 2560 / 2 * 31, || {
                     k.gemv_q4g64_slotsm_rpw_bf16(
                         &w, &ids1, &x, &gof1, &mut y3, 31, 1280, 2560, 2560, 0, blob, 0,
@@ -1833,1936 +1837,15 @@ fn run() -> Result<()> {
                 "  参照：**我们的 Q4 专家 GEMV（真实 decode 实测）= 170 GB/s**（78MB/层 ÷ 0.46ms）"
             );
         }
-        Some("verify") => {
-            let path = args.get(2).expect("用法: lingxi-bench verify <artifact.ninfer>");
-            let t0 = std::time::Instant::now();
-            let art = Artifact::open(path)?;
-            art.verify()?;
-            let catalog = lingxi_model::catalog_from_artifact(&art);
-
-            let mut formats: BTreeMap<String, usize> = BTreeMap::new();
-            let mut layouts: BTreeMap<String, usize> = BTreeMap::new();
-            let mut roles: BTreeMap<String, usize> = BTreeMap::new();
-            let mut total = 0u64;
-            for (_, info) in catalog.iter() {
-                *formats.entry(info.format.name().to_string()).or_default() += 1;
-                *layouts.entry(info.layout.name().to_string()).or_default() += 1;
-                *roles.entry(format!("{:?}", info.role)).or_default() += 1;
-                total += info.storage_bytes();
-            }
-            println!(
-                "OK: identity={}/{} objects={} (tensor {} + resource {}) payload={:.2}GB 用时 {:.2}s",
-                art.identity.model_id,
-                art.identity.weights_id,
-                art.objects.len(),
-                art.tensors().count(),
-                art.resources().count(),
-                total as f64 / 1e9,
-                t0.elapsed().as_secs_f64(),
-            );
-            println!("formats: {formats:?}");
-            println!("layouts: {layouts:?}");
-            let other = roles.get("Other").copied().unwrap_or(0);
-            println!("roles: {roles:?}  (Other={other})");
-        }
-        Some("vram-budget") => {
-            // 用法: vram-budget <artifact> [arena] [split_lo] [kv_cap]
-            // 只读 catalog/arena 与设备总量，不加载权重、不分配专家槽。
-            let path = args
-                .get(2)
-                .expect("用法: vram-budget <artifact> [arena] [split_lo] [kv_cap]");
-            let arena = args
-                .get(3)
-                .map(|s| s.as_str())
-                .unwrap_or("/dev/shm/qwen4_exp.expert-arena.mix64.bin");
-            let split_lo: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(24);
-            let kv_cap: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(32768);
-            let art = Artifact::open(path)?;
-            println!("artifact={path}\narena={arena}\nsplit_lo={split_lo} kv_cap={kv_cap}");
-            for dev in 0..2 {
-                let _ctx = cudarc::driver::CudaContext::new(dev)?;
-                match autotune_arena_slots(&art, arena, dev, split_lo, kv_cap) {
-                    Ok(Some((slots, ledger))) => println!("{ledger}\n  dev{dev}: slots={slots}"),
-                    Ok(None) => println!("dev{dev}: autotune disabled"),
-                    Err(e) => println!("dev{dev}: ERROR {e:#}"),
-                }
-            }
-        }
-        Some("bytes") => {
-            // 用法: bytes <artifact> [top_n]
-            // 统计 payload 字节构成，用于部署内存策略（什么常驻 VRAM / 什么流式读盘）。
-            let path = args.get(2).expect("用法: lingxi-bench bytes <artifact.ninfer> [top_n]");
-            let top_n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
-            let art = Artifact::open(path)?;
-            let catalog = lingxi_model::catalog_from_artifact(&art);
-
-            let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
-            let mut total = 0u64;
-            let mut by_format: BTreeMap<String, (u64, usize)> = BTreeMap::new();
-            let mut by_cat: BTreeMap<String, (u64, usize)> = BTreeMap::new();
-            let mut by_layer: BTreeMap<String, u64> = BTreeMap::new();
-            let mut tensors: Vec<(u64, String)> = Vec::new();
-
-            for (_, info) in catalog.iter() {
-                let b = info.storage_bytes();
-                total += b;
-                let f = by_format.entry(info.format.name().to_string()).or_insert((0, 0));
-                f.0 += b;
-                f.1 += 1;
-
-                let cat = categorize(&info.name);
-                let c = by_cat.entry(cat.to_string()).or_insert((0, 0));
-                c.0 += b;
-                c.1 += 1;
-
-                *by_layer.entry(layer_of(&info.name)).or_default() += b;
-                tensors.push((b, info.name.clone()));
-            }
-
-            println!("总 payload: {:.2} GiB ({total} bytes)", gb(total));
-            println!("\n== 按量化格式 ==");
-            for (k, (b, n)) in &by_format {
-                println!("  {k:<16} {:>8.2} GiB  ({n} 个)", gb(*b));
-            }
-            println!("\n== 按类别 ==");
-            let mut cats: Vec<_> = by_cat.iter().collect();
-            cats.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-            for (k, (b, n)) in cats {
-                println!(
-                    "  {k:<24} {:>8.2} GiB  {:>5.1}%  ({n} 个)",
-                    gb(*b),
-                    100.0 * *b as f64 / total as f64
-                );
-            }
-            println!("\n== 按层（text 主干 + mtp）==");
-            let mut layers: Vec<_> = by_layer.iter().collect();
-            layers.sort_by(|a, b| b.1.cmp(a.1));
-            for (k, b) in layers.iter().take(55) {
-                println!("  {k:<28} {:>8.2} GiB", gb(**b));
-            }
-            // text 48 层是否等大（决定能否共享一套“单层常驻”方案）
-            let text_layers: Vec<u64> = (0..48)
-                .filter_map(|i| by_layer.get(&format!("text/layers/{i}")).copied())
-                .collect();
-            if !text_layers.is_empty() {
-                let mn = *text_layers.iter().min().unwrap();
-                let mx = *text_layers.iter().max().unwrap();
-                println!(
-                    "  text 主干 48 层：min {:.2} GiB / max {:.2} GiB（差 {:.2} GiB），合计 {:.2} GiB",
-                    gb(mn),
-                    gb(mx),
-                    gb(mx - mn),
-                    gb(text_layers.iter().sum())
-                );
-            }
-            println!("\n== 最大的 {top_n} 个张量 ==");
-            tensors.sort_by(|a, b| b.0.cmp(&a.0));
-            for (b, name) in tensors.iter().take(top_n) {
-                println!("  {:>8.2} GiB  {name}", gb(*b));
-            }
-        }
-        Some("mtp-pack") => {
-            // **把 `mtp/*` 张量抽出来单独打包**。
-            //
-            // 背景（docs §3.51）：生产产物 `qwen4_exp.ninfer` 里**没有** MTP 张量，
-            // 而 `/data/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer`（252 GB）里有 27 个。
-            // 投机解码只需要那 27 个 ⇒ 把它们抽成一个 ~5 GiB 的小产物，
-            // 引擎启动时多开一个小产物即可，**不必去碰那个 252 GB 的大文件**。
-            //
-            // 用法: lingxi-bench mtp-pack <src.ninfer> <dst.ninfer>
-            let src = args
-                .get(2)
-                .context("用法: lingxi-bench mtp-pack <src.ninfer> <dst.ninfer>")?;
-            let dst = args.get(3).context("缺 dst 路径")?;
-            let art = Artifact::open(src)?;
-            let catalog = lingxi_model::catalog_from_artifact(&art);
-            let mut objects: Vec<lingxi_artifact::Object> = Vec::new();
-            let mut payloads: Vec<(String, &[u8])> = Vec::new();
-            for (_, info) in catalog.iter() {
-                if !info.name.starts_with("mtp/") {
-                    continue;
-                }
-                let payload = art
-                    .payload(&info.name)
-                    .with_context(|| format!("取 payload 失败: {}", info.name))?;
-                objects.push(lingxi_artifact::Object::Tensor {
-                    name: info.name.clone(),
-                    shape: info.shape.to_vec(),
-                    format: info.format.name().to_string(),
-                    layout: info.layout.name().to_string(),
-                    offset: 0,
-                    bytes: payload.len() as u64,
-                });
-                payloads.push((info.name.clone(), payload));
-            }
-            if objects.is_empty() {
-                anyhow::bail!("源产物 {src} 里没有 mtp/* 张量");
-            }
-            let total: u64 = objects.iter().map(|o| o.bytes()).sum();
-            println!(
-                "mtp-pack: {} 个张量，共 {:.2} GiB → {dst}",
-                objects.len(),
-                total as f64 / 1073741824.0
-            );
-            let identity = lingxi_artifact::Identity {
-                model_id: "qwen4_exp-mtp".to_string(),
-                weights_id: "extracted-from-mtp2".to_string(),
-            };
-            let mut w = lingxi_artifact::Writer::create(dst, &identity, objects)?;
-            for (name, payload) in payloads {
-                w.write(&name, payload)?;
-            }
-            w.finish()?;
-            println!("mtp-pack 完成：{dst}");
-        }
-        Some("mtp-accept") => {
-            // **接受率测量** —— 投机解码的总闸门（§3.52 步骤 2）。
-            // 主干贪心跑 N 步；每步拿 (h_P, 主干刚预测的 token) 喂 MTP 头出草稿，
-            // 与主干**真实的下一个 token** 比对；输出一致率（= 接受率）。
-            // MTP 有自己的 KV（1 层），随主干同步推进：prompt 一次性 T 行，之后每步 1 行。
-            // 用法: lingxi-bench mtp-accept <main.ninfer> <mtp.ninfer> [prompt] [n]
-            let main_path = args
-                .get(2)
-                .context("用法: lingxi-bench mtp-accept <main.ninfer> <mtp.ninfer> [prompt] [n]")?;
-            let mtp_path = args.get(3).context("缺 MTP 产物路径")?;
-            let prompt = prompt_arg(args.get(4))?;
-            let n_new: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(64);
-
-            let dev: usize =
-                std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let k = lingxi_kernels::Kernels::load(dev)?;
-            let art = Arc::new(Artifact::open(main_path)?);
-            let meta = flash_next_meta();
-            let shape = layer_shape(&meta);
-            let tok_bytes = art
-                .payload("frontend/tokenizer.json")
-                .context("产物缺少 frontend/tokenizer.json")?;
-            let tok = lingxi_tokenize::Tokenizer::from_json(&tok_bytes)?;
-            let prompt_ids = tok.encode(&prompt)?;
-            let prompt_len = prompt_ids.len();
-            let endpoints = load_endpoints(&k, &art)?;
-            // ⚠️ `LINGXI_SPEC_BENCH` 那段 A/B 会**先顺序跑 n_seq 个、再投机跑 n_seq 个**
-            // ⇒ 位置最多到 `prompt_len + 2*n_seq`，比普通 decode 多一整段。
-            // 容量/rope 表按普通口径开会在投机环路里炸
-            // （实测：`QsaState 容量不足: 57 > 53`，崩在 `spec_chunk`）。
-            let spec_ab = std::env::var("LINGXI_SPEC_BENCH").is_ok();
-            let extra = if spec_ab {
-                std::env::var("LINGXI_SPEC_N").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(24)
-            } else {
-                0
-            };
-            let rope_len = prompt_len + n_new + extra + 8;
-            let tables = load_rope_tables(&k, rope_len, shape.attn.rot_dim)?;
-            let n_layers = lingxi_model::DIMS.n_layers as u32;
-            let arena_path = std::env::var("LINGXI_EXPERT_ARENA")
-                .unwrap_or_else(|_| "/dev/shm/qwen4_exp.expert-arena.q4g64.bin".to_string());
-            // ㊿-P0：未显式给槽数时走显存预算自动分配。tune_lo 在 ls_lo 定案前先用
-            // env 口径（缺省 24；无 GPU1 时 ls_lo 实为 0，此处按 24 只会**少估**槽数，安全方向）。
-            let tune_lo: u32 = std::env::var("LINGXI_LAYER_SPLIT")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
-            let slots: usize = match std::env::var("LINGXI_ARENA_SLOTS")
-                .ok().and_then(|s| s.parse().ok())
-            {
-                Some(v) => v,
-                None => match autotune_arena_slots(&art, &arena_path, 0, tune_lo, rope_len + 8)? {
-                    Some((s, ledger)) => {
-                        eprintln!("{ledger}");
-                        s
-                    }
-                    None => 7000,
-                },
-            };
-            let moe_split = lingxi_model::flag("LINGXI_MOE_SPLIT");
-            // ⚠️ 跨卡 + CUDA Graph 是**危险组合**：图是在 GPU0 的 stream 上捕获/实例化的，
-            //    GPU1 的内核一旦落进捕获区间，重放时就会在"图所属的设备"上执行 ⇒ 错乱。
-            //    当前这条路必须关图（`LINGXI_NO_GRAPHS=1`；实测关图本来就快 5%，见 §P13.3）。
-            anyhow::ensure!(
-                !moe_split || lingxi_model::flag("LINGXI_NO_GRAPHS"),
-                "LINGXI_MOE_SPLIT 必须同时设 LINGXI_NO_GRAPHS=1 —— 跨卡内核不能被 GPU0 的 CUDA Graph 捕获"
-            );
-            // GPU0 这份 arena 服务哪些层：默认全部 48 层；开跨卡/LayerSplit 时只服务前一半
-            // （否则一半的槽位会白占在 GPU1 负责的层上）。
-            let split_lo_env: u32 = std::env::var("LINGXI_MOE_SPLIT_LO")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
-            let layers_hi_env: u32 = std::env::var("LINGXI_ARENA_LAYERS_HI")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(48);
-
-            // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`，PLAN §P15 里程碑 A）：
-            //    与 `LINGXI_MOE_SPLIT`（只搬 MoE）互斥。这里必须在建 `Sequence` **之前**把
-            //    两张卡都建好 —— 因为 `[lo, n_layers)` 的**状态**要直接建在 GPU1 上。
-            // ★ P15-㉜（2026-10-17）：**双卡时默认自动开 split**（lo=24）——真实语料实测
-            //    20.7 → 54.1 tok/s（+161%：每卡 arena 减半 → 专家 miss 崩塌；bench 英文
-            //    高命中语境 −1%）。显式设 `LINGXI_LAYER_SPLIT=0` 可关（回归对照用）。
-            let ls_env: Option<u32> = std::env::var("LINGXI_LAYER_SPLIT")
-                .ok().and_then(|s| s.parse().ok());
-            let auto_split = ls_env.is_none() && !moe_split
-                && cudarc::driver::CudaContext::new(1).is_ok();
-            let ls_lo: u32 = ls_env.unwrap_or(if auto_split { 24 } else { 0 });
-            let ls_on = ls_lo > 0 && ls_lo < n_layers;
-            anyhow::ensure!(
-                !(ls_on && moe_split),
-                "LINGXI_LAYER_SPLIT 与 LINGXI_MOE_SPLIT 互斥（前者已覆盖后者的能力）"
-            );
-            if ls_on {
-                if auto_split {
-                    // ㊸：不再整体禁图——所录的图全是**单层本地段**（专家段 3 核固定槽），
-                    // 层⇄设备一一对应（key=layer*8+7 只在那一台设备上出现），捕获/重放都在
-                    // 本层自己的 stream 上；跨卡拷贝（cross_copy）在层循环之外，不进图。
-                    // 若实测判据翻车，回退 = 恢复 force_disable() 一行。
-                    eprintln!(
-                        "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%，\
-                         bench 语境 −1%；设 LINGXI_LAYER_SPLIT=0 关闭）。单层本地图保持开启。"
-                    );
-                } else {
-                    if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
-                        eprintln!(
-                            "[layer-split] 警告：未设 LINGXI_NO_GRAPHS。㊸ 起单层本地图（专家段）\
-                             在 split 下保持可用；若出现数值异常请先设 LINGXI_NO_GRAPHS=1 对照。"
-                        );
-                    }
-                }
-                // ★ P15-㉞：池已 device-aware（键=(设备,长度)）⇒ 不再需要禁池。
-                // 禁池正是 split+分块确定性发散的根因（直连 alloc/free 与在飞 kernel 竞争）。
-            }
-            let ls_k1: Option<lingxi_kernels::Kernels> =
-                if ls_on { Some(lingxi_kernels::Kernels::load(1)?) } else { None };
-            let ls_tables: Option<lingxi_driver::RopeTables> = match ls_k1.as_ref() {
-                Some(kk) => Some(load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
-                None => None,
-            };
-            // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
-            // talk 路径 KV 容量 = rope_len+8（prompt+n_new+spec 余量+16）。
-            let ls_slots: usize = match std::env::var("LINGXI_LAYER_SPLIT_SLOTS")
-                .ok().and_then(|s| s.parse().ok())
-            {
-                Some(v) => v,
-                None => match autotune_arena_slots(&art, &arena_path, 1, ls_lo, rope_len + 8)? {
-                    Some((s, ledger)) => {
-                        eprintln!("{ledger}");
-                        s
-                    }
-                    None => 9600,
-                },
-            };  // ★㊲ 工作集≥槽位判决(375/卡层)
-            let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
-                match ls_k1.as_ref() {
-                    Some(kk) => {
-                        eprintln!(
-                            "[layer-split] GPU1 上下文就绪；层 {ls_lo}..{n_layers} 整层交给它，专家槽位 {ls_slots}"
-                        );
-                        Some(Box::new(arena_source::ArenaExpertSource::new(
-                            kk,
-                            &arena_path,
-                            ls_slots,
-                            false,
-                            ls_lo..n_layers,
-                        )?))
-                    }
-                    None => None,
-                };
-            let gpu0_layers = 0..if moe_split {
-                layers_hi_env.min(split_lo_env)
-            } else if ls_on {
-                ls_lo
-            } else {
-                n_layers
-            };
-            let mut seq = lingxi_driver::Sequence::new_split(
-                &k,
-                ls_k1.as_ref().map(|kk| (kk, ls_lo)),
-                n_layers,
-                &shape,
-                rope_len + 8,
-                Some((
-                    1,
-                    meta["ple_conv_kernel_size"].as_u64().unwrap() as usize,
-                    meta["ngram_size"].as_u64().unwrap() as usize,
-                )),
-            )?;
-            let host_cache = {
-                let c = host_cache::HostCache::new(Arc::clone(&art));
-                c.start_prefetcher();
-                c.prefetch_layer_dense(0);
-                c
-            };
-            let expert_source: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
-                Some(Box::new(arena_source::ArenaExpertSource::new(&k, &arena_path, slots, false, gpu0_layers)?));
-            // ★ **跨卡 MoE**（`LINGXI_MOE_SPLIT=1`，设计见 `docs/PLAN.md` §P13.1c）：
-            //   把**后一半层**的 MoE 交给目前全空的 GPU1 跑 —— 它只有这些层的槽位，可以给到
-            //   每层 400+ 个（覆盖 ~100%、miss≈0），而 GPU0 的 9000 槽只需伺候前一半层
-            //   （每层 375 个 ⇒ ~92%）。跨卡只过 MoE 的输入/输出激活（36 KB×2/层）。
-            let split_lo: u32 = split_lo_env;
-            let split_slots: usize = std::env::var("LINGXI_MOE_SPLIT_SLOTS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(11000);
-            let k1 = if moe_split {
-                let kk = lingxi_kernels::Kernels::load(1)?;
-                eprintln!("[moe-split] GPU1 上下文就绪；层 {split_lo}..{n_layers} 的 MoE 交给它，槽位 {split_slots}");
-                Some(kk)
-            } else {
-                None
-            };
-            let split_src: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> = match k1.as_ref() {
-                // GPU1 那份 arena：只服务 `split_lo..48`（钉表也只钉这些层）⇒ 每层槽位拉满、
-                // 首触也能靠钉表省掉（**关键**：纯 LRU 时 GPU1 的首触 miss 全走 x8 链路，
-                // 实测 300 token 里 7350 次 miss ≈ 18 GB，直接把跨卡的收益吃光）。
-                Some(kk) => Some(Box::new(arena_source::ArenaExpertSource::new(
-                    kk,
-                    &arena_path,
-                    split_slots,
-                    false,
-                    split_lo..n_layers,
-                )?)),
-                None => None,
-            };
-            // 这些层在 GPU1 上的 MoE 权重（**只装 moe 段**：router + shared expert，~12 MB/层；
-            // routed 专家走 GPU1 的 arena，不在这里）
-            let mut split_moe: Vec<Option<lingxi_model::moe::MoeWeights>> =
-                (0..n_layers as usize).map(|_| None).collect();
-            if let Some(kk) = k1.as_ref() {
-                let tl = std::time::Instant::now();
-                for l in split_lo..n_layers {
-                    let canon = format!("text/layers/{l}/moe/");
-                    split_moe[l as usize] = Some(lingxi_model::moe::MoeWeights {
-                        router_shared_gate: lingxi_model::gpu::upload_any_bf16(
-                            kk, &art, &format!("{canon}router_shared_gate"))?,
-                        routed_gate_up: None,
-                        routed_down: None,
-                        shared_gate_up: lingxi_model::gpu::upload_any_bf16(
-                            kk, &art, &format!("{canon}shared_gate_up"))?,
-                        shared_down: lingxi_model::gpu::upload_any_bf16(
-                            kk, &art, &format!("{canon}shared_down"))?,
-                    });
-                }
-                eprintln!("[moe-split] GPU1 的 MoE 权重装好（{} 层，{:.1}s）", n_layers - split_lo, tl.elapsed().as_secs_f64());
-                // ⚠️ cudarc 的错误**粘在上下文上**，要等下一次 `bind_to_thread` 才吐 ⇒
-                //    初始化期（建 context/开 arena/钉页/传权重）如果有错，会一路潜伏到
-                //    后面的某次拷贝才炸、把报错点带偏。这里先清一次，保证后面报错的就是真凶。
-                kk.ctx.check_err().map_err(|e| {
-                    anyhow::anyhow!("[moe-split] GPU1 初始化阶段就有报错（见上）：{e}")
-                })?;
-            }
-            let split_stat = [
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-                std::sync::atomic::AtomicU64::new(0),
-            ];
-            let remote = match (k1.as_ref(), split_src.as_deref()) {
-                (Some(kk), Some(src)) => Some(lingxi_model::moe::RemoteMoe {
-                    k: kk,
-                    experts: src,
-                    layers: split_lo..n_layers,
-                    moe: &split_moe,
-                    stat: &split_stat,
-                }),
-                _ => None,
-            };
-            let eng = lingxi_driver::Engine {
-                k: &k,
-                shape: &shape,
-                n_layers,
-                vocab: lingxi_model::DIMS.vocab as usize,
-                endpoints: &endpoints,
-                tables: &tables,
-                experts: expert_source.as_deref(),
-                remote: remote.as_ref(),
-                k1: ls_k1.as_ref(),
-                split_lo: ls_lo,
-                tables1: ls_tables.as_ref(),
-                experts1: ls_experts.as_deref(),
-            };
-            let hc_for_build: Option<Arc<host_cache::HostCache>> = Some(host_cache.clone());
-            let build = {
-                let (kb, k1b, ab, mb) = (&k, ls_k1.as_ref(), &art, &meta);
-                let (lsb, lob) = (ls_on, ls_lo);
-                Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
-                    eprint!("\r  [load] 层 {layer}/{n_layers}        ");
-                    // ★ 全量 layer-split：本层的稠密权重必须直接装到**本层要跑的卡**上
-                    //   （装错了不会报错，只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串）。
-                    let dev_k = match (lsb, k1b) {
-                        (true, Some(kk)) if layer >= lob => kk,
-                        _ => kb,
-                    };
-                    let b = build_layer(dev_k, ab, mb, layer, true, hc_for_build.as_deref())?;
-                    if let (Some(c), true) = (&hc_for_build, layer + 1 < n_layers) {
-                        c.prefetch_layer_dense(layer + 1);
-                    }
-                    Ok(lingxi_model::trunk::LoadedLayer {
-                        weights: b.weights,
-                        k_layernorm_host: b.k_layernorm_host,
-                    })
-                })
-            };
-            let mut cache_provider =
-                DeviceLayerCache { slots: (0..n_layers as usize).map(|_| None).collect(), build };
-            let provider = &mut cache_provider;
-
-            // ── MTP：权重 + 自己的一份 KV 状态 ──
-            let mtp_art = Artifact::open(mtp_path)?;
-            let g = lingxi_model::mtp::load(&k, &mtp_art)?;
-            let mtp_q4_exp = lingxi_model::flag("LINGXI_MTP_Q4_EXPERTS");
-            let ml = build_mtp_layer(&k, &mtp_art, mtp_q4_exp)?;
-            // MTP 的小 arena：把 512 个专家从 bf16(5.03 GiB) 换成 Q4G64(1.34 GiB)，
-            // 给主干腾出专家槽位（真语料 miss 19.4% → ~11.7%）。判据：固定贪心序列必须不变。
-            let mtp_arena = if mtp_q4_exp {
-                Some(mtp_arena::MtpArena::build(&k, &mtp_art)?)
-            } else {
-                None
-            };
-            let mut mst = lingxi_model::layer::LayerStates::for_kind(
-                &k,
-                lingxi_ids::LayerKind::QsaSparseAttention,
-                &shape,
-                rope_len + 8,
-                None,
-            )?;
-            let vocab = lingxi_model::DIMS.vocab as usize;
-            let hidden = shape.hidden;
-            let dim = shape.hc * hidden;
-            // `LINGXI_MTP_STATS=1`：打印 draft 三站（stem 输出 / 层输出 / mixer 输出）的量级。
-            // 白盒第一步 —— 哪一站尺度离谱就直接定位到那一段，不必先写 oracle。
-            let mtp_stats = std::env::var("LINGXI_MTP_STATS").is_ok();
-            let stat = |tag: &str, d: &cudarc::driver::CudaSlice<half::bf16>| -> Result<()> {
-                let h: Vec<half::bf16> = k.stream.clone_dtoh(d)?;
-                let f: Vec<f32> = h.iter().map(|v| v.to_f32()).collect();
-                let mean = f.iter().sum::<f32>() / f.len() as f32;
-                let sd = (f.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / f.len() as f32).sqrt();
-                let mx = f.iter().fold(0f32, |a, v| a.max(v.abs()));
-                eprintln!("    [mtp-stats] {tag:<14} n={} mean={mean:+.4} std={sd:.4} max|x|={mx:.3}", f.len());
-                Ok(())
-            };
-            let embed1 = |k: &lingxi_kernels::Kernels, id: i64| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
-                let d = k.stream.clone_htod(&[id as i32])?;
-                let mut e = k.stream.alloc_zeros::<half::bf16>(hidden)?;
-                k.gather_rows_bf16(&endpoints.token_embedding, &d, &mut e, 1, hidden, 0)?;
-                Ok(e)
-            };
-            // MTP 一步：`(Rin[t,dim], emb[t,H])` → （argmax, 每行 logits 的 **top-K 下标**, 本层输出 `out`）
-            // 返回 `out` 是为了**草稿链**：下一枚草稿的 h 输入就是它（MTP 自喂自）。
-            // 返回 top-K 是为了**量"多候选/树草稿"的天花板** —— top-1 命中率会低估草稿头
-            // （分布可能全对，只是 argmax 差一两位）。
-            //
-            // `need_head=false`：**只要层的输出 `o`**（用来刷 MTP 自己的 KV），
-            // 不算 head、不 D2H、不做 host 侧的 argmax/top-K/softmax。
-            // 这一条是实测出来的大头：host 侧要对 `t×248320` 个 logits 做多趟标量处理
-            // （`clone_dtoh` 同步拷贝 + f32 转换 + argmax + top-K + softmax 的 248K 次 `exp()`），
-            // **比主干一整层（0.57 ms）还贵**。而**重放格的 token id 根本没用**（只用来刷 KV）。
-            const MTP_KTOP: usize = 20;
-            // prompt 相位的 top-K 存档（`mtp_step` 一次给 t 行的 top-K；这里只需要那一次）
-            thread_local! {
-                static TOPK_P: std::cell::RefCell<Vec<Vec<u32>>> =
-                    const { std::cell::RefCell::new(Vec::new()) };
-                /// `LINGXI_MTP_CHAIN_DIAG=hhcmp` 用：草稿链第 0 步的 `o`（= 自喂量）
-                static O0_SAVE: std::cell::RefCell<
-                    Option<cudarc::driver::CudaSlice<half::bf16>>,
-                > = const { std::cell::RefCell::new(None) };
-                /// `LINGXI_SUFFIX_TRACE` 用：本轮查表提议的内容（到 verify 之后与真值对照）
-                static SD_TRACE: std::cell::RefCell<Option<Vec<i32>>> =
-                    const { std::cell::RefCell::new(None) };
-            }
-            let mtp_step = |mst: &mut lingxi_model::layer::LayerStates,
-                                hyper: &cudarc::driver::CudaSlice<half::bf16>,
-                                emb: &cudarc::driver::CudaSlice<half::bf16>,
-                                t: usize,
-                                ids: &[i64],
-                                need_head: bool|
-             -> Result<(
-                Vec<u32>,
-                Vec<Vec<u32>>,
-                Vec<f32>,
-                cudarc::driver::CudaSlice<half::bf16>,
-            )> {
-                // `LINGXI_KTS=1`：把草稿一步拆成三段**真 GPU 时间**（层+stem / mixer+head / host 侧）。
-                // 为什么必须测：按内核逐项估只算得出 ~7 ms/轮，而实测草稿是 14.1 ms/轮 —— 差 7 ms 不明。
-                let kts_mtp = lingxi_model::flag("LINGXI_KTS");
-                if kts_mtp {
-                    k.stream.synchronize()?;
-                }
-                let t_mtp0 = std::time::Instant::now();
-                let r = lingxi_model::mtp::stem(&k, &g, hyper, emb, t, shape.eps)?;
-                if mtp_stats {
-                    stat("stem R", &r)?;
-                }
-                let env = lingxi_model::layer::LayerEnv {
-                    cos: &tables.cos,
-                    sin: &tables.sin,
-                    cos_host: &tables.cos_host,
-                    sin_host: &tables.sin_host,
-                    remote: None,
-                    causal_host: &[],
-                    k_layernorm_host: &ml.k_layernorm_host,
-                    ids,
-                    experts: mtp_arena
-                        .as_ref()
-                        .map(|a| a as &dyn lingxi_model::moe::ExpertSource),
-                };
-                // ⚠️ **层号必须用哨兵值**：`layer_step` 的层号决定 (a) CUDA Graph 的键、
-                // (b) `graph::take_fixed(layer*8+slot)` 的固定缓冲。MTP 若用 `layer=0`，
-                // 就会和**主干 layer 0** 共用图/缓冲 ⇒ 主干 layer 0 被写坏（实测：开图时
-                // 第二个 token 就错，关图（LINGXI_NO_GRAPHS=1）就正确）。
-                const MTP_LAYER_SENTINEL: u32 = 100;
-                let out = lingxi_model::layer::layer_step(
-                    &k, &ml.weights, &shape, &r, t, &env, mst, MTP_LAYER_SENTINEL,
-                )?;
-                if mtp_stats {
-                    stat("layer out", &out)?;
-                }
-                if kts_mtp {
-                    k.stream.synchronize()?;
-                }
-                let d_layer = t_mtp0.elapsed().as_secs_f64() * 1e3;
-                let t_mtp1 = std::time::Instant::now();
-                lingxi_model::scratch::put_bf16(r);
-                if !need_head {
-                    return Ok((Vec::new(), Vec::new(), Vec::new(), out));
-                }
-                // 【实验 LINGXI_MTP_GMIX=1】§3.64：末步该用**全局** mixer
-                // (`text/hyper_connection_mixer`，主干喂输出头前的那一站) 还是 MTP 自带的 `mtp/mixer`？
-                // Strata（已验证能跑投机的实现）读的是全局那套 ⇒ 开关切换以对拍；默认保持现状。
-                let fmix: &lingxi_model::gr::GrWeights = if lingxi_model::flag("LINGXI_MTP_GMIX") {
-                    &endpoints.mixer
-                } else {
-                    &ml.mixer
-                };
-                let (mixed, injw) = lingxi_model::gr::gated_residual_forward(
-                    &k, fmix, &out, t as u32, dim, hidden, shape.hc, shape.lowrank, shape.eps,
-                )?;
-                if let Some(j) = injw {
-                    lingxi_model::scratch::put_bf16(j);
-                }
-                if mtp_stats {
-                    stat("mixer mixed", &mixed)?;
-                    stat("  h 输入", hyper)?;
-                }
-                let mut logits = k.stream.alloc_zeros::<half::bf16>(t * vocab)?;
-                if let Some(wq) = &endpoints.output_head_q4 {
-                    lingxi_model::gpu::proj_q4_epi(&k, &mixed, wq, &mut logits, vocab, hidden, 0, t, 0, 0.0, 0.0)?;
-                } else {
-                    lingxi_model::gpu::proj_t1(&k, &mixed, &endpoints.output_head, &mut logits, vocab, hidden, t)?;
-                }
-                lingxi_model::scratch::put_bf16(mixed);
-                if kts_mtp {
-                    k.stream.synchronize()?;
-                }
-                let d_head = t_mtp1.elapsed().as_secs_f64() * 1e3;
-                let t_mtp2 = std::time::Instant::now();
-                // ★ P15-⑮：top-K 移进 GPU（两段式），免去整幅 logits 的 D2H + host topk
-                // （KTS 实测 host 段 0.7 ms/步）。**位等价**：与 `topk_bf16_row` 同一全序
-                // （f32 值降序、下标升序）⇒ 结果唯一；非有限值计进 `bad` 并在此报错（与原
-                // `ensure!(is_finite)` 同效）。`LINGXI_HOST_TOPK=1` 回退老路做 A/B。
-                let mut d: Vec<u32> = Vec::with_capacity(t);
-                let mut tk: Vec<Vec<u32>> = Vec::with_capacity(t);
-                let mut probs: Vec<f32> = Vec::with_capacity(t);
-                if !lingxi_model::flag("LINGXI_HOST_TOPK") {
-                    const G: usize = 64;
-                    let kk = MTP_KTOP;
-                    let mut pval = lingxi_model::scratch::f32(&k, t * G * kk)?;
-                    let mut pidx = lingxi_model::scratch::i32(&k, t * G * kk)?;
-                    let mut oval = lingxi_model::scratch::f32(&k, t * kk)?;
-                    let mut oidx = lingxi_model::scratch::i32(&k, t * kk)?;
-                    let mut bad = k.stream.alloc_zeros::<i32>(1)?;
-                    k.topk_rows_part_bf16(&logits, &mut pval, &mut pidx, &mut bad, t, vocab, G, kk)?;
-                    k.topk_rows_fin(&pval, &pidx, &mut oval, &mut oidx, t, G, kk)?;
-                    let vals: Vec<f32> = k.stream.clone_dtoh(&oval)?;
-                    let idxs: Vec<i32> = k.stream.clone_dtoh(&oidx)?;
-                    let bad_h: Vec<i32> = k.stream.clone_dtoh(&bad)?;
-                    anyhow::ensure!(bad_h[0] == 0, "logits 出现非有限值（GPU topk 计数 {}）", bad_h[0]);
-                    lingxi_model::scratch::put_f32(pval);
-                    lingxi_model::scratch::put_i32(pidx);
-                    lingxi_model::scratch::put_f32(oval);
-                    lingxi_model::scratch::put_i32(oidx);
-                    for r in 0..t {
-                        let top: Vec<(f32, u32)> =
-                            (0..kk).map(|j| (vals[r * kk + j], idxs[r * kk + j] as u32)).collect();
-                        // 与原来完全同式：只用已算出的 top-K，`p ≈ 1/(1+Σ exp(l_j − l_0))`
-                        let l0 = top[0].0;
-                        let mut s = 0f64;
-                        for &(v, _) in top.iter().skip(1) {
-                            s += ((v - l0) as f64).exp();
-                        }
-                        probs.push((1.0 / (1.0 + s)) as f32);
-                        d.push(top[0].1);
-                        tk.push(top.iter().map(|&(_, i)| i).collect());
-                    }
-                } else {
-                let lh: Vec<half::bf16> = lingxi_model::scratch::download_bf16(&k, &logits)?;
-                // ★ **单趟**取代原来的「建 f32 Vec + argmax + topk」三趟（KTS 实测 0.90 ms/步）。
-                // `topk_bf16_row` 的口径与 `topk_rows` 逐位相同；有限性校验也并进这一趟。
-                for r in 0..t {
-                    let top =
-                        lingxi_model::trunk::topk_bf16_row(&lh[r * vocab..(r + 1) * vocab], MTP_KTOP)?;
-                    anyhow::ensure!(!top.is_empty(), "MTP topk 为空（vocab={vocab}）");
-                    // 与原来完全同式：只用已算出的 top-K，`p ≈ 1/(1+Σ exp(l_j − l_0))`
-                    let l0 = top[0].0;
-                    let mut s = 0f64;
-                    for &(v, _) in top.iter().skip(1) {
-                        s += ((v - l0) as f64).exp();
-                    }
-                    probs.push((1.0 / (1.0 + s)) as f32);
-                    d.push(top[0].1);
-                    tk.push(top.iter().map(|&(_, i)| i).collect());
-                }
-                }
-                if kts_mtp {
-                    eprintln!(
-                        "      [kts-mtp t={t}] 层+stem {:.2} | mixer+head {:.2} | **host(D2H+argmax/topk) {:.2}** ms",
-                        d_layer,
-                        d_head,
-                        t_mtp2.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                Ok((d, tk, probs, out))
-            };
-
-            // ── 主干 prefill（同时拿到 T 行的 hyper）──
-            let (mut trunk_next, hyper_p) = seq.prefill_with_hyper(&eng, &prompt_ids, provider)?;
-            eprintln!("\nprefill {prompt_len} token，首 token = {trunk_next}");
-            // prompt 相位：位置 i 喂 (h_i, ids[i+1]) —— 即"下一个 token"的 embedding
-            let mut ids_p = seq.ids.clone();
-            if ids_p.len() < prompt_len + 1 {
-                ids_p.push(trunk_next);
-            }
-            let emb_p = {
-                let idx: Vec<i32> = ids_p[1..prompt_len + 1].iter().map(|&v| v as i32).collect();
-                let d = k.stream.clone_htod(&idx)?;
-                let mut e = k.stream.alloc_zeros::<half::bf16>(prompt_len * hidden)?;
-                k.gather_rows_bf16(&endpoints.token_embedding, &d, &mut e, prompt_len, hidden, 0)?;
-                e
-            };
-            // ══════════ (b) 诊断：喂给 MTP 的 `h` 是否**逐行位置对齐** ══════════
-            // 自洽判据（不需要外部 oracle）：主干自己在位置 i 的 `h`，过「全局 mixer + lm_head」
-            // 后的 argmax 必须 == 该位置**真实的下一个 token** `ids_p[i+1]`
-            // （主干贪心能逐位复现 prompt 续写，golden 就是这么来的）。
-            //   逐行命中 ⇒ 我们喂 MTP 的 `hyper` 行与位置一一对应，且与主干喂头的那份**同源**；
-            //   错位/系统偏 ⇒ 问题就在 (b)（h 的来源或节奏）。
-            {
-                let (mixed_h, injw_h) = lingxi_model::gr::gated_residual_forward(
-                    &k, &endpoints.mixer, &hyper_p, prompt_len as u32, dim, hidden,
-                    shape.hc, shape.lowrank, shape.eps,
-                )?;
-                if let Some(j) = injw_h {
-                    lingxi_model::scratch::put_bf16(j);
-                }
-                let mut logits_h = k.stream.alloc_zeros::<half::bf16>(prompt_len * vocab)?;
-                if let Some(wq) = &endpoints.output_head_q4 {
-                    lingxi_model::gpu::proj_q4_epi(
-                        &k, &mixed_h, wq, &mut logits_h, vocab, hidden, 0, prompt_len, 0, 0.0, 0.0,
-                    )?;
-                } else {
-                    lingxi_model::gpu::proj_t1(
-                        &k, &mixed_h, &endpoints.output_head, &mut logits_h, vocab, hidden, prompt_len,
-                    )?;
-                }
-                lingxi_model::scratch::put_bf16(mixed_h);
-                let lh: Vec<half::bf16> = k.stream.clone_dtoh(&logits_h)?;
-                let lf: Vec<f32> = lh.iter().map(|v| v.to_f32()).collect();
-                let am = lingxi_model::trunk::argmax_rows(&lf, prompt_len, vocab);
-                let (mut ok, mut tot) = (0usize, 0usize);
-                for i in 0..prompt_len {
-                    if i + 1 >= ids_p.len() {
-                        break;
-                    }
-                    let want = ids_p[i + 1] as u32;
-                    tot += 1;
-                    if want == am[i] {
-                        ok += 1;
-                    }
-                    if i < 6 {
-                        eprintln!(
-                            "  [h 对齐] 行{i}: 真实下个={want} h-argmax={} {}",
-                            am[i],
-                            if want == am[i] { "✓" } else { "✗" }
-                        );
-                    }
-                }
-                eprintln!(
-                    "  [h 对齐] **主干 h(行i) 过 mixer+head 的 argmax == ids[i+1] 命中 {ok}/{tot}**"
-                );
-            }
-            // h 的"身份"候选（两条线索打架，实测裁）：
-            //   `hyper`（默认）：48 层后的**残差栈** [T,10240]（Strata 的 window_R_ 就叫 residual）
-            //   `mixed`：层尾 mixer 的产物 [T,2560] **repeat 到 10240**
-            //            （llama.cpp 说 h 是"喂 lm_head 的 post-norm hidden"，而本模型无最终 norm）
-            let mtp_h_mixed =
-                std::env::var("LINGXI_MTP_H").map(|v| v == "mixed").unwrap_or(false);
-            eprintln!(
-                "MTP 的 h 候选：{}",
-                if mtp_h_mixed { "mixed(repeat 到 10240)" } else { "hyper(残差栈)" }
-            );
-            let h_prep = |hyper: &cudarc::driver::CudaSlice<half::bf16>,
-                          t: usize|
-             -> Result<cudarc::driver::CudaSlice<half::bf16>> {
-                let mut hb = lingxi_model::scratch::bf16(&k, t * dim)?;
-                if mtp_h_mixed {
-                    let (mixed, injw) = lingxi_model::gr::gated_residual_forward(
-                        &k, &endpoints.mixer, hyper, t as u32, dim, hidden, shape.hc,
-                        shape.lowrank, shape.eps,
-                    )?;
-                    if let Some(j) = injw {
-                        lingxi_model::scratch::put_bf16(j);
-                    }
-                    k.hc_repeat_bf16(&mixed, &mut hb, t, hidden, shape.hc)?;
-                    lingxi_model::scratch::put_bf16(mixed);
-                } else {
-                    k.stream.memcpy_dtod(hyper, &mut hb)?;
-                }
-                Ok(hb)
-            };
-            let drafts_p = {
-                let h_p = h_prep(&hyper_p, prompt_len)?;
-                lingxi_model::scratch::put_bf16(hyper_p);
-                let (d, tk, _pr, o) = mtp_step(&mut mst, &h_p, &emb_p, prompt_len, &seq.ids, true)?;
-                lingxi_model::scratch::put_bf16(o);
-                lingxi_model::scratch::put_bf16(h_p);
-                TOPK_P.with(|c| *c.borrow_mut() = tk);
-                d
-            };
-            let mut pending: i64 = drafts_p[prompt_len - 1] as i64; // 最后一个 prompt 位置的草稿
-            // ── **强核对（真值，无需主干 rollout）** ──
-            // prompt 相位：行 i 喂的是 (h_i, emb(ids[i+1]))，语义上应预测 **ids[i+2]**
-            // ⇒ 每个 prompt 行的期望值是**已知的**，一次前向可得 ~prompt_len 个独立样本。
-            //   这里命中率高 ⇒ 草稿头本身对，问题在 decode 段的喂法/索引；
-            //   这里也≈0    ⇒ 草稿头本身有问题（与 §3.60"必是范畴性错误"一致）。
-            {
-                let (mut ok, mut tot) = (0usize, 0usize);
-                let n = prompt_len.saturating_sub(2);
-                for i in 0..n {
-                    let (want, got) = (ids_p[i + 2] as i64, drafts_p[i] as i64);
-                    tot += 1;
-                    if want == got {
-                        ok += 1;
-                    }
-                    if i < 6 || i + 3 >= prompt_len {
-                        eprintln!(
-                            "  [prompt 核对] 行{i}: 期望={want} 草稿={got} {}",
-                            if want == got { "✓" } else { "✗" }
-                        );
-                    }
-                }
-                eprintln!(
-                    "  [prompt 核对] **MTP 在已知真值上的命中 {ok}/{tot} = {:.3}**",
-                    if tot > 0 { ok as f64 / tot as f64 } else { 0.0 }
-                );
-                // ── **top-N 命中率**（回答"该不该做多候选/树草稿"）──
-                // 判据：主干真值 `ids_p[i+2]` 是否落在 MTP 该行 logits 的 **top-N** 里。
-                // 若 top-1 低而 top-8/top-16 高 ⇒ 草稿**分布是对的**，只是 argmax 差一两位
-                // ⇒ 多候选（树）草稿有真收益；若 top-20 也只高一点 ⇒ 分布本身偏了，树也没用。
-                // ⚠️ 本轮样本 = 1 个 prompt 的 (prompt_len-2) 行，**统计上很薄**；
-                //    要看"不同专家/上下文"的差异必须换多个 prompt 各跑一遍再合。
-                {
-                    const NS: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
-                    let mut hit = [0usize; 7];
-                    let n = prompt_len.saturating_sub(2);
-                    TOPK_P.with(|c| -> Result<()> {
-                        let tk = c.borrow();
-                        for i in 0..n {
-                            let want = ids_p[i + 2] as u32;
-                            let Some(row) = tk.get(i) else { continue };
-                            for (j, &nn) in NS.iter().enumerate() {
-                                if row.iter().take(nn).any(|&x| x == want) {
-                                    hit[j] += 1;
-                                }
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    eprintln!("  [top-N 命中] 真值落在 MTP 该行 logits 的 top-N 里（n={n}）：");
-                    for (j, &nn) in NS.iter().enumerate() {
-                        eprintln!(
-                            "      top-{nn:<2} {}/{} = {:.3}{}",
-                            hit[j],
-                            n,
-                            if n > 0 { hit[j] as f64 / n as f64 } else { 0.0 },
-                            if nn == 1 { "   ← 贪心接受率就是它" } else { "" }
-                        );
-                    }
-                }
-                // ── 目标偏移扫描（零额外算力）：草稿到底"对上"了 ids 的哪一个偏移？ ──
-                // 若命中集中在 k≠0，说明喂进去的 (h, tok) 与目标之间差了一个位置
-                // （tok 差一格 → k=-1；h 差一格 → k=+1）。全 0 才说明草稿真的算错了。
-                eprintln!("  [偏移扫描] drafts_p[i] 命中 ids_p[i+2+k] 的计数：");
-                for k in -2i64..=2i64 {
-                    let (mut okk, mut totk) = (0usize, 0usize);
-                    for i in 0..prompt_len {
-                        let tgt = i as i64 + 2 + k;
-                        if tgt < 0 || tgt as usize >= ids_p.len() {
-                            continue;
-                        }
-                        totk += 1;
-                        if drafts_p[i] as i64 == ids_p[tgt as usize] {
-                            okk += 1;
-                        }
-                    }
-                    eprintln!(
-                        "      k={k:+}: {okk}/{totk} = {:.3}{}",
-                        if totk > 0 { okk as f64 / totk as f64 } else { 0.0 },
-                        if k == 0 { "   ← 当前口径" } else { "" }
-                    );
-                }
-                if prompt_len >= 2 {
-                    let last = prompt_len - 1;
-                    eprintln!(
-                        "  [prompt 核对] 注：最后一行(行{last})预测的是 ids[{}]（未知），而首个 decode 步该要的是 ids[{prompt_len}] 的草稿 ⇒ 应为 drafts_p[{}]",
-                        prompt_len + 1,
-                        prompt_len.saturating_sub(2)
-                    );
-                }
-            }
-            // ══════════════ 投机（speculative）机械：正确性核对 + 一轮成本 ══════════════
-            let spec_ple = Some((
-                1u32,
-                meta["ple_conv_kernel_size"].as_u64().unwrap() as usize,
-                meta["ngram_size"].as_u64().unwrap() as usize,
-            ));
-            if let Ok(ks) = std::env::var("LINGXI_MTP_SPEC") {
-                // ── 真实投机环路（MTP 草稿链）──
-                // 每轮：① MTP 草稿 k 个（自喂自链）② 主干一次批前向验证 ③ 数出接受前缀
-                //      ④ 提交：主干状态回卷 + MTP 的 KV cell 用**主干的 h** 重放（否则下一轮建立在错 KV 上）
-                let kd: usize = ks.parse().unwrap_or(6);
-                let t_max = kd + 1;
-                let n_gen = n_new.max(kd + 1);
-                let mut sb = seq.spec_prepare(&eng, provider, t_max)?;
-                // 起手：吃掉 prefill 吐的 pending，同时拿到主干在**那一行**的 h（草稿链的 h 输入）
-                let (tok_first, hyper0) = seq.decode_token_with_hyper(&eng, provider)?;
-                let mut h_last = h_prep(&hyper0, 1)?;
-                lingxi_model::scratch::put_bf16(hyper0);
-                let mut out_tokens: Vec<i64> = vec![tok_first];
-                let (mut n_round, mut acc_sum) = (0usize, 0usize);
-                // 分段计时（均值）：草稿链 / 主干验证 / 提交 / MTP 重放
-                let (mut t_draft, mut t_chunk, mut t_commit, mut t_resync) = (0f64, 0f64, 0f64, 0f64);
-                // ── 链上**逐位**接受率（回答用户提的"长度可能也不一样"）──
-                //   reached[j] = 有多少轮**走到了第 j 位**（第 0..j-1 位全接受）
-                //   hit1[j]    = 其中第 j 位 top-1 命中 ⇒ 条件接受率 = hit1[j]/reached[j]
-                //   hitn[j][..] = 其中真值落在该位草稿 **top-N** 里（N=1,2,3,5,8,10,20）
-                // ⚠️ 条件接受率**天然随 j 递减**（越深越难），所以必须报"分母 = reached"，
-                //    否则第 3 位之后的数字会被分母缩水而看着像"突然崩掉"。
-                const NS_SPEC: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
-                let mut reached = vec![0usize; kd];
-                let mut hit1 = vec![0usize; kd];
-                let mut hitn = vec![[0usize; NS_SPEC.len()]; kd];
-                // oracle 链（`LINGXI_MTP_CHAIN_DIAG=oracle`）：h 与 tok 都换成**主干真值**
-                let mut or_reached = vec![0usize; kd];
-                let mut or_hit = vec![0usize; kd];
-                // `hhcmp` 累积器：自喂量 o0 vs 主干真 h(hyper_rows[0]) 的 cos / 相对误差 / 归一化 std
-                let (mut hhc_n, mut hhc_cos, mut hhc_rel, mut hhc_a, mut hhc_b) =
-                    (0usize, 0f64, 0f64, 0f64, 0f64);
-                // 草稿概率 vs 实际接受（按 prob1 分桶；回答"模型知道自己第几位开始不确定吗"）
-                let mut pb_n = [0usize; 4];
-                let mut pb_hit = [0usize; 4];
-                let mut pb_n0 = [0usize; 4];
-                let mut pb_hit0 = [0usize; 4];
-                // ── ★ 后缀查表草稿（Strata `--suffix-draft`，他那边默认开）──
-                // 见 `lingxi_model::suffix` 的模块说明与 `probes.rs` 的登记项。
-                // `sd_cursor`：历史里已经喂进查表器的位置游标（`seq.ids` 是单调前推的）。
-                // ⚠️ **默认 0 = 关**（这是本轮的实测教训，别急着开）：
-                //   查表本身是对的（`LINGXI_SUFFIX_TRACE=1` 实测提议 `[369,11751,13]` vs 真值同、
-                //   `[369,44299,13,561,6511,314]` vs 真值同 ⇒ 3/3、3/4、6/6 命中），
-                //   但**接受是前缀式的**：把 lookup 草稿挂在 MTP 链后面，只有整条 MTP 链先被接受
-                //   才轮得到它 ⇒ 实测"提议 7 枚、接受 0 枚"，而且白付了行钱（47.4 → 44.3 tok/s）。
-                //   参考实现用的是 `DraftPolicy`（`spec/draft_policy.hpp`）的**两种策略**，我们都还没做：
-                //     ① `choose(t_mtp, lookup_k, match)`：匹配够长时 **用 lookup 顶掉整个 MTP 窗**
-                //        （省掉草稿链的时间，且第一枚就高置信）；
-                //     ② `chain(t_mtp, p_mtp, k_avail, match)`：**只在 `p_mtp`（整条 MTP 链都成立的概率）
-                //        够高时**才追加，且要用"按匹配长度分桶的历史命中率 c"算期望收益 > 成本才追加。
-                //   ⇒ 下一步：实现 ①（`--suffix-draft` 的本命用法），见 PLAN.md §P9.5c。
-                let sd_min: usize = std::env::var("LINGXI_SUFFIX_DRAFT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                // 想让它"补几位"：0 = 不设限（把 MTP 被闸门砍掉的空位全补上）
-                let sd_chain: usize = std::env::var("LINGXI_SUFFIX_CHAIN")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                let mut sd = lingxi_model::suffix::SuffixDrafter::new(sd_min.max(2));
-                let mut sd_cursor = 0usize;
-                let (mut sd_prop, mut sd_acc, mut sd_rounds) = (0usize, 0usize, 0usize);
-                let mut mtp_len = 0usize; // 本轮 MTP 链（闸门后）产出的草稿数
-                let t0 = std::time::Instant::now();
-                while out_tokens.len() < n_gen {
-                    seq.spec_snapshot(&eng, &mut sb)?;
-                    let pending = *seq.ids.last().unwrap();
-                    // ★ 后缀查表：把"刚确认下来的 token"（含当前 pending）补进历史。
-                    // `seq.ids` 是单调前推的（已提交前缀不会被改写），所以游标式追加不会重复。
-                    if sd_min > 0 && seq.ids.len() > sd_cursor {
-                        let tail: Vec<i32> =
-                            seq.ids[sd_cursor..].iter().map(|&v| v as i32).collect();
-                        sd.append(&tail);
-                        sd_cursor = seq.ids.len();
-                    }
-                    let mlen0 = match &mst.attn {
-                        lingxi_model::layer::AttnState::Qsa(q) => q.len,
-                        _ => 0,
-                    };
-                    // ① 草稿链
-                    // `LINGXI_KTS=1`：**前一个 sync 吃掉"上一段遗留的等待"，尾部 sync 量出本段真 GPU 时间**。
-                    // 默认（不叠 KTS）这里只是 CPU 入队时间 —— 段与段会互相借时间（PLAN §0 测量纪律）。
-                    let kts_spec = lingxi_model::flag("LINGXI_KTS");
-                    if kts_spec {
-                        k.stream.synchronize()?;
-                    }
-                    let ta = std::time::Instant::now();
-                    let mut drafts: Vec<i64> = Vec::with_capacity(kd);
-                    // 每一步的 top-K（用来量"链上第 j 位：真值在草稿 top-N 里吗"）
-                    let mut draft_top: Vec<Vec<u32>> = Vec::with_capacity(kd);
-                    // 每步草稿的 top-1 概率（参考实现用它当"链到几位"的闸门）
-                    let mut probs_chain: Vec<f32> = Vec::with_capacity(kd);
-                    // ── 【归因诊断】`LINGXI_MTP_CHAIN_DIAG=noh|nokv|…`（数学作废，只为定位）──
-                    // 链上第 0 位 0.97（≈单步 0.95）但**第 1 位塌到 0.57**，且 top-20 也只 0.89
-                    // ⇒ 是"自喂那步的状态偏了"。两个嫌疑：
-                    //   `noh` ：自喂的 h（MTP 层的输出）本身不该这么用 ⇒ 每步都沿用第 0 步的 h
-                    //   `nokv`：第 0 步 append 的那个 KV cell 污染了第 1 步的注意力
-                    //           ⇒ 每步先把 MTP 的 QSA 回卷到轮前（只留 pre-round 上下文）
-                    // 若 `noh` 把第 1 位救回 ~0.95 ⇒ 是 h；若 `nokv` 救回 ⇒ 是 KV；都不动 ⇒ 另找。
-                    let diag = std::env::var("LINGXI_MTP_CHAIN_DIAG").unwrap_or_default();
-                    let diag_noh = diag.contains("noh");
-                    let diag_nokv = diag.contains("nokv");
-                    // `LINGXI_SPEC_MIN_P`：草稿自己的 top-1 概率低于阈值就**停链**（参考实现 Strata
-                    // `generate.cpp:9172` 的 `--spec-min-p`）。实测依据（prob1 vs 实际接受）：
-                    //   ≥0.90 → 0.988 ｜ 0.70~0.90 → 0.750 ｜ 0.50~0.70 → 0.250 ｜ <0.50 → 0.278
-                    // ⇒ 深位的低概率草稿几乎不被接受，砍掉它们**不丢接受数、但省下来的是"行"**。
-                    let min_p: f32 = std::env::var("LINGXI_SPEC_MIN_P")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0.0);
-                    // 【调试】开了闸门就逐轮打轨迹：截短链后报 `MTP logits 非有限值`，
-                    // 需要看清 mlen0 / MTP 的 len / keep 三者的口径在哪一轮对不齐。
-                    // 调试轨迹只打前 6 轮（够看清口径；开闸门时不刷屏）
-                    if min_p > 0.0 && n_round < 6 {
-                        let mst_len = match &mst.attn {
-                            lingxi_model::layer::AttnState::Qsa(q) => q.len,
-                            _ => usize::MAX,
-                        };
-                        eprintln!(
-                            "    [min-p] 轮 {n_round} 起手: mlen0={mlen0} mst.len={mst_len} seq.ids.len={}",
-                            seq.ids.len()
-                        );
-                    }
-                    let mut h_in = lingxi_model::scratch::bf16(&k, dim)?;
-                    k.stream.memcpy_dtod(&h_last, &mut h_in)?;
-                    // ★ `DraftPolicy::choose`（参考实现 `spec/draft_policy.hpp` 的第一条策略）：
-                    //   **匹配够长时用 lookup 顶掉整个 MTP 窗**。
-                    //   为什么必须有它：查表草稿挂在 MTP 链**后面**是没用的——接受是前缀式的，
-                    //   只有整条 MTP 链先被接受才轮得到它（实测"提议 7 枚、接受 0 枚"）。
-                    //   当上下文里有长重复时（改代码/引号原文/工具 JSON/枚举），
-                    //   **lookup 的第 0 枚置信度远高于 MTP 的自喂链**，此时应该整窗换成 lookup，
-                    //   还顺带省掉草稿链的时间。
-                    //   不设 `LINGXI_SUFFIX_CHOOSE` ⇒ 行为完全不变。
-                    let sd_choose: usize = std::env::var("LINGXI_SUFFIX_CHOOSE")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    let mut chose = false;
-                    if sd_choose > 0 {
-                        let mut lk: Vec<i32> = Vec::new();
-                        let n_lk = sd.propose(kd, &mut lk);
-                        if n_lk >= sd_choose {
-                            // 用 lookup 顶掉整窗：不跑 MTP 链
-                            drafts.extend(lk[..n_lk.min(kd)].iter().map(|&v| v as i64));
-                            chose = true;
-                            sd_prop += n_lk;
-                            sd_rounds += 1;
-                            if lingxi_model::flag("LINGXI_SUFFIX_TRACE") && sd_rounds <= 12 {
-                                eprintln!("    [suffix] choose 整窗 {:?}（无 MTP）", &lk[..n_lk.min(kd)]);
-                            }
-                        }
-                    }
-                    let mut h_step0 = lingxi_model::scratch::bf16(&k, dim)?;
-                    k.stream.memcpy_dtod(&h_in, &mut h_step0)?;
-                    let mut tok = pending;
-                    for _ in 0..(if drafts.is_empty() { kd } else { 0 }) {
-                        if diag_nokv {
-                            if let lingxi_model::layer::AttnState::Qsa(q) = &mut mst.attn {
-                                q.rewind(mlen0);
-                            }
-                        }
-                        let emb = embed1(&k, tok)?;
-                        let (d, tk, pr, o) = mtp_step(&mut mst, &h_in, &emb, 1, &seq.ids, true)?;
-                        lingxi_model::scratch::put_bf16(emb);
-                        lingxi_model::scratch::put_bf16(h_in);
-                        drafts.push(d[0] as i64);
-                        draft_top.push(tk.into_iter().next().unwrap_or_default());
-                        probs_chain.push(pr.first().copied().unwrap_or(0.0));
-                        // 概率闸门：这一步的草稿自己就不确定 ⇒ 再往下链没意义（省"行"）
-                        if min_p > 0.0 && probs_chain.last().copied().unwrap_or(1.0) < min_p {
-                            // ⚠️ 必须把 `o` 挂到 `h_in` 上再 break：`h_in` 在上面已经被
-                            //    `put_bf16` 移走了，直接 break 会让循环后的 `put_bf16(h_in)` 报 E0382
-                            h_in = o;
-                            break;
-                        }
-                        tok = d[0] as i64;
-                        if diag_noh {
-                            // 不采纳自喂的 h：每一步都回到第 0 步的 h
-                            lingxi_model::scratch::put_bf16(o);
-                            h_in = lingxi_model::scratch::bf16(&k, dim)?;
-                            k.stream.memcpy_dtod(&h_step0, &mut h_in)?;
-                        } else {
-                            // `hhcmp`：留一份第 0 步的 `o`（自喂量），后面与主干真 h 比数值
-                            if diag.contains("hhcmp") {
-                                let mut o0 = lingxi_model::scratch::bf16(&k, dim)?;
-                                k.stream.memcpy_dtod(&o, &mut o0)?;
-                                O0_SAVE.with(|c| *c.borrow_mut() = Some(o0));
-                            }
-                            // ⚠️ **自喂量也必须过同一个 `h_prep`**：否则 `LINGXI_MTP_H=mixed`
-                            // 只影响第 0 步、第 1 步起偷偷回退到 hyper —— 是个"静默不一致"，
-                            // 让那个开关的 A/B 结论完全不可信。默认（hyper）时 h_prep 是恒等，
-                            // 所以这里**只在 mixed 模式下多一次拷贝**，默认路径逐位不变。
-                            if mtp_h_mixed {
-                                let o_prep = h_prep(&o, 1)?;
-                                lingxi_model::scratch::put_bf16(o);
-                                h_in = o_prep;
-                            } else {
-                                h_in = o;
-                            }
-                        }
-                    }
-                    lingxi_model::scratch::put_bf16(h_step0);
-                    lingxi_model::scratch::put_bf16(h_in);
-                    // ★ 后缀查表草稿：把 MTP 被闸门砍掉的空位用"上下文里原样出现过的续写"补上。
-                    // 语义与 Strata 的 `--lookup-chain` 一致：查询 = 「历史后缀 + 已产出的草稿」，
-                    // 命中就从"那个更早的位置之后"取 token。**只改提哪些草稿**，被采纳与否仍由主干验证决定。
-                    // ⚠️ `chose` 时**不能**把 lookup 草稿记成 MTP 产的（否则 `sd_acc` 恒 0，
-                    //    上一版就是这么把自己的成绩单写错的）
-                    if !chose {
-                        mtp_len = drafts.len();
-                    }
-                    if sd_min > 0 && drafts.len() < kd {
-                        let extra: Vec<i32> = drafts.iter().map(|&v| v as i32).collect();
-                        let room = kd - drafts.len();
-                        let want = if sd_chain == 0 { room } else { room.min(sd_chain) };
-                        let mut buf: Vec<i32> = Vec::new();
-                        let got = sd.propose_after(&extra, want, &mut buf);
-                        for &v in &buf[..got] {
-                            drafts.push(v as i64);
-                        }
-                        if got > 0 {
-                            sd_prop += got;
-                            sd_rounds += 1;
-                            // 诊断：这一枚是"提议错了"还是"这段文本本来就查不到"？
-                            // 打印提议的前几枚 + 主干真值（真值在下面 verify 之后才有，所以先存下来）
-                            if lingxi_model::flag("LINGXI_SUFFIX_TRACE") && sd_rounds <= 8 {
-                                eprintln!(
-                                    "    [suffix] 提议 {:?}（MTP 链 {} 枚：{:?}）",
-                                    &buf[..got],
-                                    mtp_len,
-                                    &drafts[..mtp_len]
-                                );
-                                SD_TRACE.with(|c| *c.borrow_mut() = Some(buf[..got].to_vec()));
-                            }
-                        }
-                    }
-                    if kts_spec {
-                        k.stream.synchronize()?;
-                    }
-                    t_draft += ta.elapsed().as_secs_f64() * 1e3;
-                    // ②③ 主干验证 + 接受前缀
-                    let tb = std::time::Instant::now();
-                    let chunk: Vec<i64> =
-                        std::iter::once(pending).chain(drafts.iter().copied()).collect();
-                    seq.spec_chunk(&eng, &chunk, provider, &mut sb)?;
-                    let mut acc = 0usize;
-                    for (j, &d) in drafts.iter().enumerate() {
-                        if d == sb.argmax[j] as i64 {
-                            if j >= mtp_len {
-                                sd_acc += 1; // 这一位是后缀查表提的
-                            }
-                            acc += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    let keep = acc + 1; // 含 chunk[0]（pending 本身，必然保留）
-                    // ★ `LINGXI_SPEC_TRACE_ARGMAX=1`：逐轮把「主干各行的 argmax + 草稿 + acc/keep」打出来。
-                    //   为什么要它（2026-10-16）：**提交的 token 只可能是 `argmax[acc]`**，而 `acc` 由
-                    //   「drafts 是否等于 argmax」决定 ⇒ **只要 `argmax` 本身不变，草稿再怎么变，
-                    //   提交的 token 流都必须一样**（同一前缀下贪心是唯一的）。
-                    //   所以两条配置的 token 流一旦分叉，**必然**是某一轮的 `argmax` 变了 ——
-                    //   这条轨迹就是用来把"哪一轮"钉死的（drafts 的差异只是噪声，不是原因）。
-                    if lingxi_model::flag("LINGXI_SPEC_TRACE_ARGMAX") {
-                        eprintln!(
-                            "    [argmax] 轮 {n_round:3} mlen0={mlen0} t={} acc={acc} keep={keep} argmax={:?} drafts={:?}",
-                            sb.argmax.len(),
-                            sb.argmax,
-                            drafts
-                        );
-                    }
-                    // 诊断对照：主干在那些位置上的真值（回答"是提议错了还是文本查不到"）
-                    if lingxi_model::flag("LINGXI_SUFFIX_TRACE") {
-                        if let Some(prop) = SD_TRACE.with(|c| c.borrow_mut().take()) {
-                            let truth: Vec<u32> = (mtp_len..drafts.len())
-                                .map(|j| sb.argmax[j])
-                                .collect();
-                            eprintln!("    [suffix] 真值 {truth:?}  ← 提议 {prop:?}");
-                        }
-                    }
-                    // 逐位记账（只记"走到了"的位；见上面 reached 的注释）
-                    // ⚠️ 上界必须取 `drafts.len()`：开了 `LINGXI_SPEC_MIN_P` 后链会被截短，
-                    //    而 `acc` 可以等于 `drafts.len()` ⇒ 用 `0..kd` 会在 `drafts[j]` 越界 panic。
-                    for j in 0..kd.min(drafts.len()) {
-                        if j > acc {
-                            break;
-                        }
-                        reached[j] += 1;
-                        let truth = sb.argmax[j] as u32;
-                        if drafts[j] as u32 == truth {
-                            hit1[j] += 1;
-                        }
-                        if let Some(row) = draft_top.get(j) {
-                            for (n, &nn) in NS_SPEC.iter().enumerate() {
-                                if row.iter().take(nn).any(|&x| x == truth) {
-                                    hitn[j][n] += 1;
-                                }
-                            }
-                        }
-                        // 草稿概率分桶（位 j 自己那一步的 prob1）
-                        if let Some(&p1) = probs_chain.get(j) {
-                            let bkt = if p1 >= 0.9 { 0 } else if p1 >= 0.7 { 1 } else if p1 >= 0.5 { 2 } else { 3 };
-                            pb_n[bkt] += 1;
-                            if drafts[j] as u32 == truth { pb_hit[bkt] += 1; }
-                            if j == 0 {
-                                pb_n0[bkt] += 1;
-                                if drafts[0] as u32 == truth { pb_hit0[bkt] += 1; }
-                            }
-                        }
-                    }
-                    t_chunk += tb.elapsed().as_secs_f64() * 1e3;
-                    // ── 【归因诊断 · 决定性】`LINGXI_MTP_CHAIN_DIAG=oracle` ──
-                    // 实测已排除两个假设：`noh`（不更新自喂 h）让第 1 位**更差**（0.57→0.35）、
-                    // `nokv`（回卷 MTP KV）只值 +0.06 且 top-20 不变 ⇒ 都不是元凶。
-                    // 剩下唯一要问的：**自喂的那个 h（MTP 层输出 `o`）到底等不等价于"主干在该位置的 h"？**
-                    //   oracle 链 = 把 h 换成**主干真值**（滞后一格：j=0 用 h_last，j≥1 用 hyper_rows[j-1]），
-                    //               且 tok 也换成真值 chunk[j]。
-                    //   判据：oracle 第 1 位回到 ~0.95 而自喂只有 0.57 ⇒ **h 的"身份"错了**
-                    //        （我们的自喂量不是 MTP 训练时期望的那个）；若 oracle 也 ~0.6 ⇒ 草稿头本身
-                    //        只能预测 1 步，2 步是能力上限（那就不用修接线，只能上多候选）。
-                    if diag.contains("oracle") {
-                        let mut o_hit = vec![0usize; kd];
-                        let mut o_runs = 0usize;
-                        for j in 0..kd {
-                            if j >= chunk.len() {
-                                break;
-                            }
-                            let mut h_j = lingxi_model::scratch::bf16(&k, dim)?;
-                            if j == 0 {
-                                k.stream.memcpy_dtod(&h_last, &mut h_j)?;
-                            } else {
-                                k.stream.memcpy_dtod(
-                                    &sb.hyper_rows.slice((j - 1) * dim..j * dim),
-                                    &mut h_j,
-                                )?;
-                            }
-                            let emb = embed1(&k, chunk[j])?; // **真值** token
-                            let (d, _tk, _pr, o) = mtp_step(&mut mst, &h_j, &emb, 1, &seq.ids, true)?;
-                            lingxi_model::scratch::put_bf16(o);
-                            lingxi_model::scratch::put_bf16(emb);
-                            lingxi_model::scratch::put_bf16(h_j);
-                            if d[0] as i64 == sb.argmax[j] as i64 {
-                                o_hit[j] += 1;
-                            }
-                            o_runs += 1;
-                        }
-                        // 把 MTP 的 QSA 回卷到轮前，别污染后面的 commit/重放
-                        if let lingxi_model::layer::AttnState::Qsa(q) = &mut mst.attn {
-                            q.rewind(mlen0);
-                        }
-                        if o_runs > 0 {
-                            or_reached.iter_mut().for_each(|v| *v += 1);
-                            for j in 0..o_runs {
-                                or_hit[j] += o_hit[j];
-                            }
-                        }
-                        // `hhcmp`：把"自喂量 o0"与"主干真 h（hyper_rows[0]）"逐元素比一下。
-                        // 若两者差不多 ⇒ h 没错（问题在别处）；若差很远 ⇒ 自喂量根本不是主干 h 那一族。
-                        if diag.contains("hhcmp") {
-                            let o0h = O0_SAVE.with(|c| c.borrow_mut().take());
-                            if let Some(o0) = o0h {
-                                let a: Vec<f32> =
-                                    k.stream.clone_dtoh(&o0)?.iter().map(|v| v.to_f32()).collect();
-                                let b: Vec<f32> = k.stream
-                                    .clone_dtoh(&sb.hyper_rows.slice(0..dim))?
-                                    .iter()
-                                    .map(|v| v.to_f32())
-                                    .collect();
-                                let stat = |v: &[f32]| {
-                                    let m = v.iter().sum::<f32>() / v.len() as f32;
-                                    let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f32>()
-                                        / v.len() as f32)
-                                        .sqrt();
-                                    let mx = v.iter().fold(0f32, |s, x| s.max(x.abs()));
-                                    (m, sd, mx)
-                                };
-                                let (am, asd, amx) = stat(&a);
-                                let (bm, bsd, bmx) = stat(&b);
-                                let dot: f64 = a.iter().zip(&b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
-                                let na: f64 = a.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
-                                let nb: f64 = b.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
-                                let rel: f64 = a
-                                    .iter()
-                                    .zip(&b)
-                                    .map(|(x, y)| (*x as f64 - *y as f64).powi(2))
-                                    .sum::<f64>()
-                                    .sqrt()
-                                    / nb.max(1e-9);
-                                hhc_n += 1;
-                                hhc_cos += if na > 0.0 && nb > 0.0 { dot / (na * nb) } else { 0.0 };
-                                hhc_rel += rel;
-                                hhc_a += asd as f64 / (amx.max(1e-9) as f64);
-                                hhc_b += bsd as f64 / (bmx.max(1e-9) as f64);
-                                let _ = (am, bm);
-                                lingxi_model::scratch::put_bf16(o0);
-                            }
-                        }
-                    }
-                    // ④ 提交主干状态
-                    if kts_spec {
-                        k.stream.synchronize()?;
-                    }
-                    let tc = std::time::Instant::now();
-                    seq.spec_commit(&eng, provider, &mut sb, keep)?;
-                    if kts_spec {
-                        k.stream.synchronize()?;
-                    }
-                    t_commit += tc.elapsed().as_secs_f64() * 1e3;
-                    let td = std::time::Instant::now();
-                    // ④' MTP：回卷到批前 cell 数，再用（主干 h, 该位置token）推进 keep 个 cell
-                    //      cell 语义 = `(h_j, tok_{j+1})`；最后一个 cell 的 `tok_{keep}` 就是
-                    //      **奖励 token**（提交后 ids 末尾那个），不在 chunk 里。
-                    if let lingxi_model::layer::AttnState::Qsa(q) = &mut mst.attn {
-                        q.rewind(mlen0);
-                    }
-                    let bonus = *seq.ids.last().unwrap();
-                    // ★ 2026-10-16：**批量重放**（`LINGXI_MTP_REPLAY_1BY1=1` 退回逐行）。
-                    // 逐行重放 = `keep` 次 t=1 的 MTP 前向 ⇒ MTP 那一层的权重被读 `keep` 遍。
-                    // 批成一次 `t=keep` 的前向：权重只读一遍，行边际只剩专家读。
-                    // **为什么与逐行等价**：MTP 的注意力是因果的、状态已 `rewind(mlen0)`，
-                    //   一次喂 `keep` 行与逐行喂的每行输出逐位同源；
-                    // 而**对外输出不受影响**：草稿只影响"哪些行被验"，被采纳的 token 始终是
-                    //   主干自己的贪心 argmax（主干路径与重放无关）。
-                    if lingxi_model::flag("LINGXI_MTP_REPLAY_1BY1") {
-                    for j in 0..keep {
-                        let mut h1 = lingxi_model::scratch::bf16(&k, dim)?;
-                        k.stream
-                            .memcpy_dtod(&sb.hyper_rows.slice(j * dim..(j + 1) * dim), &mut h1)?;
-                        let tok_n = if j + 1 < keep { chunk[j + 1] } else { bonus };
-                        let emb = embed1(&k, tok_n)?;
-                        let (_, _, _, o) = mtp_step(&mut mst, &h1, &emb, 1, &seq.ids, false)?;
-                        lingxi_model::scratch::put_bf16(o);
-                        lingxi_model::scratch::put_bf16(emb);
-                        lingxi_model::scratch::put_bf16(h1);
-                    }
-                    } else {
-                    let mut hb = lingxi_model::scratch::bf16(&k, keep * dim)?;
-                    k.stream.memcpy_dtod(&sb.hyper_rows.slice(0..keep * dim), &mut hb)?;
-                    let toks: Vec<i32> = (0..keep)
-                        .map(|j| if j + 1 < keep { chunk[j + 1] as i32 } else { bonus as i32 })
-                        .collect();
-                    let d_toks = k.stream.clone_htod(&toks)?;
-                    let mut emb = k.stream.alloc_zeros::<half::bf16>(keep * hidden)?;
-                    k.gather_rows_bf16(&endpoints.token_embedding, &d_toks, &mut emb, keep, hidden, 0)?;
-                    let (_, _, _, o) = mtp_step(&mut mst, &hb, &emb, keep, &seq.ids, false)?;
-                    lingxi_model::scratch::put_bf16(o);
-                    lingxi_model::scratch::put_bf16(emb);
-                    lingxi_model::scratch::put_bf16(hb);
-                    }
-                    // 新的 h_last = 被接受前缀最后一行的主干 h
-                    if min_p > 0.0 && n_round < 6 {
-                        let mst_len = match &mst.attn {
-                            lingxi_model::layer::AttnState::Qsa(q) => q.len,
-                            _ => usize::MAX,
-                        };
-                        eprintln!(
-                            "    [min-p] 轮 {n_round} 收尾: m={} keep={} acc={} mst.len={}（应 = mlen0+keep = {}）probs={:?}",
-                            drafts.len(),
-                            keep,
-                            acc,
-                            mst_len,
-                            mlen0 + keep,
-                            probs_chain.iter().map(|p| (p * 100.0).round() / 100.0).collect::<Vec<_>>()
-                        );
-                    }
-                    lingxi_model::scratch::put_bf16(h_last);
-                    h_last = lingxi_model::scratch::bf16(&k, dim)?;
-                    k.stream
-                        .memcpy_dtod(&sb.hyper_rows.slice((keep - 1) * dim..keep * dim), &mut h_last)?;
-                    // 同上：`MTP_H=mixed` 时每轮也要过 h_prep（默认恒等 ⇒ 默认路径逐位不变）
-                    if mtp_h_mixed {
-                        let hl = h_prep(&h_last, 1)?;
-                        lingxi_model::scratch::put_bf16(h_last);
-                        h_last = hl;
-                    }
-                    // 计数口径：chunk[0]（= pending）**上一轮已经算产出**，这里只把
-                    // 新接受的草稿 chunk[1..keep] 与奖励 token 计入。
-                    out_tokens.extend_from_slice(&chunk[1..keep]);
-                    out_tokens.push(bonus);
-                    if kts_spec {
-                        k.stream.synchronize()?;
-                    }
-                    t_resync += td.elapsed().as_secs_f64() * 1e3;
-                    n_round += 1;
-                    acc_sum += acc;
-                }
-                k.stream.synchronize()?;
-                let el = t0.elapsed().as_secs_f64();
-                let nr = n_round.max(1);
-                eprintln!(
-                    "  [mtp-spec] {n_round} 轮｜平均接受 {:.2}/{kd}｜产出 {} token｜{:.2}s ⇒ **{:.1} tok/s**（{:.1} ms/token）",
-                    acc_sum as f64 / nr as f64,
-                    out_tokens.len(),
-                    el,
-                    out_tokens.len() as f64 / el,
-                    el * 1e3 / out_tokens.len() as f64
-                );
-                eprintln!("  [mtp-spec] 生成序列 = {out_tokens:?}");
-                // `LINGXI_EVPROF=1`：打印**最后一轮**的逐段真 GPU 时间（事件口径，不排空流水）
-                if let Some(p) = k.evprof.as_ref() {
-                    p.dump(n_layers);
-                }
-                {
-                    // 跨卡（`LINGXI_MOE_SPLIT`）的实际开销：次数 + 累计 µs + 其中搬运 µs。
-                    // 这是判断"跨卡到底值不值"的唯一直接证据（对照两卡的 miss 差）。
-                    let sn = split_stat[0].load(std::sync::atomic::Ordering::Relaxed);
-                    let sus = split_stat[1].load(std::sync::atomic::Ordering::Relaxed);
-                    let sxus = split_stat[2].load(std::sync::atomic::Ordering::Relaxed);
-                    if sn > 0 {
-                        eprintln!(
-                            "  [mtp-spec] 跨卡：{sn} 次｜轮均 {:.2} ms（其中搬运 {:.2} ms）｜共 {:.1} ms（占整轮 {:.1}%）",
-                            sus as f64 / 1e3 / nr as f64,
-                            sxus as f64 / 1e3 / nr as f64,
-                            sus as f64 / 1e3,
-                            100.0 * (sus as f64 / 1e3) / (el * 1e3),
-                        );
-                    }
-                }
-                eprintln!(
-                    "  [mtp-spec] 分段均值/轮：草稿 {:.1}｜主干验证 t={t_max} {:.1}｜提交 {:.1}｜MTP 重放 {:.1} ms",
-                    t_draft / nr as f64,
-                    t_chunk / nr as f64,
-                    t_commit / nr as f64,
-                    t_resync / nr as f64
-                );
-                if sd_min > 0 {
-                    eprintln!(
-                        "  [mtp-spec] 后缀查表（LINGXI_SUFFIX_DRAFT={sd_min}）：{sd_rounds}/{n_round} 轮命中｜\
-                         提议 {sd_prop} 枚、**接受 {sd_acc} 枚**（命中率 {:.2}）",
-                        if sd_prop > 0 { sd_acc as f64 / sd_prop as f64 } else { 0.0 }
-                    );
-                }
-                eprintln!("  [mtp-spec] 判据：去掉首 token 后应等于固定贪心序列 [13, 561, 6511, 314, 9564, 369, 19241, 13]");
-                // ── 链上逐位接受率 × top-N（本轮新增）──
-                // 为什么必须这么报：整体"平均接受 2.57/6"会掩盖两件事 ——
-                //   ① **第 1 位就低**（草稿头本身弱） vs **只有深位低**（自喂误差累积）；
-                //   ② top-1 低但 top-N 高（= 多候选/树草稿有收益）。
-                eprintln!("  [mtp-spec] 链上**逐位**命中（分母 = 走到该位的轮数，所以是**条件**接受率）：");
-                eprintln!(
-                    "     位 | 走到 | top1 | {}",
-                    NS_SPEC.iter().map(|n| format!("top{n:<2}")).collect::<Vec<_>>().join(" | ")
-                );
-                for j in 0..kd {
-                    let r = reached[j];
-                    if r == 0 {
-                        continue;
-                    }
-                    let cells: Vec<String> = NS_SPEC
-                        .iter()
-                        .enumerate()
-                        .map(|(n, _)| format!("{:>5.2}", hitn[j][n] as f64 / r as f64))
-                        .collect();
-                    eprintln!(
-                        "     {j:>2} | {r:>4} | {:.2} | {}",
-                        hit1[j] as f64 / r as f64,
-                        cells.join(" | ")
-                    );
-                }
-                if reached[0] > 0 {
-                    let h0 = &hitn[0];
-                    let r0 = reached[0] as f64;
-                    eprintln!(
-                        "  [mtp-spec] ⇒ 第 1 位：top-1 {:.3} → top-8 {:.3} → top-20 {:.3}；\
-                         若 top-8/top-20 明显高于 top-1 ⇒ **多候选（树）草稿有空间**，否则是分布本身偏",
-                        h0[0] as f64 / r0,
-                        h0[4] as f64 / r0,
-                        h0[6] as f64 / r0
-                    );
-                }
-                // oracle 链对照（只有开了 `LINGXI_MTP_CHAIN_DIAG=oracle` 才有数）
-                if or_reached[0] > 0 {
-                    eprintln!(
-                        "  [mtp-spec] **oracle 链**（h 与 tok 都换成主干真值，n={} 轮）：",
-                        or_reached[0]
-                    );
-                    for j in 0..kd {
-                        if or_reached[j] == 0 {
-                            continue;
-                        }
-                        eprintln!(
-                            "     位 {j:>2} | 自喂 {:.2}  vs  oracle {:.2}",
-                            if reached[j] > 0 {
-                                hit1[j] as f64 / reached[j] as f64
-                            } else {
-                                f64::NAN
-                            },
-                            or_hit[j] as f64 / or_reached[j] as f64
-                        );
-                    }
-                    eprintln!(
-                        "     ⇒ 判读：oracle 位1 显著高于自喂 ⇒ **自喂的 h 不是 MTP 训练期望的那个量**；\
-                         两者接近（都 ~0.6）⇒ 草稿头本身预测不了第 2 步（只能上多候选）"
-                    );
-                }
-                if hhc_n > 0 {
-                    let n = hhc_n as f64;
-                    eprintln!(
-                        "  [mtp-spec] **自喂量 o0 vs 主干真 h**（n={hhc_n}）：cos {:.4}｜相对误差 {:.3}｜\
-                         归一化 std  o0 {:.3} vs 真 h {:.3}",
-                        hhc_cos / n,
-                        hhc_rel / n,
-                        hhc_a / n,
-                        hhc_b / n
-                    );
-                    eprintln!(
-                        "     ⇒ cos 高（>0.9）且相对误差小 ⇒ 自喂量与主干 h 同族，问题不在 h；\
-                         cos 低/相对误差大 ⇒ 自喂量确实不是那一族（要改喂法）"
-                    );
-                }
-                {
-                    const LBL: [&str; 4] = ["≥0.90", "0.70~0.90", "0.50~0.70", "<0.50"];
-                    eprintln!("  [mtp-spec] **草稿概率 prob1 vs 实际接受**（全链 / 仅第0位）：");
-                    for b in 0..4 {
-                        let f = |h: usize, n: usize| {
-                            if n == 0 { "  n/a".to_string() } else { format!("{:.3}", h as f64 / n as f64) }
-                        };
-                        eprintln!(
-                            "     prob1 {:<9} 全链 {}/{} = {}   第0位 {}/{} = {}",
-                            LBL[b], pb_hit[b], pb_n[b], f(pb_hit[b], pb_n[b]),
-                            pb_hit0[b], pb_n0[b], f(pb_hit0[b], pb_n0[b])
-                        );
-                    }
-                    eprintln!(
-                        "     ⇒ 若「高 prob 桶的接受率明显更高」⇒ 可以用参考实现的 `--spec-min-p` 式闸门\
-                         砍掉低概率的深位（省的是「行」）；若各桶差不多 ⇒ 概率不是有效信号"
-                    );
-                }
-                return Ok(());
-            }
-            if std::env::var("LINGXI_SPEC_CHECK").is_ok() {
-                // 把"快照+重放"拆成两半分别判，且用**模型自己的贪心 token**当 chunk（同分布，
-                // 避免合成 token 把状态推到退化区）。期望值都是确定的：
-                //   p0 = 自然贪心链            ⇒ [t0, t1, t2, ...]
-                //   chunk(喂 t0..t5)
-                //   a2 = 喂完不 commit          ⇒ 应等于 p0[6..]      （因果性）
-                //   b2 = 喂完 commit(6)         ⇒ 应等于 a2           （重放等价）
-                //   b0 = 喂完 commit(0)（全拒）⇒ 应等于 p0            （快照/恢复完整）
-                let t = 6usize;
-                let prompt_ids = prompt_ids.clone();
-                let run = |eng: &lingxi_driver::Engine,
-                           provider: &mut dyn lingxi_driver::LayerProvider,
-                           chunk: Option<Vec<i64>>,
-                           prep_only: bool,
-                           commit: Option<usize>,
-                           decode: usize|
-                 -> Result<(i64, Vec<i64>)> {
-                    let mut sq = lingxi_driver::Sequence::new(&k, n_layers, &shape, rope_len + 16, spec_ple)?;
-                    let pre = sq.prefill(eng, &prompt_ids, provider)?;
-                    if prep_only {
-                        let _ = sq.spec_prepare(eng, provider, 8)?;
-                    }
-                    if let Some(ch) = chunk {
-                        let n = ch.len();
-                        let mut buf = sq.spec_prepare(eng, provider, n + 1)?;
-                        sq.spec_snapshot(eng, &mut buf)?;
-                        sq.spec_chunk(eng, &ch, provider, &mut buf)?;
-                        if let Some(a) = commit {
-                            sq.spec_commit(eng, provider, &mut buf, a)?;
-                        }
-                    }
-                    let out = (0..decode)
-                        .map(|_| sq.decode_token(eng, provider))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok((pre, out))
-                };
-                let (a0, p0) = run(&eng, provider, None, false, None, 12)?;
-                let (_, pp) = run(&eng, provider, None, true, None, 12)?;
-                eprintln!("  [spec 核对] A0(prefill 吐的 pending)= {a0}   p0={p0:?}");
-                eprintln!("  [spec 核对] pp(只 spec_prepare) ={pp:?} ⇒ {}", if pp == p0 { "✅ 分配无副作用" } else { "❌ spec_prepare 本身破坏状态" });
-                // **自然链**：喂 [A0, p0[0], p0[1], …] —— 链首必须是 prefill 吐的 pending，
-                // 不是第一个 decode 输出（早先拿错了 ⇒ 判据给出的是假警报）。
-                let chunk: Vec<i64> =
-                    std::iter::once(a0).chain(p0[0..t - 1].iter().copied()).collect();
-                let (_, b1) = run(&eng, provider, Some(chunk[0..1].to_vec()), false, None, 6)?;
-                let (_, a2) = run(&eng, provider, Some(chunk.clone()), false, None, 6)?;
-                let (_, b2) = run(&eng, provider, Some(chunk.clone()), false, Some(t), 6)?;
-                let (_, b0) = run(&eng, provider, Some(chunk), false, Some(0), 6)?;
-                // 期望值口径：喂 k 个 token 后，第 k 行的 argmax 已成为 pending（会被下一步吃掉），
-                // 所以后续 D 个 decode 产出 p0[k .. k+D]。
-                eprintln!("  [spec 核对] b1(喂 1 个)      ={b1:?}  期望 p0[1..7]={:?} ⇒ {}", &p0[1..7], if b1 == p0[1..7] { "✅ t=1 走通" } else { "❌ t=1 坏" });
-                eprintln!("  [spec 核对] a2(喂 6 个不提交)={a2:?}  期望 p0[6..12]={:?} ⇒ {}", &p0[6..12], if a2 == p0[6..12] { "✅ 因果性" } else { "❌" });
-                eprintln!("  [spec 核对] b2(喂 6 + commit 6)={b2:?} ⇒ {}", if b2 == a2 { "✅ 重放等价" } else { "❌ 重放不等价" });
-                eprintln!("  [spec 核对] b0(喂 6 + commit 0)={b0:?}  期望 p0[0..6]={:?} ⇒ {}", &p0[0..6], if b0 == p0[0..6] { "✅ 快照/恢复完整" } else { "❌ 恢复不完整" });
-                return Ok(());
-            }
-            if let Ok(ks) = std::env::var("LINGXI_SPEC_BENCH") {
-                // 一轮的真实成本：`cost(t) + 提交开销`。t = 草稿数 + 1（pending）。
-                let kd: usize = ks.parse().unwrap_or(6);
-                let t = kd + 1;
-                let mut sb = seq.spec_prepare(&eng, provider, t)?;
-                // ── A/B（同进程、同状态、同 env）：顺序 tok/s vs 投机 tok/s ──
-                // 1) 先顺序解码 N 个 token = 顺序基线，同时拿到**自然 token 链**
-                //    （用自然链当草稿 = 模拟 100% 接受；MTP 的草稿成本 ~1 层 ≈ 1~2 ms/轮，可忽略）
-                let n_seq: usize = std::env::var("LINGXI_SPEC_N")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(24);
-                let accept: usize = std::env::var("LINGXI_SPEC_ACCEPT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(t - 1)
-                    .min(t - 1)
-                    .max(1);
-                let mut chain: Vec<i64> = Vec::with_capacity(n_seq);
-                let t0 = std::time::Instant::now();
-                while chain.len() < n_seq {
-                    chain.push(seq.decode_token(&eng, provider)?);
-                }
-                k.stream.synchronize()?;
-                let t_seq = t0.elapsed().as_secs_f64();
-                // 2) 投机环路：每轮喂 [pending, 链上 accept-1 个]，提交 accept 个
-                let mut ci = 0usize;
-                let mut emitted = 0usize;
-                let mut rounds = 0usize;
-                let t1 = std::time::Instant::now();
-                while ci + accept <= chain.len() {
-                    seq.spec_snapshot(&eng, &mut sb)?;
-                    let pend = *seq.ids.last().unwrap();
-                    let chunk: Vec<i64> = std::iter::once(pend)
-                        .chain(chain[ci..ci + accept - 1].iter().copied())
-                        .collect();
-                    seq.spec_chunk(&eng, &chunk, provider, &mut sb)?;
-                    seq.spec_commit(&eng, provider, &mut sb, accept)?;
-                    ci += accept;
-                    emitted += accept;
-                    rounds += 1;
-                }
-                k.stream.synchronize()?;
-                let t_sp = t1.elapsed().as_secs_f64();
-                eprintln!(
-                    "  [spec A/B] 顺序 {n_seq} token 用 {:.2}s = **{:.1} tok/s**（{:.1} ms/token）",
-                    t_seq,
-                    n_seq as f64 / t_seq,
-                    t_seq * 1e3 / n_seq as f64
-                );
-                eprintln!(
-                    "  [spec A/B] 投机 {emitted} token / {rounds} 轮 用 {:.2}s = **{:.1} tok/s**（{:.1} ms/token，t={t}，每轮接受 {accept}）",
-                    t_sp,
-                    emitted as f64 / t_sp,
-                    t_sp * 1e3 / emitted as f64
-                );
-                eprintln!(
-                    "  [spec A/B] ⇒ 加速比 **{:.2}×**（草稿接受率 100%；按 p 折算：p=0.9 时约 {:.2}×）",
-                    (emitted as f64 / t_sp) / (n_seq as f64 / t_seq),
-                    (t_seq * 1e3 / n_seq as f64) / (t_sp * 1e3 / emitted as f64) * 1.0
-                );
-                return Ok(());
-            }
-            let mut hits = 0usize;
-            let mut total = 0usize;
-            // **单步 top-N 命中**（这一路是最好的样本：n_new 步、每步一个"真值 vs 草稿 top-N"）
-            //   判据：主干这一步真实吐的 `tok_next`，是否落在**上一步草稿**的 top-N 里。
-            //   为什么要它：`hits/total` 只是 top-1；若 top-8/top-20 明显更高，
-            //   说明草稿**分布是对的**（可以做多候选/树草稿），只是 argmax 差一两位。
-            const NS_ACC: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
-            let mut acc_hitn = [0usize; 7];
-            let mut acc_last_top: Vec<u32> = Vec::new(); // 上一步草稿的 top-N
-            let mut acc_rows = 0usize;
-            let mut acc_reach = 0usize; // 有草稿可比的总步数
-            // 对齐假设：MTP 的 token 分支喂**哪个** token？
-            //  `next`（默认）：喂主干**刚预测出**的 token（predict 它后面那个）
-            //  `last`：喂主干**刚吃进**的 token
-            // 两个都试，一次跑清 —— 输入语义是 0/64 的最大嫌疑。
-            let align_last = std::env::var("LINGXI_MTP_ALIGN").map(|v| v == "last").unwrap_or(false);
-            let mut prev_tok: i64 = trunk_next; // 第一个 decode 步吃进去的就是它
-            eprintln!("MTP 对齐假设：{}", if align_last { "last" } else { "next" });
-
-            // ── decode 相位 ──
-            for i in 0..n_new {
-                let (tok_next, hyper_i) = seq.decode_token_with_hyper(&eng, provider)?;
-                // 比对上一步留下的草稿
-                total += 1;
-                if pending == tok_next {
-                    hits += 1;
-                }
-                // 上一步草稿的 top-N 里有没有这一步的真值
-                if acc_rows > 0 {
-                    acc_reach += 1;
-                    let truth = tok_next as u32;
-                    for (n, &nn) in NS_ACC.iter().enumerate() {
-                        if acc_last_top.iter().take(nn).any(|&x| x == truth) {
-                            acc_hitn[n] += 1;
-                        }
-                    }
-                }
-                // 用本步的 (h, token) 出下一步的草稿
-                let emb_i = embed1(&k, if align_last { prev_tok } else { tok_next })?;
-                let h_i = h_prep(&hyper_i, 1)?;
-                lingxi_model::scratch::put_bf16(hyper_i);
-                let (d, tk, _pr, o) = mtp_step(&mut mst, &h_i, &emb_i, 1, &seq.ids, true)?;
-                lingxi_model::scratch::put_bf16(o);
-                lingxi_model::scratch::put_bf16(h_i);
-                acc_last_top = tk.into_iter().next().unwrap_or_default();
-                acc_rows += 1;
-                pending = d[0] as i64;
-                trunk_next = tok_next;
-                prev_tok = tok_next;
-                if i % 16 == 0 || i + 1 == n_new {
-                    eprintln!(
-                        "  step {}/{}  主干={trunk_next} draft={pending} 累计命中 {hits}/{total}",
-                        i + 1,
-                        n_new
-                    );
-                }
-            }
-            println!(
-                "MTP 接受率：{hits}/{total} = **{:.3}**（prompt {prompt_len} token，n_new {n_new}）",
-                hits as f64 / total as f64
-            );
-            if acc_reach > 0 {
-                println!("MTP **单步 top-N 命中**（n={acc_reach}；真值落在草稿 top-N 里）：");
-                for (n, &nn) in NS_ACC.iter().enumerate() {
-                    println!(
-                        "    top-{nn:<2} {}/{} = **{:.3}**{}",
-                        acc_hitn[n],
-                        acc_reach,
-                        acc_hitn[n] as f64 / acc_reach as f64,
-                        if nn == 1 { "   ← 这就是贪心接受率" } else { "" }
-                    );
-                }
-                println!(
-                    "  ⇒ 提示：若 top-8/top-20 明显高于 top-1 ⇒ 草稿分布是对的、\n\
-                     多候选（树）草稿有空间；若几乎持平 ⇒ 分布本身偏，树也没用。"
-                );
-            }
-        }
-        Some("mtp-dump") => {
-            // **白盒对拍用**：把 MTP stem 的输入 / 权重 / 输出全部落成 f32 —— 交给
-            // `tools/golden/mtp_stem_oracle.py` 在 numpy 里复算，**逐步**比中间量。
-            // 黑盒已经试不出东西了（§3.52 记着全部被否的假设），必须白盒。
-            // 用法: lingxi-bench mtp-dump <mtp.ninfer> <outdir>
-            let path = args.get(2).context("用法: lingxi-bench mtp-dump <mtp.ninfer> <outdir>")?;
-            let outdir = args.get(3).context("缺 outdir")?;
-            let dev: usize =
-                std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let k = lingxi_kernels::Kernels::load(dev)?;
-            let art = Artifact::open(path)?;
-            let g = lingxi_model::mtp::load(&k, &art)?;
-            let meta = flash_next_meta();
-            let shape = layer_shape(&meta);
-            std::fs::create_dir_all(outdir)?;
-            let (n, hc) = (g.geom.n, g.geom.hc);
-            let t = 2usize;
-            let dump_dev = |name: &str, d: &cudarc::driver::CudaSlice<half::bf16>| -> Result<()> {
-                let h: Vec<half::bf16> = k.stream.clone_dtoh(d)?;
-                let b: Vec<u8> = h.iter().flat_map(|v| v.to_f32().to_le_bytes()).collect();
-                std::fs::write(format!("{outdir}/{name}.f32"), b)?;
-                Ok(())
-            };
-            let dump_f32 = |name: &str, v: &[f32]| -> Result<()> {
-                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{outdir}/{name}.f32"), b)?;
-                Ok(())
-            };
-            dump_dev("fc_embedding", &g.fc_embedding)?;
-            dump_dev("fc_hidden", &g.fc_hidden)?;
-            dump_dev("embedding_norm", &g.embedding_norm)?;
-            dump_dev("hidden_norm", &g.hidden_norm)?;
-            let mk = |cnt: usize, seed: usize| -> Vec<half::bf16> {
-                (0..cnt)
-                    .map(|i| half::bf16::from_f32((((i + seed) % 13) as f32 - 6.0) * 0.1))
-                    .collect()
-            };
-            let emb_h = mk(t * n, 1);
-            let rin_h = mk(t * hc * n, 3);
-            let to_f = |v: &[half::bf16]| -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() };
-            dump_f32("emb", &to_f(&emb_h))?;
-            dump_f32("rin", &to_f(&rin_h))?;
-            let emb = k.stream.clone_htod(&emb_h)?;
-            let rin = k.stream.clone_htod(&rin_h)?;
-            let r = lingxi_model::mtp::stem(&k, &g, &rin, &emb, t, shape.eps)?;
-            k.stream.synchronize()?;
-            dump_dev("R", &r)?;
-            // ── 再把 MTP 那一层跑一遍，把它的输入/输出/注意力权重也落下来 ──
-            // （这样就能在 numpy 里单独复算**那一层的注意力**，把"层接线错"钉死或排除）
-            let ml = build_mtp_layer(&k, &art, false)?;
-            let rope = load_rope_tables(&k, 64, shape.attn.rot_dim)?;
-            let ids: Vec<i64> = (0..t as i64).collect();
-            let mut st = lingxi_model::layer::LayerStates::for_kind(
-                &k,
-                lingxi_ids::LayerKind::QsaSparseAttention,
-                &shape,
-                64,
-                None,
-            )?;
-            let env = lingxi_model::layer::LayerEnv {
-                cos: &rope.cos,
-                sin: &rope.sin,
-                cos_host: &rope.cos_host,
-                sin_host: &rope.sin_host,
-                remote: None,
-                causal_host: &[],
-                k_layernorm_host: &ml.k_layernorm_host,
-                ids: &ids,
-                experts: None,
-            };
-            dump_dev("layer_in", &r)?;
-            let out =
-                lingxi_model::layer::layer_step(&k, &ml.weights, &shape, &r, t, &env, &mut st, 0)?;
-            k.stream.synchronize()?;
-            dump_dev("layer_out", &out)?;
-            if let lingxi_model::layer::AttnWeights::Qsa { attn, indexer } = &ml.weights.attn {
-                dump_dev("w_qkgv", &attn.query_key_gate_value)?;
-                dump_dev("w_q_norm", &attn.query_norm)?;
-                dump_dev("w_k_norm", &attn.key_norm)?;
-                dump_dev("w_o_proj", &attn.output)?;
-                dump_dev("w_index_qk", &indexer.index_qk_proj)?;
-                dump_dev("w_index_klayernorm", &indexer.k_layernorm)?;
-            }
-            dump_dev("rope_cos", &rope.cos)?;
-            dump_dev("rope_sin", &rope.sin)?;
-            // ── 再把**注意力块单独**跑一次：落它的输入(mixed_a)/输出(attn_out) ──
-            // 这样 numpy 只需复算 attention_step（投影→norm→rope→掩码注意力→sigmoid 门→o_proj），
-            // 不必连两个 GR 和 MoE 一起重写。
-            let mut mixed_a = k.stream.alloc_zeros::<half::bf16>(t * shape.hidden)?;
-            let mut injw_a = k.stream.alloc_zeros::<half::bf16>(t * shape.hc)?;
-            lingxi_model::gr::gated_residual_forward_into(
-                &k, &ml.weights.attn_gr, &r, &mut mixed_a, Some(&mut injw_a), t as u32,
-                shape.hc * shape.hidden, shape.hidden, shape.hc, shape.lowrank, shape.eps, 0,
-            )?;
-            dump_dev("attn_mixed_a", &mixed_a)?;
-            // GR 块的 4 组权重（白盒：复算 GR(R) → attn_mixed_a）
-            dump_dev("gr_hc_norm", &ml.weights.attn_gr.hc_norm)?;
-            dump_dev("gr_mix_down", &ml.weights.attn_gr.mix_down)?;
-            dump_dev("gr_mix_up", &ml.weights.attn_gr.mix_up)?;
-            if let Some(bi) = &ml.weights.attn_gr.block_inject {
-                dump_dev("gr_block_inject", bi)?;
-            }
-            if let lingxi_model::layer::AttnWeights::Qsa { attn, indexer } = &ml.weights.attn {
-                let mut st2 = lingxi_model::layer::LayerStates::for_kind(
-                    &k,
-                    lingxi_ids::LayerKind::QsaSparseAttention,
-                    &shape,
-                    64,
-                    None,
-                )?;
-                let attn_out = {
-                    let lingxi_model::layer::AttnState::Qsa(qs) = &mut st2.attn else {
-                        unreachable!()
-                    };
-                    lingxi_model::qsa::attention_step(
-                        &k, attn, indexer, &mixed_a, &rope.cos, &rope.sin, &rope.cos_host,
-                        &rope.sin_host, &ml.k_layernorm_host, t, &shape.attn, &shape.indexer, qs,
-                    )?
-                };
-                k.stream.synchronize()?;
-                dump_dev("attn_out", &attn_out)?;
-            }
-            println!(
-                "mtp-dump：已写 {outdir}（stem + 层 + **注意力块单独**的输入/输出；全 f32 LE；n={n} hc={hc} t={t} eps={}）",
-                shape.eps
-            );
-        }
-        Some("mtp-load") => {
-            // **MTP 草稿路径的机械化冒烟**：产物读入 → 几何/形状交叉校验 → stem →
-            // 复用主干的 `layer_step` → 层尾 mixer → 复用主干的输出头 → argmax。
-            // 输入是**合成的**（不是真 token 流），所以只证明"接线正确、没有非法访问、
-            // 数值有限"；真正的**接受率**由下一步的真 token 流测量给出。
-            // 用法: lingxi-bench mtp-load <main.ninfer> <mtp.ninfer>
-            let main_path = args.get(2).context("用法: lingxi-bench mtp-load <main.ninfer> <mtp.ninfer>")?;
-            let mtp_path = args.get(3).context("缺 MTP 产物路径")?;
-            let dev: usize =
-                std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let k = lingxi_kernels::Kernels::load(dev)?;
-            let meta = flash_next_meta();
-            let shape = layer_shape(&meta);
-            let main_art = Artifact::open(main_path)?;
-            let mtp_art = Artifact::open(mtp_path)?;
-
-            let g = lingxi_model::mtp::load(&k, &mtp_art)?;
-            let gm = g.geom;
-            println!(
-                "MTP 几何（由张量形状推出）：n={} hc={} q_dim={} kv_dim={} inter={} E={}",
-                gm.n, gm.hc, gm.q_dim, gm.kv_dim, gm.inter, gm.num_experts
-            );
-            // 与主干同源的量必须逐一对上——对不上说明产物抽错或几何推错
-            anyhow::ensure!(
-                gm.n == shape.hidden
-                    && gm.hc == shape.hc
-                    && gm.inter == shape.inter
-                    && gm.num_experts == shape.num_experts,
-                "MTP 几何与主干 LayerShape 不一致：MTP n={} hc={} inter={} E={} vs 主干 hidden={} hc={} inter={} E={}",
-                gm.n, gm.hc, gm.inter, gm.num_experts,
-                shape.hidden, shape.hc, shape.inter, shape.num_experts
-            );
-            println!("与主干 LayerShape 一致 ✓（hidden / hc / inter / num_experts 全对上）");
-
-            let ml = build_mtp_layer(&k, &mtp_art, false)?;
-            println!("MTP 层权重构造完成 ✓（复用主干 QSA 层的算子，不重写前向）");
-
-            // 合成输入：`emb` 给一段图案；`Rin` 用 `hc_repeat(emb)`（与主干起点同形）
-            let t = 1usize;
-            let dim = shape.hc * shape.hidden;
-            let emb_h: Vec<half::bf16> = (0..t * shape.hidden)
-                .map(|i| half::bf16::from_f32((((i % 11) as f32) - 5.0) * 0.1))
-                .collect();
-            let emb = k.stream.clone_htod(&emb_h)?;
-            let mut rin = k.stream.alloc_zeros::<half::bf16>(t * dim)?;
-            k.hc_repeat_bf16(&emb, &mut rin, t, shape.hidden, shape.hc)?;
-
-            let r = lingxi_model::mtp::stem(&k, &g, &rin, &emb, t, shape.eps)?;
-            let rope = load_rope_tables(&k, 64, shape.attn.rot_dim)?;
-            let ids = vec![0i64];
-            let mut st = lingxi_model::layer::LayerStates::for_kind(
-                &k,
-                lingxi_ids::LayerKind::QsaSparseAttention,
-                &shape,
-                64,
-                None,
-            )?;
-            let env = lingxi_model::layer::LayerEnv {
-                cos: &rope.cos,
-                sin: &rope.sin,
-                cos_host: &rope.cos_host,
-                sin_host: &rope.sin_host,
-                remote: None,
-                causal_host: &[],
-                k_layernorm_host: &ml.k_layernorm_host,
-                ids: &ids,
-                experts: None,
-            };
-            let out = lingxi_model::layer::layer_step(
-                &k, &ml.weights, &shape, &r, t, &env, &mut st, 0,
-            )?;
-            let (mixed, injw) = lingxi_model::gr::gated_residual_forward(
-                &k, &ml.mixer, &out, t as u32, dim, shape.hidden, shape.hc, shape.lowrank, shape.eps,
-            )?;
-            if let Some(j) = injw {
-                lingxi_model::scratch::put_bf16(j);
-            }
-            // 输出头复用主干的（MTP 产物里没有 output_head）
-            let tw = load_endpoints(&k, &main_art)?;
-            let vocab = lingxi_model::DIMS.vocab as usize;
-            let mut logits = k.stream.alloc_zeros::<half::bf16>(t * vocab)?;
-            if let Some(wq) = &tw.output_head_q4 {
-                lingxi_model::gpu::proj_q4_epi(&k, &mixed, wq, &mut logits, vocab, shape.hidden, 0, t, 0, 0.0, 0.0)?;
-            } else {
-                lingxi_model::gpu::proj_t1(&k, &mixed, &tw.output_head, &mut logits, vocab, shape.hidden, t)?;
-            }
-            k.stream.synchronize()?;
-            let lh: Vec<half::bf16> = k.stream.clone_dtoh(&logits)?;
-            let lf: Vec<f32> = lh.iter().map(|v| v.to_f32()).collect();
-            anyhow::ensure!(lf.iter().all(|v| v.is_finite()), "MTP draft 的 logits 出现非有限值");
-            let top = lingxi_model::trunk::argmax_rows(&lf, t, vocab);
-            println!(
-                "MTP 草稿路径全程跑通 ✓：stem → layer_step → mixer → 输出头 → argmax = {:?}（合成输入，token 无意义）",
-                top
-            );
-        }
+        Some("verify") => cli::cmd::verify::run(&args)?,
+        Some("doctor") => doctor::run(&args)?,
+        Some("moe-gemm-bench") => moe_gemm_bench::run(&args)?,
+        Some("vram-budget") => cli::cmd::vram::run(&args)?,
+        Some("bytes") => cli::cmd::bytes::run(&args)?,
+        Some("mtp-pack") => cli::cmd::mtp::pack(&args)?,
+        Some("mtp-accept") => cli::cmd::mtp::accept(&args)?,
+        Some("mtp-dump") => cli::cmd::mtp::dump(&args)?,
+        Some("mtp-load") => cli::cmd::mtp::load(&args)?,
         Some("list") => {
             let path = args.get(2).expect("用法: lingxi-bench list <artifact.ninfer>");
             let art = Artifact::open(path)?;
@@ -3883,7 +1966,7 @@ fn run() -> Result<()> {
                     let dbg_dir = if std::env::var("LINGXI_MOE_DEBUG").is_ok() { Some(dir.as_path()) } else { None };
                     let res = lingxi_model::moe::sparse_moe_forward(
                         &k, &w, &dx, rows, hidden, num_experts, top_k, inter, dbg_dir, 0, None,
-                        None,
+                        None, None,
                     )?;
                     if std::env::var("LINGXI_MOE_DEBUG").is_ok() {
                         // 零拷贝路径下 `router_logits` 为 None（logits 落在映射 host 内存里）
@@ -4101,7 +2184,7 @@ fn run() -> Result<()> {
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
             let art = Artifact::open(art_path)?;
-            let built = build_layer(&k, &art, &meta, layer, false, None)?;
+            let built = cli::common::build_layer(&k, &art, &meta, layer, false, None)?;
             let kind = built.kind;
             let klay_h = built.k_layernorm_host;
             let shape = built.shape;
@@ -4247,7 +2330,7 @@ fn run() -> Result<()> {
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
                 .collect();
 
-            let shape = layer_shape(&meta);
+            let shape = cli::common::layer_shape(&meta);
             let env = lingxi_model::trunk::TrunkEnv {
                 cos: &cos_dev,
                 sin: &sin_dev,
@@ -4262,7 +2345,7 @@ fn run() -> Result<()> {
             println!("主干前向：{n_layers} 层 rows={rows}（逐层从产物载入，层权重用后即弃）");
             let mut loader = |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
                 eprint!("\r  [trunk] 载入层 {layer}/{n_layers} …");
-                let b = build_layer(&k, &art, &meta, layer, false, None)?;
+                let b = cli::common::build_layer(&k, &art, &meta, layer, false, None)?;
                 Ok(lingxi_model::trunk::LoadedLayer {
                     weights: b.weights,
                     k_layernorm_host: b.k_layernorm_host,
@@ -4300,9 +2383,9 @@ fn run() -> Result<()> {
             // 用法: trunk-ends <artifact> <golden-f32-dir>
             // 省 I/O 版的 T3：把 golden 的层间中间量当作输入，逐段验证主干**两端**
             // （配合 48/48 的 layer-check，即可覆盖整条 `embedding → 48 层 → mixer → lm_head`）：
-            //   ① embedding + hc 广播        vs layer0_in
-            //   ② 末端 mixer（输入 layer47_out）vs mixer_out
-            //   ③ lm_head（输入 golden mixer_out 与 ② 的 mixed 各一遍）vs logits
+            // ① embedding + hc 广播 vs layer0_in
+            // ② 末端 mixer（输入 layer47_out）vs mixer_out
+            // ③ lm_head（输入 golden mixer_out 与 ② 的 mixed 各一遍）vs logits
             let art_path = args.get(2).context("缺少 artifact")?;
             let dir = std::path::PathBuf::from(args.get(3).context("缺少 golden f32 目录")?);
             let meta: serde_json::Value =
@@ -4408,7 +2491,7 @@ fn run() -> Result<()> {
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
             let art = Artifact::open(art_path)?;
-            let shape = layer_shape(&meta);
+            let shape = cli::common::layer_shape(&meta);
             let dim = shape.hc * shape.hidden;
 
             // cos/sin 全表（覆盖到 rows）；整段/步进共用
@@ -4433,7 +2516,7 @@ fn run() -> Result<()> {
             let dx = k.stream.clone_htod(&x_bf)?;
 
             println!("step-check layer={layer} t={t}（载入层权重，机械盘稍候 …）");
-            let built = build_layer(&k, &art, &meta, layer, false, None)?;
+            let built = cli::common::build_layer(&k, &art, &meta, layer, false, None)?;
             let kind = built.kind;
             let klay_h = built.k_layernorm_host;
 
@@ -4569,7 +2652,7 @@ fn run() -> Result<()> {
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
             let art = Artifact::open(art_path)?;
-            let shape = layer_shape(&meta);
+            let shape = cli::common::layer_shape(&meta);
 
             // 两端权重
             let token_embedding =
@@ -4660,7 +2743,7 @@ fn run() -> Result<()> {
                 println!("双链对拍：{n_layers} 层流式（机械盘约 45 分钟）…");
                 let t0 = std::time::Instant::now();
                 for i in 0..n_layers {
-                    let b = build_layer(&k, &art, &meta, i, false, None)?;
+                    let b = cli::common::build_layer(&k, &art, &meta, i, false, None)?;
                     let env = LayerEnv {
                         cos: &tables.cos,
                         sin: &tables.sin,
@@ -4739,7 +2822,7 @@ fn run() -> Result<()> {
                     assert_eq!(gin.len(), rows * dim, "layer{i}_in 尺寸不符");
                     let dx_h: Vec<half::bf16> = gin.iter().map(|&v| half::bf16::from_f32(v)).collect();
                     let dx = k.stream.clone_htod(&dx_h)?;
-                    let b = build_layer(&k, &art, &meta, i, false, None)?;
+                    let b = cli::common::build_layer(&k, &art, &meta, i, false, None)?;
                     let env = LayerEnv {
                         cos: &tables.cos,
                         sin: &tables.sin,
@@ -4835,17 +2918,18 @@ fn run() -> Result<()> {
                 split_lo: 0,
                 tables1: None,
                 experts1: None,
+                ep: None,
             };
 
             println!("driver prefill：{n_layers} 层流式（机械盘约 20 分钟）…");
             let t0 = std::time::Instant::now();
-            let mut loader = StreamingProvider {
+            let mut loader = cli::common::StreamingProvider {
                 cur: None,
                 build: {
                     let (kb, ab, mb) = (&k, &art, &meta);
                     Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
                         eprint!("\r  [drive] 层 {layer}/{n_layers}  {:>5.1}s", t0.elapsed().as_secs_f64());
-                        let b = build_layer(kb, ab, mb, layer, false, None)?;
+                        let b = cli::common::build_layer(kb, ab, mb, layer, false, None)?;
                         Ok(lingxi_model::trunk::LoadedLayer { weights: b.weights, k_layernorm_host: b.k_layernorm_host })
                     })
                 },
@@ -4867,600 +2951,10 @@ fn run() -> Result<()> {
             }
             }
         }
-        Some("talk") => {
-            // 用法: talk <artifact> "<prompt>" [max_new_tokens]
-            // 出字闭环：产物内 frontend/tokenizer.json 分词 → Sequence 贪心
-            // prefill+generate → token 解码回文本。当前每层全量取权重（机械盘慢），
-            // 只用于打通"文本进→文本出"；速度要等专家瘦身+缓存（P1）。
-            let art_path = args.get(2).context("用法: lingxi-bench talk <artifact> <prompt> [max_new_tokens]")?;
-            let prompt = prompt_arg(args.get(3)).context("缺少 prompt 文本")?;
-            let max_new: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(16);
-
-            let dev: usize =
-                std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let k = lingxi_kernels::Kernels::load(dev)?;
-            // [探针] `LINGXI_SYNCTEST=N`：量**空闲 GPU 下**一次 `cuStreamSynchronize` 的代价。
-            // decode 每层都要同步一次取路由（48 次/token）。若单次就是几百 µs，那它就是主瓶颈，
-            // 必须换成"映射内存 + 自旋读标志"这类不依赖驱动同步的取法。
-            if let Some(n) = std::env::var("LINGXI_SYNCTEST").ok().and_then(|s| s.parse::<u32>().ok()) {
-                k.stream.synchronize()?;
-                let t = std::time::Instant::now();
-                for _ in 0..n {
-                    k.stream.synchronize()?;
-                }
-                let dt = t.elapsed().as_secs_f64() / f64::from(n);
-                eprintln!("[synctest] 空闲同步 {n} 次 → **{:.1} µs/次**", dt * 1e6);
-            }
-            // `LINGXI_GRAPHTEST=1`：把 CUDA Graph 捕获拆成一步步探测，精确定位哪一步失败。
-            if std::env::var("LINGXI_GRAPHTEST").is_ok() {
-                use cudarc::driver::sys;
-                let xs = k.stream.alloc_zeros::<f32>(1024)?;
-                let mut ys = k.stream.alloc_zeros::<f32>(1024)?;
-                k.smoke_scale(&xs, 2.0, &mut ys, 1024)?;
-                k.stream.synchronize()?;
-                eprintln!("[graphtest] 基线 kernel 正常");
-                for m in [
-                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
-                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
-                ] {
-                    let r1 = k.stream.begin_capture(m);
-                    eprintln!("[graphtest] begin_capture({m:?}) -> {r1:?}");
-                    if r1.is_ok() {
-                        let r2 = k.smoke_scale(&xs, 2.0, &mut ys, 1024);
-                        eprintln!("[graphtest]   捕获中 launch -> {r2:?}");
-                        let r3 = k.stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                        match r3 {
-                            Ok(Some(g)) => {
-                                eprintln!("[graphtest]   end_capture OK，试 replay");
-                                eprintln!("[graphtest]   replay -> {:?}", g.launch());
-                            }
-                            Ok(None) => eprintln!("[graphtest]   end_capture 返回空图"),
-                            Err(e) => eprintln!("[graphtest]   end_capture -> {e:?}"),
-                        }
-                    }
-                }
-            }
-
-            // `LINGXI_NO_SCRATCH_POOL=1`：量"整轮禁池"的代价（layer-split 现在无条件禁池，
-            // 所以这是把那条 22 ms 回归拆成"禁池 vs 跨卡"两半的判决性实验）。
-            if lingxi_model::flag("LINGXI_NO_SCRATCH_POOL") {
-                lingxi_model::scratch::disable_pool_forever();
-            }
-
-            let art = Arc::new(Artifact::open(art_path)?);
-            let meta = flash_next_meta();
-
-            let shape = layer_shape(&meta);
-
-            // 分词器与 eos（全部取自产物 resource，零外部文件）
-            let tok_bytes = art
-                .payload("frontend/tokenizer.json")
-                .context("产物缺少 frontend/tokenizer.json")?;
-            let tok = lingxi_tokenize::Tokenizer::from_json(&tok_bytes)?;
-            let prompt_ids = tok.encode(&prompt)?;
-            let prompt_len = prompt_ids.len();
-            let cfg_eos = match art.payload("frontend/generation_config.json") {
-                Some(b) => {
-                    let g: serde_json::Value = serde_json::from_slice(b)?;
-                    match &g["eos_token_id"] {
-                        serde_json::Value::Number(n) => n.as_i64(),
-                        serde_json::Value::Array(a) => a.first().and_then(|v| v.as_i64()),
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-            let eos = cfg_eos
-                .or_else(|| tok.token_to_id("<|im_end|>"))
-                .or_else(|| tok.token_to_id(""))
-                .context("无法确定 eos token id")?;
-            // talk 默认走瘦身路径（只传命中专家）；LINGXI_SPARSE_EXPERTS=0 回全量对拍路径
-            let sparse = std::env::var("LINGXI_SPARSE_EXPERTS")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            eprintln!(
-                "prompt={prompt_len} tokens  eos={eos}  max_new={max_new}  sparse_experts={sparse}"
-            );
-
-            // 两端权重 + RoPE 表（覆盖 prompt+生成长度）
-            let endpoints = load_endpoints(&k, &art)?;
-            let rope_len = prompt_len + max_new + 1;
-            let tables = load_rope_tables(&k, rope_len, shape.attn.rot_dim)?;
-
-            let n_layers = lingxi_model::DIMS.n_layers as u32;
-            // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`，PLAN §P15 里程碑 A）。
-            //    这套接线必须建在 `Sequence` **之前**：`[lo, n_layers)` 的跨 token 状态
-            //    （QSA KV/indexer、GDN 的 S+卷积史、PLE 史）要**直接建在 GPU1 上**，
-            //    建错卡不报错、只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串。
-            let ls_arena_path = std::env::var("LINGXI_EXPERT_ARENA").ok();
-            // ★ P15-㉜：双卡默认自动 split（同 mtp-accept 分支的口径）。
-            let ls_env: Option<u32> = std::env::var("LINGXI_LAYER_SPLIT")
-                .ok().and_then(|s| s.parse().ok());
-            let auto_split = ls_env.is_none()
-                && cudarc::driver::CudaContext::new(1).is_ok()
-                && ls_arena_path.is_some();
-            let ls_lo: u32 = ls_env.unwrap_or(if auto_split { 24 } else { 0 });
-            let ls_on = ls_lo > 0 && ls_lo < n_layers;
-            if ls_on {
-                if auto_split {
-                    // ㊸：单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
-                    // 跨卡拷贝在层循环外不进图）。判据翻车则恢复 force_disable()。
-                    eprintln!(
-                        "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%；\
-                         设 LINGXI_LAYER_SPLIT=0 关闭）。单层本地图保持开启。"
-                    );
-                } else {
-                    if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
-                        eprintln!(
-                            "[layer-split] 警告：未设 LINGXI_NO_GRAPHS；㊸ 起单层本地图 split 下可用，\
-                             数值异常先设它对拍。"
-                        );
-                    }
-                }
-                // ★ P15-㉞：池已 device-aware，不再需要禁池（见 mtp-accept 分支同款注释）。
-            }
-            let ls_k1: Option<lingxi_kernels::Kernels> =
-                if ls_on { Some(lingxi_kernels::Kernels::load(1)?) } else { None };
-            let ls_tables: Option<lingxi_driver::RopeTables> = match ls_k1.as_ref() {
-                Some(kk) => Some(load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
-                None => None,
-            };
-            // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
-            let ls_slots: usize = match std::env::var("LINGXI_LAYER_SPLIT_SLOTS")
-                .ok().and_then(|s| s.parse().ok())
-            {
-                Some(v) => v,
-                None => match ls_arena_path.as_deref() {
-                    Some(ap) => match autotune_arena_slots(&art, ap, 1, ls_lo, rope_len + 8)? {
-                        Some((s, ledger)) => {
-                            eprintln!("{ledger}");
-                            s
-                        }
-                        None => 9600,
-                    },
-                    None => 9600,
-                },
-            };  // ★㊲ 工作集≥槽位判决(375/卡层)
-            let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
-                match (ls_k1.as_ref(), ls_arena_path.as_deref()) {
-                    (Some(kk), Some(ap)) => {
-                        eprintln!(
-                            "[layer-split] GPU1 上下文就绪；层 {ls_lo}..{n_layers} 整层交给它，专家槽位 {ls_slots}"
-                        );
-                        Some(Box::new(arena_source::ArenaExpertSource::new(
-                            kk, ap, ls_slots, false, ls_lo..n_layers,
-                        )?))
-                    }
-                    (Some(_), None) => anyhow::bail!(
-                        "LINGXI_LAYER_SPLIT 需要 LINGXI_EXPERT_ARENA（GPU1 那份专家表）"
-                    ),
-                    _ => None,
-                };
-            let mut seq = lingxi_driver::Sequence::new_split(
-                &k,
-                ls_k1.as_ref().map(|kk| (kk, ls_lo)),
-                n_layers,
-                &shape,
-                rope_len + 8,
-                Some((
-                    1,
-                    meta["ple_conv_kernel_size"].as_u64().unwrap() as usize,
-                    meta["ngram_size"].as_u64().unwrap() as usize,
-                )),
-            )?;
-            // host 缓存（sparse 时启用）：dense 匿名常驻 + 专家 mmap 零拷贝视图
-            let host_cache: Option<Arc<host_cache::HostCache>> = if sparse {
-                let c = host_cache::HostCache::new(Arc::clone(&art));
-                c.start_prefetcher();
-                eprintln!("host_cache: dense 后台预读已启动，专家走 mmap 零拷贝视图");
-                Some(c)
-            } else {
-                None
-            };
-
-            // 瘦身专家源（sparse 时启用）：
-            //   LINGXI_EXPERT_ARENA 给出 → arena 直读（只读 mmap + 整段 pin + DMA + 视图解量化）
-            //   否则 → 旧的 host LRU(mmap 视图) + device LRU 路径（对照/回退）
-            let expert_source: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> = if sparse {
-                let inter = meta["inter"].as_u64().unwrap() as usize;
-                let hidden = meta["hidden"].as_u64().unwrap() as usize;
-                if let Ok(ap) = std::env::var("LINGXI_EXPERT_ARENA") {
-                    // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
-                    let slots: usize = match std::env::var("LINGXI_ARENA_SLOTS")
-                        .ok().and_then(|s| s.parse().ok())
-                    {
-                        Some(v) => v,
-                        None => match autotune_arena_slots(&art, &ap, 0, ls_lo, rope_len + 8)? {
-                            Some((s, ledger)) => {
-                                eprintln!("{ledger}");
-                                s
-                            }
-                            None => 4000,
-                        },
-                    };
-                    Some(Box::new(arena_source::ArenaExpertSource::new(
-                        &k,
-                        &ap,
-                        slots,
-                        false,
-                        // ★ 全量 layer-split：GPU0 这份只服务 `0..ls_lo`（后一半层的槽位
-                        //   全部留给 GPU1 那份，否则一半的槽白占）。
-                        if ls_on { 0..ls_lo } else { 0..u32::MAX },
-                    )?))
-                } else {
-                    // ⚠️ **不允许静默回退**：这条 host LRU ↔ device LRU 的路实测
-                    // decode **488~714 ms/token**（比 arena 慢 15~20 倍），而且以前毫无提示。
-                    // 历史上"忘了设 LINGXI_EXPERT_ARENA"就掉进来，被误判成代码回归（§3.45）。
-                    // 要用它必须显式开 `LINGXI_ALLOW_MMAP_FALLBACK=1`。
-                    if std::env::var("LINGXI_ALLOW_MMAP_FALLBACK").is_err() {
-                        anyhow::bail!(
-                            "没给 LINGXI_EXPERT_ARENA ⇒ 稀疏路径只剩 MmapExpertSource（host LRU），\
-                             实测慢 15~20 倍。请设 LINGXI_EXPERT_ARENA=<arena 文件>；\
-                             确实要用旧路请显式设 LINGXI_ALLOW_MMAP_FALLBACK=1（对比用）。"
-                        );
-                    }
-                    let dev_gb: usize = std::env::var("LINGXI_DEV_EXPERT_GB")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(17);
-                    Some(Box::new(MmapExpertSource::new(
-                        &k,
-                        host_cache.as_ref().unwrap(),
-                        inter,
-                        hidden,
-                        dev_gb,
-                    )?))
-                }
-            } else {
-                None
-            };
-            let eng = lingxi_driver::Engine {
-                k: &k,
-                shape: &shape,
-                n_layers,
-                vocab: lingxi_model::DIMS.vocab as usize,
-                endpoints: &endpoints,
-                tables: &tables,
-                experts: expert_source.as_deref(),
-                remote: None,
-                k1: ls_k1.as_ref(),
-                split_lo: ls_lo,
-                tables1: ls_tables.as_ref(),
-                experts1: ls_experts.as_deref(),
-            };
-
-            // dense 预读：立刻给预读线程喂前两层，之后每层回调里再喂下一层
-            if let Some(c) = &host_cache {
-                c.prefetch_layer_dense(0);
-            }
-
-            let t0 = std::time::Instant::now();
-            // sparse：dense 权重显存常驻，prefill 首遍逐层构建（同时后台预读下一层
-            // host 字节），之后 decode 全部按引用复用、零 dense H2D；
-            // full（对照）：保持每层每步流式现建。
-            let mut stream_provider: Option<StreamingProvider>;
-            let mut cache_provider: Option<DeviceLayerCache>;
-            let hc_for_build = host_cache.clone();
-            let build = {
-                let (kb, k1b, ab, mb) = (&k, ls_k1.as_ref(), &art, &meta);
-                let (lsb, lob) = (ls_on, ls_lo);
-                Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
-                    eprint!("\r  [load] 层 {layer}/{n_layers}  {:>6.1}s", t0.elapsed().as_secs_f64());
-                    // ★ 全量 layer-split：本层的稠密权重必须直接装到**本层要跑的卡**上。
-                    let dev_k = match (lsb, k1b) {
-                        (true, Some(kk)) if layer >= lob => kk,
-                        _ => kb,
-                    };
-                    let b = build_layer(dev_k, ab, mb, layer, sparse, hc_for_build.as_deref())?;
-                    // 本层 dense 已就位：后台线程立刻开始读下一层（与本层 GPU 计算重叠）
-                    if let Some(c) = &hc_for_build {
-                        if layer + 1 < n_layers {
-                            c.prefetch_layer_dense(layer + 1);
-                        }
-                    }
-                    Ok(lingxi_model::trunk::LoadedLayer { weights: b.weights, k_layernorm_host: b.k_layernorm_host })
-                })
-            };
-            let provider: &mut dyn lingxi_driver::LayerProvider = if sparse {
-                cache_provider = Some(DeviceLayerCache {
-                    slots: (0..n_layers as usize).map(|_| None).collect(),
-                    build,
-                });
-                cache_provider.as_mut().unwrap()
-            } else {
-                stream_provider = Some(StreamingProvider { cur: None, build });
-                stream_provider.as_mut().unwrap()
-            };
-
-            let first = seq.prefill(&eng, &prompt_ids, provider)?;
-            eprintln!("\nprefill 用时 {:.1}s，首 token = {first}", t0.elapsed().as_secs_f64());
-            // `LINGXI_EVPROF=1`：prefill 最后一个 chunk 的逐段真 GPU 时间（层求和）。
-            // 注意事件是每个 (层,段) 取**最后一次**记录 ⇒ decode 开始前 dump = 末 chunk 账。
-            if let Some(p) = k.evprof.as_ref() {
-                p.dump(eng.n_layers);
-            }
-
-            // `LINGXI_FWD_BENCH="2,4,8,16"`：**一次 t=k 前向要多少钱？**
-            // 这是"投机解码能不能把单流推到 200"的唯一判据：若 t=8 的一趟 ≈ t=1 的一趟
-            // （decode 43 ms），那么一轮验 8 个 token 就等于"8 个 token 花 1.3 趟的钱"。
-            // 此时 provider 已把 48 层全建好（cache 命中），所以这里量的是纯前向。
-            if let Ok(spec) = std::env::var("LINGXI_FWD_BENCH") {
-                let reps: usize = std::env::var("LINGXI_FWD_REPS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(5);
-                let ple_spec = (
-                    1u32,
-                    meta["ple_conv_kernel_size"].as_u64().unwrap() as usize,
-                    meta["ngram_size"].as_u64().unwrap() as usize,
-                );
-                let cap = rope_len + 8;
-                for tv in spec.split(',').filter_map(|x| x.trim().parse::<usize>().ok()) {
-                    let ids: Vec<i64> =
-                        (0..tv).map(|i| prompt_ids[i % prompt_ids.len()]).collect();
-                    let mk_seq = || {
-                        lingxi_driver::Sequence::new_split(
-                            &k,
-                            ls_k1.as_ref().map(|kk| (kk, ls_lo)),
-                            n_layers,
-                            &shape,
-                            cap,
-                            Some(ple_spec),
-                        )
-                    };
-                    {
-                        let mut w = mk_seq()?;
-                        w.prefill(&eng, &ids, provider)?;
-                    }
-                    let mut ts = Vec::with_capacity(reps);
-                    for _ in 0..reps {
-                        let mut s = mk_seq()?;
-                        let tf = std::time::Instant::now();
-                        s.prefill(&eng, &ids, provider)?;
-                        ts.push(tf.elapsed().as_secs_f64());
-                    }
-                    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let med = ts[ts.len() / 2];
-                    eprintln!(
-                        "[fwd] t={tv:<4} median={:>7.1} ms   （每 token-slot {:.2} ms；t=1 decode 对比见 bench.sh）",
-                        med * 1e3,
-                        med * 1e3 / tv as f64
-                    );
-                }
-            }
-
-            let mut gen_ids = Vec::new();
-            if first != eos {
-                gen_ids.push(first);
-                for step in 0..max_new {
-                    let t1 = std::time::Instant::now();
-                    let t = seq.decode_token(&eng, provider)?;
-                    let dt = t1.elapsed().as_secs_f64();
-                    // ⚠️ 这里原来打的是 `{dt:>7.3}s/token` —— **只有 3 位小数 = 1 ms 粒度**，
-                    // 而单 token 约 33 ms，也就是**量化台阶就有 3%**：任何 1~3% 的优化都量不出来。
-                    // 改成 µs（0.1 µs 分辨率）后，尺子才比被测物细。
-                    eprint!("\r  decode {:>2}/{max_new}  token={t:<7} {:>9.1} µs/token        ", step + 1, dt * 1e6);
-                    use std::io::Write;
-                    std::io::stderr().flush().ok();
-                    if t == eos {
-                        break;
-                    }
-                    gen_ids.push(t);
-                }
-                eprintln!();
-            } else {
-                eprintln!("首 token 即 eos，结束");
-            }
-
-            eprintln!("-- 生成 {} tokens，解码文本 --", gen_ids.len());
-            println!("{}", tok.decode(&gen_ids)?);
-            // ㊸：decode 后再 dump 一次 ⇒ 逐段数字 = **最后一个 decode token** 的真 GPU 分解
-            if let Some(p) = k.evprof.as_ref() {
-                p.dump(eng.n_layers);
-            }
-            // ㊸：GPU1 的账单独打（split 下 wall = max(两卡) + 跨卡手递手，只看 GPU0 会误判瓶颈侧）
-            if let Some(kk) = ls_k1.as_ref() {
-                if let Some(p) = kk.evprof.as_ref() {
-                    p.dump(eng.n_layers);
-                }
-            }
-        }
-        Some("serve") => {
-            // 用法: serve <artifact> [port=11434]   —— OpenAI 兼容 HTTP（P15-㊷）
-            // 装配与 talk 完全同一条生产链（layer-split/arena/图门控全在），
-            // 差别只在出字循环：每请求 reset 复用状态，HTTP+SSE 出字。
-            let art_path = args.get(2).context("用法: lingxi-bench serve <artifact> [port]")?;
-            let port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(11434);
-            let serve_ctx: usize = std::env::var("LINGXI_SERVE_MAX_CTX")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(32768);
-            let max_new_default: usize = std::env::var("LINGXI_SERVE_MAX_NEW")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(512);
-
-            let dev: usize =
-                std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let k = lingxi_kernels::Kernels::load(dev)?;
-            if lingxi_model::flag("LINGXI_NO_SCRATCH_POOL") {
-                lingxi_model::scratch::disable_pool_forever();
-            }
-
-            let art = Arc::new(Artifact::open(art_path)?);
-            let meta = flash_next_meta();
-            let shape = layer_shape(&meta);
-
-            let tok_bytes = art
-                .payload("frontend/tokenizer.json")
-                .context("产物缺少 frontend/tokenizer.json")?;
-            let tok = lingxi_tokenize::Tokenizer::from_json(&tok_bytes)?;
-            let cfg_eos = match art.payload("frontend/generation_config.json") {
-                Some(b) => {
-                    let g: serde_json::Value = serde_json::from_slice(b)?;
-                    match &g["eos_token_id"] {
-                        serde_json::Value::Number(n) => n.as_i64(),
-                        serde_json::Value::Array(a) => a.first().and_then(|v| v.as_i64()),
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-            let eos = cfg_eos
-                .or_else(|| tok.token_to_id("<|im_end|>"))
-                .context("无法确定 eos token id")?;
-
-            let endpoints = load_endpoints(&k, &art)?;
-            // 容量按 serve_ctx 一次建足：rope/序列状态都不随请求重分配
-            let rope_len = serve_ctx + 520;
-            let tables = load_rope_tables(&k, rope_len, shape.attn.rot_dim)?;
-
-            let n_layers = lingxi_model::DIMS.n_layers as u32;
-            let ls_arena_path = std::env::var("LINGXI_EXPERT_ARENA").ok();
-            let ls_env: Option<u32> = std::env::var("LINGXI_LAYER_SPLIT")
-                .ok().and_then(|s| s.parse().ok());
-            let auto_split = ls_env.is_none()
-                && cudarc::driver::CudaContext::new(1).is_ok()
-                && ls_arena_path.is_some();
-            let ls_lo: u32 = ls_env.unwrap_or(if auto_split { 24 } else { 0 });
-            let ls_on = ls_lo > 0 && ls_lo < n_layers;
-            if ls_on {
-                if auto_split {
-                    // ㊸：单层本地图 split 下保持开启（判据翻车则恢复 force_disable()）
-                    eprintln!("[layer-split] 双卡自动整层切分 lo={ls_lo}（单层本地图保持开启）");
-                } else {
-                    if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
-                        eprintln!("[layer-split] 警告：未设 LINGXI_NO_GRAPHS；单层本地图 split 下可用");
-                    }
-                }
-            }
-            let ls_k1: Option<lingxi_kernels::Kernels> =
-                if ls_on { Some(lingxi_kernels::Kernels::load(1)?) } else { None };
-            let ls_tables: Option<lingxi_driver::RopeTables> = match ls_k1.as_ref() {
-                Some(kk) => Some(load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
-                None => None,
-            };
-            let ls_slots: usize = std::env::var("LINGXI_LAYER_SPLIT_SLOTS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(9600);
-            let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
-                match (ls_k1.as_ref(), ls_arena_path.as_deref()) {
-                    (Some(kk), Some(ap)) => {
-                        eprintln!("[layer-split] GPU1：层 {ls_lo}..{n_layers}，专家槽位 {ls_slots}");
-                        Some(Box::new(arena_source::ArenaExpertSource::new(
-                            kk, ap, ls_slots, false, ls_lo..n_layers,
-                        )?))
-                    }
-                    (Some(_), None) => anyhow::bail!(
-                        "LINGXI_LAYER_SPLIT 需要 LINGXI_EXPERT_ARENA（GPU1 那份专家表）"
-                    ),
-                    _ => None,
-                };
-            // ㊿-P1：Sequence 不再预建——交给 serve 的会话池按需物化（每会话一个，复用/沉没/唤醒）。
-            let mut mk_seq = {
-                let (kb, k1b) = (&k, ls_k1.as_ref());
-                let (sh, nl, rl, lo) = (&shape, n_layers, rope_len, ls_lo);
-                let ple = (
-                    meta["ple_conv_kernel_size"].as_u64().unwrap() as usize,
-                    meta["ngram_size"].as_u64().unwrap() as usize,
-                );
-                move || {
-                    lingxi_driver::Sequence::new_split(
-                        kb, k1b.map(|kk| (kk, lo)), nl, sh, rl + 8, Some((1, ple.0, ple.1)),
-                    )
-                }
-            };
-            let host_cache: Option<Arc<host_cache::HostCache>> = {
-                let c = host_cache::HostCache::new(Arc::clone(&art));
-                c.start_prefetcher();
-                Some(c)
-            };
-            let expert_source: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> = {
-                let ap = std::env::var("LINGXI_EXPERT_ARENA").context(
-                    "serve 需要 LINGXI_EXPERT_ARENA=<arena 文件>（host LRU 路径慢 15-20 倍，不允许静默回退）",
-                )?;
-                // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
-                let slots: usize = match std::env::var("LINGXI_ARENA_SLOTS")
-                    .ok().and_then(|s| s.parse().ok())
-                {
-                    Some(v) => v,
-                    None => match autotune_arena_slots(&art, &ap, 0, ls_lo, serve_ctx + 528)? {
-                        Some((s, ledger)) => {
-                            eprintln!("{ledger}");
-                            s
-                        }
-                        None => 9000,
-                    },
-                };
-                Some(Box::new(arena_source::ArenaExpertSource::new(
-                    &k, &ap, slots, false,
-                    if ls_on { 0..ls_lo } else { 0..u32::MAX },
-                )?))
-            };
-            let eng = lingxi_driver::Engine {
-                k: &k,
-                shape: &shape,
-                n_layers,
-                vocab: lingxi_model::DIMS.vocab as usize,
-                endpoints: &endpoints,
-                tables: &tables,
-                experts: expert_source.as_deref(),
-                remote: None,
-                k1: ls_k1.as_ref(),
-                split_lo: ls_lo,
-                tables1: ls_tables.as_ref(),
-                experts1: ls_experts.as_deref(),
-            };
-            if let Some(c) = &host_cache {
-                c.prefetch_layer_dense(0);
-            }
-
-            let t0 = std::time::Instant::now();
-            let mut cache_provider: Option<DeviceLayerCache>;
-            let hc_for_build = host_cache.clone();
-            let build = {
-                let (kb, k1b, ab, mb) = (&k, ls_k1.as_ref(), &art, &meta);
-                let (lsb, lob) = (ls_on, ls_lo);
-                Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
-                    eprint!("\r  [load] 层 {layer}/{n_layers}  {:>6.1}s", t0.elapsed().as_secs_f64());
-                    let dev_k = match (lsb, k1b) {
-                        (true, Some(kk)) if layer >= lob => kk,
-                        _ => kb,
-                    };
-                    let b = build_layer(dev_k, ab, mb, layer, true, hc_for_build.as_deref())?;
-                    if let Some(c) = &hc_for_build {
-                        if layer + 1 < n_layers {
-                            c.prefetch_layer_dense(layer + 1);
-                        }
-                    }
-                    Ok(lingxi_model::trunk::LoadedLayer { weights: b.weights, k_layernorm_host: b.k_layernorm_host })
-                })
-            };
-            let provider: &mut dyn lingxi_driver::LayerProvider = {
-                cache_provider = Some(DeviceLayerCache {
-                    slots: (0..n_layers as usize).map(|_| None).collect(),
-                    build,
-                });
-                cache_provider.as_mut().unwrap()
-            };
-
-            let opts = serve::ServeOpts {
-                tok: &tok,
-                eos,
-                max_ctx: serve_ctx,
-                max_new_default,
-            };
-            // ── 投机（可选）：`LINGXI_SERVE_SPEC=1` + `LINGXI_MTP_ARTIFACT=<path>` ──
-            // 只接在 serve 上（产品路径）；talk 仍走纯自回归。
-            let mut spec_rt: Option<spec::SpecRuntime<'_>> =
-                if std::env::var("LINGXI_SERVE_SPEC").map(|v| v == "1").unwrap_or(false) {
-                    let mp = std::env::var("LINGXI_MTP_ARTIFACT")
-                        .unwrap_or_else(|_| "/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer".to_string());
-                    eprintln!("[serve] 投机解码启用：MTP = {mp}");
-                    Some(spec::SpecRuntime::load(&k, &mp, &tables, &endpoints, &shape, rope_len)?)
-                } else {
-                    None
-                };
-            serve::run(port, &opts, &eng, &mut mk_seq, provider, &mut spec_rt)?;
-        }
+        Some("talk") => cli::cmd::talk::run(&args)?,
+        Some("serve") => cli::cmd::serve_cmd::run(&args)?,
         _ => {
-            eprintln!("lingxi-bench: 用法: verify|list|bytes|vram-budget|decode-check|dequant-check|component-check|layer-check|trunk-check|trunk-ends|step-check|drive-check|argmax-check|f32x-check|talk|serve ...");
+            eprintln!("lingxi-bench: 用法: doctor|verify|list|bytes|vram-budget|decode-check|dequant-check|component-check|layer-check|trunk-check|trunk-ends|step-check|drive-check|argmax-check|f32x-check|talk|serve ...");
         }
     }
     Ok(())
@@ -5475,175 +2969,9 @@ fn run() -> Result<()> {
 /// KV(serve_ctx)/GDN/rope/预留/边距，余量全部给专家槽。
 /// 显式给了槽数 env 时不接管（返回 None）；`LINGXI_NO_VRAM_AUTOTUNE=1` 整体关闭。
 /// 分配后仍建议看启动账与实际 free VRAM 的差距，逐步收紧 reserve。
-fn autotune_arena_slots(
-    art: &lingxi_artifact::Artifact,
-    arena_path: &str,
-    dev: usize,
-    split_lo: u32,
-    kv_cap: usize,
-) -> Result<Option<(usize, String)>> {
-    use lingxi_ids::TensorRole;
-    if std::env::var("LINGXI_NO_VRAM_AUTOTUNE").is_ok() {
-        return Ok(None);
-    }
-    let arena = lingxi_artifact::expert_arena::ExpertArena::open(arena_path)?;
-    let n_layers = arena.n_layers;
-    let (lo, hi) = if dev == 0 {
-        (0, split_lo.min(n_layers))
-    } else {
-        (split_lo.min(n_layers), n_layers)
-    };
-    // 按**每个 blob 自己的格式**统计本卡服务区间的专家数与平均字节数。
-    // 混档 arena 不能再用缺省 Q4 blob 估算——那会把 Q3 槽也按 Q4 大小算，
-    // 白白少算几千个槽（2026-10-22 修正）。
-    let mut n_q4 = 0usize;
-    let mut n_q3 = 0usize;
-    let mut q4_bytes = 0u64;
-    let mut q3_bytes = 0u64;
-    for l in lo..hi {
-        for e in 0..arena.n_experts {
-            if let Some(b) = arena.routed(l, e)? {
-                let sz = (b.gu.len() + b.down.len()) as u64;
-                match b.format {
-                    BlobFormat::Q4G64F16S => {
-                        n_q4 += 1;
-                        q4_bytes += sz;
-                    }
-                    BlobFormat::Q3G128F16S => {
-                        n_q3 += 1;
-                        q3_bytes += sz;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    let blob_q4 = if n_q4 > 0 {
-        q4_bytes / n_q4 as u64
-    } else {
-        arena.gu_bytes + arena.down_bytes
-    };
-    let blob_q3 = if n_q3 > 0 { q3_bytes / n_q3 as u64 } else { 0 };
-    let mixed = n_q4 > 0 && n_q3 > 0;
-    let catalog = lingxi_model::catalog_from_artifact(art);
-    let mut w = [0u64; 2];
-    for (_tid, info) in catalog.iter() {
-        // 专家路由权重：Q4 arena 路径下不进显存（bf16 原档留在 host mmap）。
-        if matches!(info.role, TensorRole::MoeRoutedGateUp | TensorRole::MoeRoutedDown) {
-            continue;
-        }
-        let gpu = info
-            .name
-            .split("layers/")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .and_then(|s| s.parse::<u32>().ok())
-            .map_or(0usize, |l| if l >= split_lo { 1 } else { 0 });
-        w[gpu] += info.storage_bytes();
-    }
-    // P2 分页：KV 设备侧只开常驻窗口（`LINGXI_QSA_WIN_TOKENS`，默认 32K token）——
-    // 预算按窗口口径算，省下的全额 KV 直接变成专家槽。（indexer 的 rk/pooled 是
-    // 逻辑缓冲但懒增长到 len，不进预算。）
-    let cap = if lingxi_model::flag("LINGXI_QSA_PAGED") {
-        let win: usize = std::env::var("LINGXI_QSA_WIN_TOKENS")
-            .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1024)
-            .unwrap_or(32768);
-        kv_cap.min(win)
-    } else {
-        kv_cap // 调用方给 KV 池的实际容量（serve=serve_ctx+528，talk=rope_len+8）
-    };
-    const QSA_PER_DEV: usize = 6; // 12 层 full-attn 双卡各半
-    const GDN_PER_DEV: usize = 18; // 36 层 linear-attn 双卡各半
-    let kv_per_token_layer: u64 = if lingxi_model::flag("LINGXI_KV_K8V4") { 1184 } else { 2368 };
-    let kv = cap as u64 * kv_per_token_layer * QSA_PER_DEV as u64;
-    let gdn = 3_220_000u64 * GDN_PER_DEV as u64; // S 3.1MB + 卷积历史双缓冲 ~3.22MB/层
-    let reserve: u64 = if dev == 0 { 3 << 30 } else { 2500 << 20 }; // scratch/图/投机缓冲
-    let margin: u64 = 1 << 30; // 驱动/碎片边距
-    let dev_raw = cudarc::driver::result::device::get(dev as i32)?;
-    let total = unsafe { cudarc::driver::result::device::total_mem(dev_raw)? } as u64;
-    let budget = total.saturating_sub(margin);
-    let fixed = w[dev] + kv + gdn + reserve;
-    let remain = budget.saturating_sub(fixed);
-    let gib = |b: u64| b as f64 / (1 << 30) as f64;
-    let (slots, ledger) = if mixed {
-        let q4_slots = n_q4.min((remain / blob_q4) as usize);
-        let remain2 = remain.saturating_sub(q4_slots as u64 * blob_q4);
-        let q3_slots = n_q3.min((remain2 / blob_q3) as usize);
-        let slots = q4_slots + q3_slots;
-        let used = q4_slots as u64 * blob_q4 + q3_slots as u64 * blob_q3;
-        let all = q4_slots == n_q4 && q3_slots == n_q3;
-        let ledger = format!(
-            "[vram-budget] GPU{dev}: 总量 {:.1} − 边距 {:.1} − 权重 {:.1} − KV {:.2} \
-             − GDN {:.2} − 预留 {:.1} = 余 {:.1} GiB | Q4 {}/{} (blob {:.2}MB) + \
-             Q3 {}/{} (blob {:.2}MB) ⇒ 槽 {}，占用 {:.1} GiB{}",
-            gib(total), gib(margin), gib(w[dev]), gib(kv), gib(gdn), gib(reserve),
-            gib(remain),
-            q4_slots, n_q4, blob_q4 as f64 / (1 << 20) as f64,
-            q3_slots, n_q3, blob_q3 as f64 / (1 << 20) as f64,
-            slots, gib(used),
-            if all { "（全部专家可驻留）" } else { "" },
-        );
-        (slots, ledger)
-    } else {
-        let blob = if n_q4 > 0 { blob_q4 } else if n_q3 > 0 { blob_q3 } else { arena.gu_bytes + arena.down_bytes };
-        let slots = (remain / blob) as usize;
-        let ledger = format!(
-            "[vram-budget] GPU{dev}: 总量 {:.1} − 边距 {:.1} − 权重 {:.1} − KV {:.2} \
-             − GDN {:.2} − 预留 {:.1} = 余 {:.1} GiB ⇒ 槽 {} × blob {:.2}MB",
-            gib(total), gib(margin), gib(w[dev]), gib(kv), gib(gdn), gib(reserve),
-            gib(remain), slots, blob as f64 / (1 << 20) as f64,
-        );
-        (slots, ledger)
-    };
-    if slots == 0 {
-        anyhow::bail!(
-            "{ledger}\nautotune: GPU{dev} 预算连 1 个专家槽都装不下。降 LINGXI_SERVE_MAX_CTX、\
-             显式给 LINGXI_ARENA_SLOTS/LINGXI_LAYER_SPLIT_SLOTS，或检查权重分类是否漏了新角色。"
-        );
-    }
-    Ok(Some((slots, ledger)))
-}
-
-fn flash_next_meta() -> serde_json::Value {
-    serde_json::json!({
-        "hidden": 2560,
-        "hc": 4,
-        "lowrank": 320,
-        "eps": 1e-06,
-        "num_experts": 512,
-        "top_k": 10,
-        "inter": 640,
-        "num_attention_heads": 24,
-        "num_key_value_heads": 2,
-        "head_dim": 256,
-        "rot_dim": 64,
-        "indexer_n_heads": 4,
-        "indexer_kv_heads": 1,
-        "indexer_head_dim": 128,
-        "indexer_budget": 2048,
-        "indexer_compress_ratio": 4,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 48,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_conv_kernel_dim": 4,
-        "output_gate_type": "sigmoid",
-        "vocab_size": 248320,
-        "ple_layer_ids": [2],
-        "ple_embed_dim": 2560,
-        "ple_conv_kernel_size": 4,
-        "ngram_size": 3,
-        "heads_per_ngram": 8,
-        "ngram_vocab_size_base": 20000000,
-        "make_ngram_vocab_size_divisible_by": 128,
-        "seed": 1234,
-        "eos_token_id": 248044
-    })
-}
-
 /// MTP 草稿层（`mtp/layer/*` + `mtp/mixer/*`）。
 ///
-/// 结构与主干 QSA 层**同构**（§3.52 已交叉验证），所以这里只做"命名映射 + 构造"，
+/// 结构与主干 QSA 层**同构**（已交叉验证），所以这里只做"命名映射 + 构造"，
 /// 前向直接复用主干的 `layer_step` —— 不另写一份容易写错的注意力 / MoE。
 pub(crate) struct MtpLayer {
     pub(crate) weights: lingxi_model::layer::LayerWeights,
@@ -5678,17 +3006,46 @@ pub(crate) fn build_mtp_layer(
     } else {
         (up("attention/query_norm")?, up("attention/key_norm")?)
     };
+    // ★ 2026-10-25 `LINGXI_MTP_ATTN_Q4=1`（**默认开**，`=0` 回退）：
+    // MTP（草稿）层的 `attention/query_key_gate_value`（68.2 MB bf16）与 `attention/output`
+    // （31.5 MB）在线量化成 W4G64 —— 每步省 ~74 MB 的读，草稿 ~3.79 步/轮 ⇒ 约 −0.46 ms/轮。
+    // 为什么**不损质量**：贪心投机解码里草稿只决定"这一轮能接受几个"，
+    // 被接受的前缀永远是主干自己的 argmax ⇒ **草稿用什么权重都不改变生成文本**
+    // （判据：md5 必须与不开时相同；只有接受率可能微动，损了就把开关关掉）。
+    // 与主干同一套 `upload_q4_named`（带磁盘缓存），W4 形态 ⇒ 也顺带省 ~74 MB 显存。
+    // ⚠️ 2026-10-25 **默认已翻回 0（关）**：端到端 2×2 实测（200 token，同 prompt）
+    // 开 = 70.3/68.6 tok/s、49 轮、接受 149（3.04/轮）；关 = 78.4/79.0、47 轮、153（3.26/轮）。
+    // ⇒ 省下的 0.1 ms/轮被"接受率 3.26→3.04"吃成 **−10%**（生成的文本 md5 四跑全同，纯亏吞吐）。
+    // 连带修正一条授权边界：**"草稿权重可以随便量化"只对 head 成立**（head 的舍入只扰动
+    // 最终 argmax ~1e-7）；草稿的**注意力**权重会改变整层 hidden ⇒ 草稿分布漂移、接受率掉。
+    // `=1` 仍可开（代码与缓存都在），只作诊断/省显存用（−74 MB）。
+    let mtp_attn_q4 = std::env::var("LINGXI_MTP_ATTN_Q4").map(|v| v == "1").unwrap_or(false);
+    let up_m = |n: &str| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
+        if mtp_attn_q4 {
+            // 1 元素 stub：所有读取点都先看 `*_q4`，W4 档不会读它
+            Ok(unsafe { k.stream.alloc::<half::bf16>(1) }?)
+        } else {
+            up(n)
+        }
+    };
+    let q4_m = |n: &str| -> Result<Option<lingxi_model::q4::Q4W>> {
+        if mtp_attn_q4 {
+            Ok(Some(lingxi_model::gpu::upload_q4_named(k, art, &format!("{p}{n}"))?))
+        } else {
+            Ok(None)
+        }
+    };
     let weights = lingxi_model::layer::LayerWeights {
         attn_gr: gr("attn_gr")?,
         mlp_gr: gr("mlp_gr")?,
         attn: lingxi_model::layer::AttnWeights::Qsa {
             attn: lingxi_model::qsa::AttentionWeights {
-                query_key_gate_value: up("attention/query_key_gate_value")?,
-                query_key_gate_value_q4: None,
+                query_key_gate_value: up_m("attention/query_key_gate_value")?,
+                query_key_gate_value_q4: q4_m("attention/query_key_gate_value")?,
                 query_norm: q_norm,
                 key_norm: k_norm,
-                output: up("attention/output")?,
-                output_q4: None,
+                output: up_m("attention/output")?,
+                output_q4: q4_m("attention/output")?,
             },
             indexer: lingxi_model::qsa::IndexerWeights {
                 index_qk_proj: up("attention/indexer/index_qk_proj")?,
@@ -5714,527 +3071,6 @@ pub(crate) fn build_mtp_layer(
         block_inject: None,
     };
     Ok(MtpLayer { weights, k_layernorm_host: klay_h, mixer })
-}
-
-/// 装配两端权重：token embedding、末端 hyper-connection mixer、lm_head。
-fn load_endpoints(
-    k: &lingxi_kernels::Kernels,
-    art: &Artifact,
-) -> Result<lingxi_model::trunk::TrunkWeights> {
-    let token_embedding =
-        lingxi_model::gpu::upload_any_bf16(k, art, "text/token_embedding")?;
-    // `LINGXI_HEAD_Q4=1`：lm_head（1.18 GiB bf16，每 token 全读）在线量化成 W4G64，
-    // 省下 ~0.9 ms/token 的 GEMV 时间 + 0.87 GiB 显存（换成专家槽）。
-    let output_head_q4 = if lingxi_model::flag("LINGXI_HEAD_Q4") {
-        Some(lingxi_model::gpu::upload_q4_named(k, art, "text/output_head")?)
-    } else {
-        None
-    };
-    let output_head = if output_head_q4.is_some() {
-        unsafe { k.stream.alloc::<half::bf16>(1)? }
-    } else {
-        lingxi_model::gpu::upload_any_bf16(k, art, "text/output_head")?
-    };
-    let mup = |n: &str| {
-        lingxi_model::gpu::upload_any_bf16(k, art, &format!("text/hyper_connection_mixer/{n}"))
-    };
-    let mixer = lingxi_model::gr::GrWeights {
-        hc_norm: mup("hc_norm")?,
-        mix_down: mup("mix_down")?,
-        mix_up: mup("mix_up")?,
-        block_inject: None,
-    };
-    Ok(lingxi_model::trunk::TrunkWeights {
-        token_embedding,
-        mixer,
-        output_head,
-        output_head_q4,
-    })
-}
-
-/// 生成 RoPE 表并上传（device bf16 + host f32 各一份），`len` 需覆盖 prefill+decode。
-fn load_rope_tables(
-    k: &lingxi_kernels::Kernels,
-    len: usize,
-    rot_dim: usize,
-) -> Result<lingxi_driver::RopeTables> {
-    let (cos_h, sin_h) =
-        lingxi_model::rope::build_tables(len, rot_dim, lingxi_model::rope::ROPE_THETA);
-    let to_dev = |v: &[f32]| -> Result<_> {
-        Ok(k.stream
-            .clone_htod(&v.iter().map(|x| half::bf16::from_f32(*x)).collect::<Vec<_>>())?)
-    };
-    Ok(lingxi_driver::RopeTables {
-        cos: to_dev(&cos_h)?,
-        sin: to_dev(&sin_h)?,
-        cos_host: cos_h,
-        sin_host: sin_h,
-    })
-}
-
-/// 从产物装配一层的全部权重 + 形状（`layer-check` / `trunk-check` 共用）。
-struct BuiltLayer {
-    weights: lingxi_model::layer::LayerWeights,
-    /// indexer 池化 key 的归一化 gamma（host f32；GDN 层为空）
-    k_layernorm_host: Vec<f32>,
-    shape: lingxi_model::layer::LayerShape,
-    kind: lingxi_ids::LayerKind,
-}
-
-/// 由 golden meta 构造与层无关的 `LayerShape`（各层共用同一套超参）。
-fn layer_shape(meta: &serde_json::Value) -> lingxi_model::layer::LayerShape {
-    let u = |key: &str| meta[key].as_u64().unwrap() as usize;
-    let eps = meta["eps"].as_f64().unwrap() as f32;
-    lingxi_model::layer::LayerShape {
-        hidden: u("hidden"),
-        hc: u("hc"),
-        lowrank: u("lowrank"),
-        eps,
-        attn: lingxi_model::qsa::AttnCfg {
-            hidden: u("hidden"),
-            heads: u("num_attention_heads"),
-            kv_heads: u("num_key_value_heads"),
-            head_dim: u("head_dim"),
-            rot_dim: u("rot_dim"),
-            eps,
-        },
-        indexer: lingxi_model::qsa::IndexerCfg {
-            heads: u("indexer_n_heads"),
-            head_dim: u("indexer_head_dim"),
-            rot_dim: u("rot_dim"),
-            budget: u("indexer_budget"),
-            compress: u("indexer_compress_ratio"),
-            eps,
-        },
-        gdn: lingxi_model::gdn::GdnCfg {
-            hidden: u("hidden"),
-            num_k_heads: u("linear_num_key_heads"),
-            num_v_heads: u("linear_num_value_heads"),
-            head_k_dim: u("linear_key_head_dim"),
-            head_v_dim: u("linear_value_head_dim"),
-            conv_kernel: u("linear_conv_kernel_dim"),
-            gate_activation: lingxi_ids::GateActivation::from_name(
-                meta["output_gate_type"].as_str().unwrap_or("silu"),
-            )
-            .unwrap_or(lingxi_ids::GateActivation::Silu),
-        },
-        num_experts: u("num_experts"),
-        top_k: u("top_k"),
-        inter: u("inter"),
-    }
-}
-
-fn build_layer(
-    k: &lingxi_kernels::Kernels,
-    art: &Artifact,
-    meta: &serde_json::Value,
-    layer: u32,
-    sparse: bool,
-    cache: Option<&host_cache::HostCache>,
-) -> Result<BuiltLayer> {
-    let u = |key: &str| meta[key].as_u64().unwrap() as usize;
-    let hidden = u("hidden");
-    let hc = u("hc");
-    let eps = meta["eps"].as_f64().unwrap() as f32;
-    let p = format!("text/layers/{layer}/");
-    // dense 权重：有 host cache 走常驻缓存（未命中同步填、后台预读提前一层），
-    // 无 cache（对拍命令）走原始产物直读。
-    let up = |n: &str| -> Result<_> {
-        let name = format!("{p}{n}");
-        match cache {
-            Some(c) => c.upload_dense(k, &name),
-            None => lingxi_model::gpu::upload_any_bf16(k, art, &name),
-        }
-    };
-
-    // 【已否决的实验，留档于此】曾试过 `LINGXI_GR_Q4=1` 把 GR 的 mix_down/mix_up 转 W4G64
-    // （它们 1.26 GB/token，占全量流量 27%，却一直是 bf16）。整机实测 33 ms → **12 s/token**
-    // （慢 360 倍），且 launch-bench 逐形状算下来**净亏**：mix_down [320,10240] 的 Q4 只有
-    // `n/8 = 40` 个 block，14.4 µs 反而慢于 bf16 的 9.3 µs。**方向关闭，代码已撤。**
-    let attn_gr = lingxi_model::gr::GrWeights {
-        hc_norm: up("attn_gr/hc_norm")?,
-        mix_down: up("attn_gr/mix_down")?,
-        mix_up: up("attn_gr/mix_up")?,
-        block_inject: Some(up("attn_gr/block_inject")?),
-    };
-    let mlp_gr = lingxi_model::gr::GrWeights {
-        hc_norm: up("mlp_gr/hc_norm")?,
-        mix_down: up("mlp_gr/mix_down")?,
-        mix_up: up("mlp_gr/mix_up")?,
-        block_inject: Some(up("mlp_gr/block_inject")?),
-    };
-    let moe = lingxi_model::moe::MoeWeights {
-        router_shared_gate: up("moe/router_shared_gate")?,
-        // sparse=true：512 个专家不预上传（每层省约 5GB），运行时由 ExpertSource
-        // 按路由结果只取命中专家（prefill ≤rows*top_k、decode=top_k 个）
-        routed_gate_up: if sparse {
-            None
-        } else {
-            Some(up("moe/routed_gate_up")?)
-        },
-        routed_down: if sparse { None } else { Some(up("moe/routed_down")?) },
-        shared_gate_up: up("moe/shared_gate_up")?,
-        shared_down: up("moe/shared_down")?,
-    };
-
-    // `LINGXI_DENSE_Q4=1`：把最大的几块稠密矩阵在线量化成 W4G64（decode 走融合反量化 GEMV）。
-    // 这些矩阵实测全是纯带宽受限（launch-bench 分形状表 ~700 GB/s），是 decode 的主要流量。
-    let dense_q4 = lingxi_model::flag("LINGXI_DENSE_Q4");
-    let q4of = |name: &str| -> Result<Option<lingxi_model::q4::Q4W>> {
-        if !dense_q4 {
-            return Ok(None);
-        }
-        // 按张量名的磁盘缓存：命中就连 bf16 都不读（"提前算好、之后只取"）。
-        Ok(Some(lingxi_model::gpu::upload_q4_named(k, art, name)?))
-    };
-    // W4 模式下**不再上传这些矩阵的 bf16**（省 ~6 GiB → 直接换成更多专家槽）。
-    // 留 1 元素 stub 只为满足结构体类型；所有读取点都先看 `*_q4`，走 W4 时不会读它。
-    // （`gdn_forward` / `attention_forward` 这类非增量路径仍读 bf16 → 那些子命令不要开 W4。）
-    let up_w = |name: &str| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
-        if dense_q4 {
-            Ok(unsafe { k.stream.alloc::<half::bf16>(1) }?)
-        } else {
-            up(name)
-        }
-    };
-    // QSA 的两块单独开关（`LINGXI_DENSE_Q4_QSA=1`）：实测 GDN 侧稳定，QSA 侧在长序列下会
-    // 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`（未定位完），所以默认分开控制。
-    let qsa_q4 = lingxi_model::flag("LINGXI_DENSE_Q4_QSA");
-    let q4of_qsa = |name: &str| -> Result<Option<lingxi_model::q4::Q4W>> {
-        if !qsa_q4 {
-            return Ok(None);
-        }
-        q4of(name)
-    };
-
-    let kind = lingxi_model::layer_kind(layer);
-
-    let (attn, klay_h) = match kind {
-        lingxi_ids::LayerKind::QsaSparseAttention => {
-            let klay = up("attention/indexer/k_layernorm")?;
-            let klay_h: Vec<f32> = k.stream.clone_dtoh(&klay)?.iter().map(|v| v.to_f32()).collect();
-            let w = lingxi_model::layer::AttnWeights::Qsa {
-                attn: lingxi_model::qsa::AttentionWeights {
-                    query_key_gate_value: if qsa_q4 { up_w("attention/query_key_gate_value")? } else { up("attention/query_key_gate_value")? },
-                    query_key_gate_value_q4: q4of_qsa(&format!("{p}attention/query_key_gate_value"))?,
-                    query_norm: up("attention/query_norm")?,
-                    key_norm: up("attention/key_norm")?,
-                    output: if qsa_q4 { up_w("attention/output")? } else { up("attention/output")? },
-                    output_q4: q4of_qsa(&format!("{p}attention/output"))?,
-                },
-                indexer: lingxi_model::qsa::IndexerWeights {
-                    index_qk_proj: up("attention/indexer/index_qk_proj")?,
-                    q_layernorm: up("attention/indexer/q_layernorm")?,
-                    k_layernorm: up("attention/indexer/k_layernorm")?,
-                },
-            };
-            (w, klay_h)
-        }
-        lingxi_ids::LayerKind::GdnLinearAttention => {
-            let w = lingxi_model::layer::AttnWeights::Gdn(lingxi_model::gdn::GdnWeights {
-                query_key_value_z: up_w("gdn/query_key_value_z")?,
-                query_key_value_z_q4: q4of(&format!("{p}gdn/query_key_value_z"))?,
-                a_b_projection: up("gdn/a_b_projection")?,
-                convolution: up("gdn/convolution")?,
-                norm: up("gdn/norm")?,
-                output: up_w("gdn/output")?,
-                output_q4: q4of(&format!("{p}gdn/output"))?,
-                a_log: lingxi_model::gpu::read_fp32_host(art, &format!("{p}gdn/a_log"))?,
-                dt_bias: lingxi_model::gpu::read_fp32_host(art, &format!("{p}gdn/dt_bias"))?,
-            });
-            (w, Vec::new())
-        }
-    };
-
-    let shape = layer_shape(meta);
-
-    // PLE（仅 layer 1；权重是全局的 `text/ple/*`）
-    let ple_ids: Vec<i64> = meta["ple_layer_ids"]
-        .as_array()
-        .map(|a| a.iter().map(|v| v.as_i64().unwrap()).collect())
-        .unwrap_or_default();
-    let ple = if ple_ids.contains(&(layer as i64 + 1)) {
-        let cfg = lingxi_model::plet::PleCfg {
-            hidden,
-            hc,
-            embed_dim: u("ple_embed_dim"),
-            ngram_size: u("ngram_size"),
-            heads_per_ngram: u("heads_per_ngram"),
-            ngram_vocab_base: u("ngram_vocab_size_base") as u64,
-            unigram_vocab: u("vocab_size") as u64,
-            divisible_by: u("make_ngram_vocab_size_divisible_by") as u64,
-            seed: u("seed") as u64,
-            eos: meta["eos_token_id"].as_i64().unwrap(),
-            conv_kernel: u("ple_conv_kernel_size"),
-            eps,
-            // PLE 表路径（**不写死，四级解析，兜底响亮警告不静默**）：
-            //   1. `LINGXI_PLE_TABLE` 显式指定（最高优先）；
-            //   2. /dev/shm 官方 IQ4_NL 表（26.8GB，量化器 quantize_ple_iq4nl.py 产出）；
-            //   3. /dev/shm 官方 FP8 表（51.2GB，extract_ple_fp8.py 产出）；
-            //   4. 兜底 lingxi-assets bf16（102GB 机械盘）——**打响亮横幅**（慢 5×，不许静默）。
-            // 格式自动识别：`.iq4nl` sidecar ⇒ IQ4_NL；`.scale` sidecar ⇒ FP8；否则 bf16。
-            table_path: std::env::var("LINGXI_PLE_TABLE").unwrap_or_else(|_| {
-                // 优先级：shm iq4nl（26.8G）> shm fp8（51.2G）> 磁盘 bf16 兜底（102G，慢！）
-                for (cand, sidecar) in [
-                    ("/dev/shm/qwen4_exp.ple-table.iq4nl.bin", ".iq4nl"),
-                    ("/dev/shm/qwen4_exp.ple-table.fp8.bin", ".scale"),
-                ] {
-                    // 必须同时存在 sidecar（量化器的完成标记）：只检文件本体的话，
-                    // 量化器 prealloc 的**半写完**文件会被当完整表读（实测：读穿 EOF
-                    // "failed to fill whole buffer"）。
-                    if std::path::Path::new(cand).exists()
-                        && std::path::Path::new(&format!("{cand}{sidecar}")).exists()
-                    {
-                        return cand.to_string();
-                    }
-                }
-                // ⚠️ **响亮兜底**：/dev/shm 的内存表丢了（机器重启/crash 会清 shm）才走这里。
-                // 磁盘随机读 prefill 慢 5 倍级（实测 60ms/行 vs 11.3ms/行）——绝不让它静默发生。
-                eprintln!(
-                    "╔══════════════════════════════════════════════════════════════════╗\n\
-                     ║ ⚠️  PLE 表回退到机械盘 bf16（lingxi-assets，102GB）——prefill 将慢 5× ║\n\
-                     ║     内存表丢失。恢复：python3 tools/convert/extract_ple_fp8.py     ║\n\
-                     ║     （或 quantize_ple_iq4nl.py），或显式 LINGXI_PLE_TABLE=...     ║\n\
-                     ╚══════════════════════════════════════════════════════════════════╝"
-                );
-                "/data/models/lingxi-assets/qwen4_exp.ple-table.bin".to_string()
-            }),
-        };
-        let derived = lingxi_model::plet::PleDerived::new(&cfg, 0);
-        let pup = |n: &str| lingxi_model::gpu::upload_any_bf16(k, art, &format!("text/ple/{n}"));
-        // 产物的 convolution 是 `[dim, K]`（HF 卷积权重布局），转成卷积核要的 `[K, dim]`
-        let dim = hc * hidden;
-        let kk = cfg.conv_kernel;
-        let conv_h = lingxi_model::gpu::read_f32_host(k, art, "text/ple/convolution")?;
-        let mut t_h = vec![0f32; kk * dim];
-        for c in 0..dim {
-            for kk_i in 0..kk {
-                t_h[kk_i * dim + c] = conv_h[c * kk + kk_i];
-            }
-        }
-        let convolution = k
-            .stream
-            .clone_htod(&t_h.iter().map(|v| half::bf16::from_f32(*v)).collect::<Vec<_>>())?;
-        let table = lingxi_model::plet::PleTable::open(&cfg.table_path, derived.head_dim)?;
-        Some(lingxi_model::plet::PleWeights {
-            key_proj: pup("key_proj")?,
-            value_proj: pup("value_proj")?,
-            norm_key: pup("norm_key")?,
-            norm_query: pup("norm_query")?,
-            norm_conv: pup("norm_conv")?,
-            convolution,
-            cfg,
-            derived,
-            table,
-        })
-    } else {
-        None
-    };
-
-    Ok(BuiltLayer {
-        weights: lingxi_model::layer::LayerWeights { attn_gr, mlp_gr, attn, moe, ple },
-        k_layernorm_host: klay_h,
-        shape,
-        kind,
-    })
-}
-
-/// 瘦身专家源（P1）：路由后只取命中专家；host 字节走 [`host_cache::HostCache`]
-/// （LRU + 并行冷读），device 侧再经 [`host_cache::DeviceExpertLru`] 让热专家
-/// 整槽常驻显存。
-///
-/// 自带一对 device 紧凑张量作为 scratch，跨层跨步复用（48 层 × N 步只用同一块
-/// 显存逐层覆写）。driver 单序列单线程调用，故用 UnsafeCell 提供 &self 内部可变性。
-struct MmapExpertSource<'a> {
-    k: &'a lingxi_kernels::Kernels,
-    cache: &'a host_cache::HostCache,
-    dev: std::cell::UnsafeCell<host_cache::DeviceExpertLru>,
-    scratch: std::cell::UnsafeCell<ExpertScratch>,
-}
-
-struct ExpertScratch {
-    dgu: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    ddn: Option<cudarc::driver::CudaSlice<half::bf16>>,
-}
-
-// 安全前提：ExpertSource 仅在 driver 单序列的主线程逐层调用，不跨线程共享；
-// 返回的 ExpertHits 借用在下一次 load_hits 之前必然用完（单层 MoE 内成立）。
-unsafe impl Sync for MmapExpertSource<'_> {}
-
-impl<'a> MmapExpertSource<'a> {
-    fn new(
-        k: &'a lingxi_kernels::Kernels,
-        cache: &'a host_cache::HostCache,
-        inter: usize,
-        hidden: usize,
-        dev_gb: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            k,
-            cache,
-            dev: std::cell::UnsafeCell::new(host_cache::DeviceExpertLru::new(
-                k, dev_gb, inter, hidden,
-            )?),
-            scratch: std::cell::UnsafeCell::new(ExpertScratch { dgu: None, ddn: None }),
-        })
-    }
-}
-
-impl<'a> lingxi_model::moe::ExpertSource for MmapExpertSource<'a> {
-    fn load_hits<'b>(
-        &'b self,
-        layer: u32,
-        experts: &[u32],
-        inter: usize,
-        hidden: usize,
-        _want_q4: bool,
-        _overlap: bool,
-    ) -> Result<lingxi_model::moe::ExpertHits<'b>> {
-        let per_gu = 2 * inter * hidden;
-        let per_dn = hidden * inter;
-        // 1) host 字节：mmap 只读视图（零拷贝；首次触页在 fill 并行线程里读盘）
-        let prof = std::env::var("LINGXI_PROF").is_ok();
-        let tf = std::time::Instant::now();
-        let blobs = self.cache.fetch_hits(layer, experts, inter, hidden)?;
-        if prof {
-            eprintln!(
-                "    [fetch ] 层 {layer:2} {} 槽视图 {:.3}s",
-                experts.len(),
-                tf.elapsed().as_secs_f64()
-            );
-        }
-        // 2) device LRU 聚集进 scratch（热槽 dtod / 冷槽分槽 htod + 回填）
-        {
-            let sc = unsafe { &mut *self.scratch.get() };
-            let ngu = experts.len() * per_gu;
-            let ndn = experts.len() * per_dn;
-            if sc.dgu.as_ref().map_or(0, |s| s.len()) < ngu {
-                sc.dgu = Some(unsafe { self.k.stream.alloc::<half::bf16>(ngu) }?);
-            }
-            if sc.ddn.as_ref().map_or(0, |s| s.len()) < ndn {
-                sc.ddn = Some(unsafe { self.k.stream.alloc::<half::bf16>(ndn) }?);
-            }
-            let dev = unsafe { &mut *self.dev.get() };
-            dev.fill(
-                self.k,
-                layer,
-                experts,
-                &blobs,
-                sc.dgu.as_mut().unwrap(),
-                sc.ddn.as_mut().unwrap(),
-            )?;
-        }
-        let sc = unsafe { &*self.scratch.get() };
-        Ok(lingxi_model::moe::ExpertHits {
-            gate_up: sc.dgu.as_ref().unwrap(),
-            down: sc.ddn.as_ref().unwrap(),
-            q4: None,
-            q4_alt: None,
-            bits_sel: Vec::new(),
-        })
-    }
-}
-
-/// 流式层供给：每层每步现建、用后即弃（对拍 / 全量对照路径，保持原行为）。
-struct StreamingProvider<'a> {
-    cur: Option<lingxi_model::trunk::LoadedLayer>,
-    build: Box<dyn FnMut(u32) -> Result<lingxi_model::trunk::LoadedLayer> + 'a>,
-}
-
-impl<'a> lingxi_driver::LayerProvider for StreamingProvider<'a> {
-    fn layer(&mut self, i: u32) -> Result<&lingxi_model::trunk::LoadedLayer> {
-        self.cur = Some((self.build)(i)?);
-        Ok(self.cur.as_ref().unwrap())
-    }
-}
-
-/// dense 显存常驻供给：每层 dense 权重只在第一次访问时构建一次，之后全部驻留
-/// 显存、跨 decode 步按引用复用——decode 每层每步权重逐字节相同，没有任何理由
-/// 重新 H2D（注意 `CudaSlice::clone` 会真复制显存，所以只能走引用复用）。
-/// sparse 模式下专家张量不在这里，仍由 `ExpertSource` 每步按路由注入。
-struct DeviceLayerCache<'a> {
-    slots: Vec<Option<lingxi_model::trunk::LoadedLayer>>,
-    build: Box<dyn FnMut(u32) -> Result<lingxi_model::trunk::LoadedLayer> + 'a>,
-}
-
-impl<'a> lingxi_driver::LayerProvider for DeviceLayerCache<'a> {
-    fn layer(&mut self, i: u32) -> Result<&lingxi_model::trunk::LoadedLayer> {
-        let idx = i as usize;
-        if self.slots[idx].is_none() {
-            self.slots[idx] = Some((self.build)(i)?);
-        }
-        Ok(self.slots[idx].as_ref().unwrap())
-    }
-    fn as_cache(&self) -> Option<&dyn lingxi_driver::LayerCache> {
-        Some(self)
-    }
-}
-
-/// SAFETY：**只允许在全部层预热之后、且不再调用 `layer()` 的前提下跨线程读**。
-/// `build` 只在 `&mut self` 的 `layer()` 里访问；`peek` 只读 `slots`。
-unsafe impl<'a> Sync for DeviceLayerCache<'a> {}
-
-impl<'a> lingxi_driver::LayerCache for DeviceLayerCache<'a> {
-    fn peek(&self, i: u32) -> Option<&lingxi_model::trunk::LoadedLayer> {
-        self.slots[i as usize].as_ref()
-    }
-}
-
-fn categorize(name: &str) -> &'static str {
-    if name == "text/token_embedding" {
-        return "embedding";
-    }
-    if name == "text/output_head" {
-        return "output_head";
-    }
-    if name.starts_with("text/ple/") {
-        return "ple";
-    }
-    if name.starts_with("mtp/") {
-        return "mtp";
-    }
-    if name.ends_with("/routed_gate_up") || name.ends_with("/routed_down") {
-        return "moe_routed_experts";
-    }
-    if name.ends_with("/router_shared_gate") {
-        return "moe_router";
-    }
-    if name.ends_with("/shared_gate_up") || name.ends_with("/shared_down") {
-        return "moe_shared";
-    }
-    if name.contains("/indexer/") {
-        return "qsa_indexer";
-    }
-    if name.contains("/attention/") {
-        return "qsa_attention";
-    }
-    if name.contains("/gdn/") {
-        return "gdn";
-    }
-    if name.ends_with("hc_norm")
-        || name.ends_with("block_inject")
-        || name.ends_with("mix_down")
-        || name.ends_with("mix_up")
-    {
-        return "gr";
-    }
-    "other"
-}
-
-/// 把 canonical 名归到所属层（`text/layers/N`、`mtp/...`、`text/ple`、`top`）。
-fn layer_of(name: &str) -> String {
-    if let Some(rest) = name.strip_prefix("text/layers/") {
-        if let Some(idx) = rest.split('/').next() {
-            return format!("text/layers/{idx}");
-        }
-    }
-    if name.starts_with("mtp/") {
-        return "mtp".to_string();
-    }
-    if name.starts_with("text/ple/") {
-        return "text/ple".to_string();
-    }
-    "top".to_string()
 }
 
 fn read_f32(p: &std::path::Path) -> Vec<f32> {

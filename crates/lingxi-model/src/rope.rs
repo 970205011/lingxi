@@ -1,12 +1,12 @@
 //! RoPE 频率表生成（模型知识，纯 host f32，无 GPU）。
 //!
 //! 数学等价 HF `Qwen4ExpTextRotaryEmbedding`（rope_type="default"）：
-//! ```text
-//! inv_freq[i] = 1 / theta^(2i/rot_dim)          i ∈ [0, rot_dim/2)
+//! `text
+//! inv_freq[i] = 1 / theta^(2i/rot_dim) i ∈ [0, rot_dim/2)
 //! freqs[p, i] = p * inv_freq[i]
 //! cos[p] = concat(cos(freqs[p]), cos(freqs[p])) # HF recomposition：cat 两份
 //! sin[p] = concat(sin(freqs[p]), sin(freqs[p]))
-//! ```
+//! `
 //! 末尾的「复制两份」与 NEOX 布局（前/后半旋转）配对，正是
 //! `lingxi_rope_partial_inplace_bf16` kernel 里 `(d, d+rot_dim/2)` 的读法。
 //!

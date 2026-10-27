@@ -38,7 +38,7 @@
   外部大表（PLE/n-gram 表、专家区）生成、以及任何需要重排/重编码的工作。
 - 产物里存的必须是 **kernel 可以直接消费的形态**：`row-split-k128-v1` 的行可寻址、K 对齐补零、
   平面 256B 对齐，都是为此服务——**运行时不做反量化、不做转置、不做融合、不建临时表**。
-- L0 Plan 在加载期一次算死全部 offset，之后只读（`ARCHITECTURE.md` §1）。
+- L0 Plan 在加载期一次算死全部 offset，之后只读（`ARCHITECTURE.md` ）。
 - 目的：**GPU 的带宽与算力 100% 用于前向计算**，不被"准备数据"消耗。
   （MoE decode 只读命中专家；若运行时还要把权重重排一遍，就是纯浪费。）
 - 因此：新需求优先考虑"能否离线预生成/预处理"，而不是"运行时能不能算出来"。
@@ -56,8 +56,8 @@ lingxi-model          （前向；依赖 ids + plan + kernels + artifact）
   ↑
 lingxi-driver         （调度/槽位/批循环）
   ↑
-lingxi-server         （HTTP/SSE）
-lingxi-bench          （旁路工具；依赖 plan/artifact/model，不反向）
+lingxi-bench::serve   （HTTP/SSE 服务 + 监视面板；生产路径）
+lingxi-bench 其余     （旁路工具；依赖 plan/artifact/model，不反向）
 ```
 
 ## 2. `lingxi-ids`：唯一的跨模块契约
@@ -105,14 +105,14 @@ pub trait ModelSpec {
 - ** lingxi-model **：前向 = `forward_layer(&Weights, &mut Ctx, LayerId)`。MTP 层是"第 49 层"。
   **只做数学编排，不做调度、不做 IO。**
 - ** lingxi-driver **：slot 池、准入、静态批 decode 循环、MTP draft/verify、前缀共享、取消。**不做 HTTP。**
-- ** lingxi-server **：HTTP/SSE/分词。**不做计算、不做调度决策。**
-- ** lingxi-bench **：压测与对拍入口；golden 消费。**旁路，不进热路径。**
+- ** lingxi-bench **：压测与对拍入口；golden 消费；`serve` 子命令是生产 HTTP 服务
+  （OpenAI 兼容 + SSE + 可选监视面板，见 README §监控面板）。**旁路，不进热路径。**
 
 ## 4. 可更替设计（未来换模型 / 换实现）
 
 - 换 kernel：改 `KernelRegistry` 映射（`OpId→KernelId`）即可，model 不动。
 - 换模型：新增一个 `impl ModelSpec` + 一个新 catalog；`lingxi-artifact`/`plan`/`kernels`/`driver` 不动。
-- 换服务协议：只改 `lingxi-server`。
+- 换服务协议：只改 `lingxi-bench/src/serve`。
 - 加功能（如新采样器、新注意力）：新增 `OpId` + 实现 + 注册，旧路径字节不变。
 
 ## 5. 调试纪律（血泪）

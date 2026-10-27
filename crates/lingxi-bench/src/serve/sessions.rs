@@ -107,7 +107,7 @@ impl Sessions {
             return Ok(());
         }
         // 1) 未物化：若已达多物化上限，先把最久未动的 live 会话沉掉（图 epoch 随之回收）。
-        //    `protect` = 正在生成中的会话（并发路径传入）——绝不当牺牲者。
+        // `protect` = 正在生成中的会话（并发路径传入）——绝不当牺牲者。
         if self.live.len() >= self.max_mat {
             let victim = self
                 .live

@@ -1,13 +1,13 @@
 //! 主干装配：`embedding → hc 广播 → 48 层 → hyper_connection_mixer → lm_head`。
 //!
 //! 严格对齐 HF `Qwen4ExpTextModel.forward` + `Qwen4ExpForCausalLM.forward`：
-//! ```text
-//! emb   = embed_tokens(ids)                     # [T, H]
-//! hyper = emb.repeat(1, 1, hc)                  # [T, hc*H]
-//! for i in 0..n_layers: hyper = layer_i(hyper)  # 单层见 `layer` 模块
-//! mixed = hyper_connection_mixer(hyper)         # GR(use_combine=False) → [T, H]
-//! logits = lm_head(mixed)                       # [T, vocab]（无最终 norm）
-//! ```
+//! `text
+//! emb = embed_tokens(ids) # [T, H]
+//! hyper = emb.repeat(1, 1, hc) # [T, hc*H]
+//! for i in 0..n_layers: hyper = layer_i(hyper) # 单层见 `layer` 模块
+//! mixed = hyper_connection_mixer(hyper) # GR(use_combine=False) → [T, H]
+//! logits = lm_head(mixed) # [T, vocab]（无最终 norm）
+//! `
 //!
 //! **权重分层流式**：48 层合计 228 GiB，不可能同时常驻 32G 显存；因此本模块
 //! 不持有层权重，而是通过 `load_layer` 回调**逐层取用**（调用方决定常驻/流式）。
@@ -179,7 +179,7 @@ pub fn argmax_rows_bf16(logits: &[bf16], rows: usize, vocab: usize) -> Vec<u32> 
 /// 口径与 [`topk_rows`] **逐位相同**（同值取更小下标；满 K 后只接受**严格更大**），
 /// 所以它是 `topk_rows` 的位等价替代。
 ///
-/// 为什么要它（`docs/PLAN.md` §P13.5）：`mtp_step` 每步要对 248K 个 logits 做
+/// 为什么要它：`mtp_step` 每步要对 248K 个 logits 做
 /// 「建 1 MB f32 Vec + argmax 一趟 + topk 一趟」，KTS 实测 **0.90 ms/步**
 /// × 5 步 = **4.5 ms/轮（3.2%）**，而且**每步都让 GPU 空等**。
 /// 这里改成单趟直接从 bf16 读（bf16→f32 是精确的，所以比较结果不变）。

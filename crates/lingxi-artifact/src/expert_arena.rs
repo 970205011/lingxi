@@ -7,14 +7,14 @@
 //! 本文件只做**只读解析 + 段几何**：不量化、不重转、不碰 CUDA。
 //!
 //! 文件布局（little endian）：
-//! ```text
+//! `text
 //! ArenaHeader(72B) | routed index [n_layers*n_expert * ArenaBlobRef(16B)]
-//!                  | shared index [n_layers * ArenaBlobRef(16B)]
-//!                  | pad→slot_align | data（各 blob 按 slot_align 对齐）
+//! | shared index [n_layers * ArenaBlobRef(16B)]
+//! | pad→slot_align | data（各 blob 按 slot_align 对齐）
 //! routed blob = [gate_up][down]；shared blob = [gate][up][down]（各补齐到公共步长）
 //! ArenaBlobRef = { i64 offset(相对 data 区起点), i32 bytes, i32 format }
 //! format: 0=BF16 1=Q4G64_F16S 2=Q5G64_F16S 3=Q6G64_F16S 4=W8G32_F16S
-//! ```
+//! `
 //! 每个 blob 自带格式字 → 同一 arena 可混合精度（见 ninfer M2.6）。
 
 use std::fs::File;
@@ -222,7 +222,7 @@ pub struct ExpertArena {
     pub flags: i32,
     /// ⚠️ **缺省格式几何**（R1 几何单源化，2026-10-21）：open 时按**首个 routed ref 的格式**
     /// 推导的 gu/down 段 payload 字节数。**同 arena 内格式可能混合，本字段只代表缺省格式**——
-    /// 任何拿到了 blob 自己格式（`routed()` 的 `BlobRef.format`）的消费侧都必须用
+    /// 任何拿到了 blob 自己格式（`routed` 的 `BlobRef.format`）的消费侧都必须用
     /// `matrix_layout(fmt, rows, cols).payload_bytes` 自算，禁止读本字段（10-19/10-20 两次
     /// dn 段偏移雷的根源：混档下按缺省格式取几何）。本字段仅保留给"整 arena 单格式"的
     /// 簿记路径（重钉/A2 补槽，均有 !mixed 闸门）。
@@ -284,7 +284,7 @@ impl ExpertArena {
         }
 
         // 段几何缺省：生产 arena 是**均匀档**（全 Q4G64 或全 Q3G128），按首个 routed
-        // ref 的格式推导；混档 arena 逐 blob 以自己的格式为准（见 routed()），
+        // ref 的格式推导；混档 arena 逐 blob 以自己的格式为准（见 routed），
         // 这里仅是 gu_bytes/down_bytes 缺省值。
         let default_fmt = if flags & FLAG_BLOB_FORMATS != 0 {
             let o = routed_index_off as usize;
@@ -398,7 +398,7 @@ impl ExpertArena {
 
 /// 再开一份**可写**的 `MAP_SHARED` 映射（与 `open` 的只读映射是**同一份页**，不额外占内存）。
 ///
-/// 为什么要它（docs/PLAN.md §P13.9b）：`CU_MEMHOSTREGISTER_READ_ONLY` 的语义是"让设备**读**这块
+/// 为什么要它：`CU_MEMHOSTREGISTER_READ_ONLY` 的语义是"让设备**读**这块
 /// host 内存"（zero-copy 映射），**不是把页锁好给 DMA 用** —— 从它发起的 H2D 实测只有 8.6 GB/s，
 /// 而且**与 kernel 完全不可重叠**（把拷贝挪到第二条流，专家段"每 miss 增量"一点没变）。
 /// 而 `DEFAULT/PORTABLE` 注册要求 VMA **可写**（对 `PROT_READ` 映射必返回 `invalid argument`，

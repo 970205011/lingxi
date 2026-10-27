@@ -9,11 +9,11 @@
 // warp tile = 8(T) x 32(N)。T=8 时 A 行利用率 100%（旧的 32x8 映射在 T=8 只用到 25%）。
 //
 // 三件"装载"事实（照抄 ninfer，别重新推导）：
-//  1. **我们的 Q4 存储顺序天然就是 B-fragment 顺序**：一个 code byte 解成 half2(k, k+1)，
-//     `((b & 0x0f) | ((b & 0xf0) << 12)) | 0x64006400` 再减 1032 就得到 (n^8)-8 —— 无需预打包。
-//  2. 一个 fp16 group scale 正好覆盖 64 个 k = 16 个 mma slice。
-//  3. 权重读是 DRAM 主流量且**完全不合并**（32 lane 读 32 行）⇒ 每个 lane 一次读满 128B
-//     （kBlk=4 组），把 2*kBlk 个 load 放在飞。
+// 1. **我们的 Q4 存储顺序天然就是 B-fragment 顺序**：一个 code byte 解成 half2(k, k+1)，
+// `((b & 0x0f) | ((b & 0xf0) << 12)) | 0x64006400` 再减 1032 就得到 (n^8)-8 —— 无需预打包。
+// 2. 一个 fp16 group scale 正好覆盖 64 个 k = 16 个 mma slice。
+// 3. 权重读是 DRAM 主流量且**完全不合并**（32 lane 读 32 行）⇒ 每个 lane 一次读满 128B
+// （kBlk=4 组），把 2*kBlk 个 load 放在飞。
 //
 // 与我们在 SIMT 路径的数值差异：这里是 fp16(权重×group scale) 进 fp16 张量核、fp32 累加；
 // SIMT 是 int4 精确值 × f32 scale。差 ~2^-11 相对（远小于 bf16 输出舍入 2^-8）⇒
@@ -50,20 +50,27 @@ __device__ __forceinline__ void mma_qpn(float (&d)[8], unsigned a0, unsigned a1,
 
 // slot 版：一个 CTA 服务**一个专家**（blockIdx.y），输出该专家命中的 t 行（t = 组大小）。
 // grid = (ceil(n/32), n_experts)，block = 128。
+// `gidx != nullptr`（2026-10-24 组压缩）：blockIdx.y 是**本格式组列表**的下标，
+// 真实组下标 = gidx[e]；边界/槽号仍从全表取 ⇒ 每组的计算逐位不变，只是不再给对侧空块。
 template <int kTiles, int kBlk>
 __device__ __forceinline__ void q4_slots_tc_body(
     const std::uint8_t* __restrict__ slots, const std::int32_t* __restrict__ slot_ids,
     const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
-    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
+    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off,
+    const std::int32_t* __restrict__ gidx) {
     using S = QpnS;
     const int e = static_cast<int>(blockIdx.y);
-    const int s0 = group_off[e];
-    const int t = group_off[e + 1] - s0;
+    const int gi = (gidx != nullptr) ? static_cast<int>(gidx[e]) : e;
+    const int s0 = group_off[gi];
+    const int t = group_off[gi + 1] - s0;
     if (t <= 0) {
         return;
     }
-    const int slot = slot_ids[e];
+    const int slot = slot_ids[gi];
+    if (slot < 0) {
+        return; // 混档单 launch：他格式组的哨兵槽，跳过
+    }
     const int groups = k_pad / S::kGroupK; // 组数按**补齐后**的 k 算
     const int kpad_groups = (k + S::kGroupK - 1) / S::kGroupK;
     (void)kpad_groups;
@@ -207,9 +214,10 @@ lingxi_gemv_q4g64_slots_tc_bf16(
     const std::uint8_t* __restrict__ slots, const std::int32_t* __restrict__ slot_ids,
     const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
-    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
+    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off,
+    const std::int32_t* __restrict__ gidx) {
     q4_slots_tc_body<1, 4>(slots, slot_ids, group_off, x, y, n, k, a_stride, k_pad, blob,
-                           seg_off, scale_off);
+                           seg_off, scale_off, gidx);
 }
 
 extern "C" __global__ void __launch_bounds__(QpnS::kThreads, 8)
@@ -217,9 +225,10 @@ lingxi_gemv_q4g64_slots_tc2_bf16(
     const std::uint8_t* __restrict__ slots, const std::int32_t* __restrict__ slot_ids,
     const std::int32_t* __restrict__ group_off, const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ y, int n, int k, int a_stride, int k_pad,
-    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off) {
+    std::int64_t blob, std::int64_t seg_off, std::int64_t scale_off,
+    const std::int32_t* __restrict__ gidx) {
     q4_slots_tc_body<2, 4>(slots, slot_ids, group_off, x, y, n, k, a_stride, k_pad, blob,
-                           seg_off, scale_off);
+                           seg_off, scale_off, gidx);
 }
 
 #endif // sm_70

@@ -3,7 +3,7 @@
 """验证 Q3G128 专家 arena 的质量：解出专家权重，与 BF16 产物逐元素对拍。
 
 与 q4_arena_check.py 同构；格式 Q3G128_F16S（上游 row_split_geometry 已支持）。
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   Q3_ARENA=/dev/shm/qwen4_exp.expert-arena.q3g128.bin \
@@ -21,13 +21,13 @@ import torch
 
 sys.path.insert(0, os.path.expanduser(os.environ.get("NINFER_REPO", "~/ninfer")))
 from tools.artifact.container import Artifact  # noqa: E402
-from tools.artifact.layouts import (  # noqa: E402
+from tools.artifact.layouts import ( # noqa: E402
     decode_direct,
     dequantize_row_split,
     row_split_geometry,
 )
 
-ARENA = os.environ.get("Q3_ARENA", "/data/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin")
+ARENA = os.environ.get("Q3_ARENA", "/models/lingxi-assets/qwen4_exp.expert-arena.q3g128.bin")
 ART = os.environ.get("LINGXI_ARTIFACT", "/models/qwen4_exp-artifact/qwen4_exp.ninfer")
 FMT = "Q3G128_F16S"
 

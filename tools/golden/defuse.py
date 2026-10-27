@@ -32,7 +32,7 @@ from tools.convert.qwen3_6.common.recipe import (
 from tools.convert.qwen4_exp import inventory as I
 
 # PLE 表（95GiB）不是 artifact 对象：从 ninfer 导出的外部文件 mmap 读取
-PLE_TABLE_FILE = "/data/models/lingxi-assets/qwen4_exp.ple-table.bin"
+PLE_TABLE_FILE = "/models/lingxi-assets/qwen4_exp.ple-table.bin"
 PLE_TABLE_ROW_WIDTH = 160
 
 

@@ -6,7 +6,7 @@ arena 格式 Q4EARN1 与编码器均来自 ninfer-dev：
   src/targets/qwen4_exp/impl/kernels/moe_expert_arena.h （Strata 借鉴，MIT）
   tools/convert/common/quantize.py + tools/artifact/layouts.py （Q4G64_F16S, row-split-k128-v1）
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/q4_arena_check.py
@@ -22,13 +22,13 @@ import torch
 
 sys.path.insert(0, os.path.expanduser(os.environ.get("NINFER_REPO", "~/ninfer")))
 from tools.artifact.container import Artifact  # noqa: E402
-from tools.artifact.layouts import (  # noqa: E402
+from tools.artifact.layouts import ( # noqa: E402
     decode_direct,
     dequantize_row_split,
     row_split_geometry,
 )
 
-ARENA = os.environ.get("Q4_ARENA", "/data/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin")
+ARENA = os.environ.get("Q4_ARENA", "/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin")
 ART = os.environ.get("LINGXI_ARTIFACT", "/models/qwen4_exp-artifact/qwen4_exp.ninfer")
 FMT = os.environ.get("FMT", "Q4G64_F16S")
 assert FMT in ("Q4G64_F16S", "Q3G128_F16S"), FMT

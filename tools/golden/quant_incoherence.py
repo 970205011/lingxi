@@ -7,7 +7,7 @@
   B) 专家间共享结构（BitsMoE 的 shared spectral basis 前提）
      —— 测跨专家的均值/相关性，判断"用共享基代替个体数值"是否可行
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/quant_incoherence.py
@@ -46,7 +46,7 @@ def rht(X: torch.Tensor, block: int, seed: int = 0) -> torch.Tensor:
     out, inn = X.shape
     assert inn % block == 0
     g = torch.Generator().manual_seed(seed)
-    s = (torch.randint(0, 2, (inn // block, block), generator=g).float() * 2 - 1)
+    s = (torch.randint(0, 2, (inn // block, block), generator=g).float * 2 - 1)
     H = hadamard(block) / (block**0.5)
     Xb = X.reshape(out, inn // block, block) * s
     return (Xb @ H).reshape(out, inn)

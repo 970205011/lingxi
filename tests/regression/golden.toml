@@ -4,8 +4,6 @@
 # 背景：旧版 pad4983 用 max_new=1 + 首 token 相等，对无损益档（bf16 PLE）是金丝雀，
 #       但对任何有损档（官方 FP8 2.3% 也如此）首 token 合法翻转 ⇒ 测不出可用性。已废弃。
 # 用法：bash tests/regression/run.sh [env=val ...]；新增基线先 RECORD=1 人工核对再填表。
-# 注：`tokens` 是脱敏前 prompt 的实测值，仅作信息对照；路径占位符替换后可能略有出入，
-#     判据只看 expect_first_token / expect_contains / min_new。
 
 [[case]]
 name = "smoke48"
@@ -14,14 +12,14 @@ tokens = 5          # 日志口径（2026-10-19 实测）
 max_new = 16
 expect_first_token = 11751      # 短 prompt 稳定锚（有损档下仍稳）
 expect_contains = "Paris"
-source = "HANDOVER §1（2026-10-15 基线）；contains 判据 2026-10-19 加"
+source = " （2026-10-15 基线）；contains 判据 2026-10-19 加"
 
 [[case]]
 name = "parity4167qa"
 prompt_file = "tests/regression/prompts/parity4167_qa.txt"
 tokens = 4189       # 4167 文档 + 问题（2026-10-19 实测）
 max_new = 48
-expect_contains = "26.9"        # 文档 §0：p10 ≈ 26.9 ms/token
+expect_contains = "26.9"        # 文档 ：p10 ≈ 26.9 ms/token
 source = "2026-10-19 可用性判据版：文档 QA（原 parity4167 金丝雀废弃）"
 
 [[case]]

@@ -36,6 +36,13 @@ pub(crate) fn init() {
     let _ = S.start.set(Instant::now());
 }
 
+/// 面板开关：`LINGXI_NO_DASHBOARD=1` 时 `/stats` + `/dashboard` 路由关闭（404），
+/// 计数仍照记（开销可忽略），重新开面板不需要重启引擎之外的操作。
+pub(crate) fn disabled() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("LINGXI_NO_DASHBOARD").map(|v| v == "1").unwrap_or(false))
+}
+
 pub(crate) fn record(
     gen_tokens: usize,
     gen_secs: f64,

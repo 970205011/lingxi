@@ -6,7 +6,7 @@
   3) 低秩谱            → "用公式代替数值"是否可行
   4) 邻域相关          → 是否存在重复/规律（LZ/字典的前提）
 
-在 测试机 内运行：
+在 CT141 内运行：
   cd /models/lingxi && \
   PYTHONPATH=~/ninfer \
   python3.12 tools/golden/quant_entropy.py

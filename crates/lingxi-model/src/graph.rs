@@ -1,6 +1,6 @@
 //! CUDA Graph 缓存 + **固定地址工作区**。
 //!
-//! 动机（实测，见 `docs/decode-speed-profile.md`）：decode 每层 ~30 个 kernel，其中
+//! 动机：decode 每层 ~30 个 kernel，其中
 //! 低占用率的小 kernel 有 **10~26 µs 的 GPU 固定成本**（[4,10240] 只有 6 GB/s、
 //! [320,10240] 251 GB/s，而 [8192,2560] 有 725 GB/s）。整层 144 MB 的聚合带宽只有
 //! ~150 GB/s。把一串 kernel 预先录进一张图里一次提交，是唯一能同时消掉
@@ -9,10 +9,10 @@
 //!
 //! 两个前提：
 //! 1. **真 stream**：`cuStreamBeginCapture` 不允许捕获 legacy NULL stream
-//!    （`Kernels::load` 已改用 `ctx.new_stream()`）。
+//! （`Kernels::load` 已改用 `ctx.new_stream`）。
 //! 2. **地址稳定**：图把设备指针烘死，所以被录的代码**不能**用共享 scratch 池
-//!    （池的 LIFO 轮转会被别处的调用打乱）。这里给每个捕获单元一份**私有固定缓冲**
-//!    （`take_fixed` / `give_fixed`，按 `(key, slot)` 键控）。
+//! （池的 LIFO 轮转会被别处的调用打乱）。这里给每个捕获单元一份**私有固定缓冲**
+//! （`take_fixed` / `give_fixed`，按 `(key, slot)` 键控）。
 //!
 //! 三段式：第 1 次调用→建缓冲并正常执行；第 2 次→捕获；第 3 次起→重放。
 //! `LINGXI_GRAPHS=1` 打开；失败会回落到普通路径（不做静默兜底：出错直接返回错误）。
@@ -74,7 +74,7 @@ thread_local! {
 /// 实测 `LINGXI_PTRPROBE=1`：一个 24-token 的投机跑里 `[fixed]` 重新分配被打出 **3315 次**。
 /// 改成 `>=` 后池里留的是"曾经用过的最大块"，地址从此稳定（对图也更友好），
 /// 多占的显存上界 = `t_max × hidden × 2 B × 192` ≈ 9 MB。
-/// **池键必须带设备**（`k.ctx.cu_ctx()`）。
+/// **池键必须带设备**（`k.ctx.cu_ctx`）。
 ///
 /// 为什么（2026-10-16 顺手修，为 P15 的 layer-split 扫雷）：第一版只按 `(key, slot)` 键控，
 /// 而 `layer.rs` 的 key 是 `layer*8` —— **layer-split 之后同一张卡上跑的是不同的层**，

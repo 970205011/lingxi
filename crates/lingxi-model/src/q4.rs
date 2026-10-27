@@ -1,6 +1,6 @@
 //! 稠密权重的 **W4G64**（group 64、FP16 scale、nibble 二补码）在线量化与设备句柄。
 //!
-//! 动机（实测，见 `docs/decode-speed-profile.md` §1/§4）：decode 每 token 要从 HBM 读
+//! 动机：decode 每 token 要从 HBM 读
 //! **7.97 GiB 的 bf16 稠密权重**，其中最大的几块（`gdn/query_key_value_z` 84 MB/层、
 //! `qsa/query_key_gate_value`、各 `output`）实测都在 ~700 GB/s 的带宽墙上
 //! （`launch-bench` 分形状表）。**这些是纯带宽受限的**，把字节数砍到 1/3.77 就是
@@ -8,16 +8,16 @@
 //!
 //! 布局与专家 arena 的 `Q4G64_F16S` 完全一致（复用同一套解码契约，
 //! 见 `lingxi_artifact::expert_arena::matrix_layout` 与 `decode_q4g64_f16s`）：
-//! ```text
-//! payload = [ base 平面: rows × (k_pad/2) 字节 ]      nibble 打包（偶列=低半字节）
-//!         | pad 到 256 对齐
-//!         | [ scale 平面: rows × (k_pad/64) × 2 字节 ]  fp16
-//! k_pad   = align_up(cols, 128)；groups = k_pad/64
-//! value   = ((nib ^ 8) - 8) * scale        （即 nibble 为二补码）
-//! ```
+//! `text
+//! payload = [ base 平面: rows × (k_pad/2) 字节 ] nibble 打包（偶列=低半字节）
+//! | pad 到 256 对齐
+//! | [ scale 平面: rows × (k_pad/64) × 2 字节 ] fp16
+//! k_pad = align_up(cols, 128)；groups = k_pad/64
+//! value = ((nib ^ 8) - 8) * scale （即 nibble 为二补码）
+//! `
 //! 量化是 **RTN（round-to-nearest）**，按 64 一组取 `amax` 定 scale、码位限在 [-7,7]
 //! （保留 4 bit 二补码的合法范围，避开 -8 边界）。这是"先拿到带宽收益"的第一刀；
-//! `docs/weight-compression-plan.md` 规划的 AWQ+GPTQ 是精修版（同一容器，只换量化器）。
+//! 规划的 AWQ+GPTQ 是精修版（同一容器，只换量化器）。
 
 use anyhow::{Context, Result};
 use cudarc::driver::CudaSlice;

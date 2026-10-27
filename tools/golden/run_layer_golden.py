@@ -52,7 +52,7 @@ from tools.convert.qwen4_exp import inventory as I  # noqa: E402
 from tools.convert.qwen4_exp import recipe as R  # noqa: E402
 
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig  # noqa: E402
-from transformers.models.qwen4_exp.modeling_qwen4_exp import (  # noqa: E402
+from transformers.models.qwen4_exp.modeling_qwen4_exp import ( # noqa: E402
     Qwen4ExpForCausalLM,
     Qwen4ExpTextDecoderLayer,
     Qwen4ExpTextRotaryEmbedding,
@@ -62,7 +62,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (  # noqa: E402
 # （产物权重是 q4→bf16；bf16 golden == 引擎的实际精度。）
 DTYPE = torch.bfloat16 if os.environ.get("LINGXI_GOLDEN_BF16", "1") == "1" else torch.float32
 
-ARTIFACT = os.environ.get("LINGXI_ARTIFACT", "/data/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer")
+ARTIFACT = os.environ.get("LINGXI_ARTIFACT", "/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer")
 HF_CONFIG = os.environ.get("LINGXI_HF_CONFIG", "/models/nvfp4/Qwen3.8-Flash-Next/config.json")
 LAYER_PREFIX = "model.language_model.layers."
 
