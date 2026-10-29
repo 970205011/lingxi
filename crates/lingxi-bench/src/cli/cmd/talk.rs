@@ -584,6 +584,8 @@ pub fn run(args: &[String]) -> Result<()> {
         (seq.prefill(&eng, &prompt_ids, provider)?, None)
     };
     eprintln!("\nprefill 用时 {:.1}s，首 token = {first}", t0.elapsed().as_secs_f64());
+    // prefill 许可模式：prefill 完成 ⇒ 封印（大 prompt 的 KV 下沉 host 池、显存回落）。
+    seq.seal_paged_kv(&eng)?;
 
     // ══ 双会话相位重叠判决原型（`LINGXI_TALK_SPEC_BATCH=1`，docs §四十六 R）══
     //
@@ -625,6 +627,7 @@ pub fn run(args: &[String]) -> Result<()> {
             )),
         )?;
         let (first_b, hyper_b) = seq_b.prefill_with_hyper(&eng, &prompt_ids, provider)?;
+        seq_b.seal_paged_kv(&eng)?;
         anyhow::ensure!(
             first_b == first,
             "同 prompt 两会话首 token 不同（{first} vs {first_b}）"

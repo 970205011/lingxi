@@ -99,6 +99,13 @@ export LINGXI_ARENA_PRELOAD_ALL="${LINGXI_ARENA_PRELOAD_ALL:-1}"
 #   命中率 84.8→88.2%、逐位判据过）。窗口 30000 = 实测最优档（60000 略退 +14%）。
 #   值感知默认：显式 LINGXI_ARENA_REPIN=0 可关。
 export LINGXI_ARENA_REPIN="${LINGXI_ARENA_REPIN:-30000}"
+# ★ 2026-10-29 prefill 许可模式转正：QSA 分页默认开——prefill 期弹性全驻留（读时尖峰
+# 不可避免：O(N²) 注意力读取必须走 HBM），全部喂完"封印"整体下沉 host 锁页池（显存
+# 回落，腾给专家槽）；decode 只驻留窗口+选中块，冷块 PCIe 流取（流量 ≪ 专家 DMA）。
+# 生产验收：58K 文档 needle 命中、prefill wall 与长文档口径吻合、二轮前缀复用 TTFT 7.7s。
+# 值感知默认：显式 LINGXI_QSA_PAGED=0 可关（R5 gate2/gate3 守门）。
+export LINGXI_QSA_PAGED="${LINGXI_QSA_PAGED:-1}"
+export LINGXI_QSA_WIN_TOKENS="${LINGXI_QSA_WIN_TOKENS:-32768}"
 # （暂无默认开启项；LINGXI_MOE_OVERLAP=1 为冷启动场景可选，见 PLAN ㊶）
 
 # ── 有损优化开关（㊶ 用户已批：env 门控 + 质量验证；合格前**保持注释**）───
@@ -185,11 +192,13 @@ if [ $# -eq 0 ]; then
         # 覆盖方式：LINGXI_ARENA_PREWARM_N=<n> GPUS=1 ./start.sh ...（显式值优先）。
         export LINGXI_ARENA_PREWARM_N="${_PREWARM_N_GIVEN:-64}"
     fi
-    # 大上下文显存配方：>64K 时专家槽让位给 KV（256K 实测档 7200/7600；可 SLOT_RECIPE=0 关）
+    # 大上下文显存配方：>64K 时专家槽让位给 KV。2026-10-29 起分页封印（超窗 KV 下沉
+    # host 池、显存回落 ~3-4.5GiB/卡）⇒ 槽位上调一档（8000/8400，实测 58K 封印请求 +
+    # 250K 峰值余量 OK；可 SLOT_RECIPE=0 关）
     MAX_CTX="${MAX_CTX:-262144}"
     if [ "$MAX_CTX" -gt 65536 ] && [ "${SLOT_RECIPE:-1}" = "1" ]; then
-        export LINGXI_ARENA_SLOTS="${LINGXI_ARENA_SLOTS:-7200}"
-        export LINGXI_LAYER_SPLIT_SLOTS="${LINGXI_LAYER_SPLIT_SLOTS:-7600}"
+        export LINGXI_ARENA_SLOTS="${LINGXI_ARENA_SLOTS:-8000}"
+        export LINGXI_LAYER_SPLIT_SLOTS="${LINGXI_LAYER_SPLIT_SLOTS:-8400}"
     fi
     # 投机档（SPEC=1）：v1.5 并发 + 双卡草稿 head 二分；多会话轮转、各请求草稿状态隔离。
     # 2026-10-27 起 256K 实测打通（draft KV 单层 ~0.6G + MTP ~2.7G，配方见下）⇒ 不再降 32K。

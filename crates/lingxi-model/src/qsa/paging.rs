@@ -68,8 +68,8 @@ impl QsaState {
 
     /// 驱逐一个常驻满块（< protect_full）下沉 host，返回其槽号。
     /// - `protect_step`：为 true 时（admit 预取路径），touch==本步 的块（本步选中/本步刚预取）
-    /// **绝不驱逐**——否则选中集覆盖整个窗口时会把"本步要读的块"挤出去（静默 corruption
-    /// 的实测根因）。无处可驱逐 ⇒ 响亮报错（窗口 ≤ 选中工作集的明确信号，拒绝静默出错）。
+    ///   **绝不驱逐**——否则选中集覆盖整个窗口时会把"本步要读的块"挤出去（静默 corruption
+    ///   的实测根因）。无处可驱逐 ⇒ 响亮报错（窗口 ≤ 选中工作集的明确信号，拒绝静默出错）。
 
     pub(crate) fn slot_alloc(&mut self, k: &Kernels, protect_full: usize, protect_step: bool) -> Result<i32> {
         if let Some(s) = self.free_slots.pop() {
@@ -231,7 +231,7 @@ impl QsaState {
     /// 写前物化：保证 [wfrom, wfrom+wt) 覆盖的块都分配了 GPU 槽（本步写入 + gather 尾部都读它）。
 
     pub fn kv_materialize_write(&mut self, k: &Kernels, wfrom: usize, wt: usize) -> Result<()> {
-        if !self.paged || wt == 0 {
+        if !self.sealed || wt == 0 {
             return Ok(());
         }
         let cp = self.idx_compress;
@@ -329,7 +329,8 @@ impl QsaState {
 
     /// **分页**：从连续 host 行（host checkpoint）整体恢复——全部块写进 host 池、
     /// 表项置下沉、GPU 槽全空（首步选块时按需预取）。调用前必须先 `reset`（rewind(0)）。
-
+    /// 2026-10-29 起同时是 `paged_seal` 的落点（prefill 许可模式）：恢复/封印后的
+    /// 状态都是"全量在 host 池"的封印态，故本函数末尾置 `sealed=true`。
     pub fn paged_kv_from_host(&mut self, k: &Kernels, kn_h: &[u16], v_h: &[u16]) -> Result<()> {
         let len = kn_h.len() / self.kv_dim.max(1);
         anyhow::ensure!(v_h.len() == kn_h.len(), "paged_kv_from_host: kn/v 长度不一致");
@@ -362,6 +363,7 @@ impl QsaState {
             cur = row_end;
         }
         self.tab_dirty = true;
+        self.sealed = true;
         self.tab_flush(k)
     }
 }

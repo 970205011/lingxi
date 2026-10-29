@@ -60,7 +60,7 @@ pub struct IndexerCfg {
 }
 
 
-/// KV E4M3 量化开关（`LINGXI_KV_K8V4`，有损：K/V 各按 (行, kv头) 量到 FP8，
+/// ㊶ KV E4M3 量化开关（`LINGXI_KV_K8V4`，有损：K/V 各按 (行, kv头) 量到 FP8，
 /// 每 token 每 QSA 层 KV 读流量 ÷2；256K 上下文 12 层 6.3GB → 3.15GB）。
 /// 开关必须在**任何 QsaState 创建之前**决定（决定分配哪套缓冲）。
 pub fn kv_q8_on() -> bool {
@@ -69,8 +69,8 @@ pub fn kv_q8_on() -> bool {
 }
 
 /// **KV FP8-G32 探索档**（`LINGXI_KV_FP8`，值感知 flag_val：`=0` 显式关，默认关）：
-/// K/V 都存 1B/元素，**每 32 维一组配一个 f16 scale**（细粒度分组 KV 量化，
-/// 每 32 维一组 scale）——与翻车的 K8V4（每 (行,头) 一个 scale）完全独立的
+/// K/V 都存 1B/元素，**每 32 维一组配一个 f16 scale**（细粒度，对标 radiance
+/// GUIDE §4.4 的 fp8_v4/k6_v4）——与翻车的 K8V4（每 (行,头) 一个 scale）完全独立的
 /// 新实现。每 token 每 QSA 层 1088B（bf16 2368B 的 45.9%）。有损，未经质量判据
 /// （tools/kvfp8_quality.py）实测前禁止进生产。开关同样必须在任何 QsaState 创建前决定。
 pub fn kv_fp8_on() -> bool {
@@ -153,7 +153,7 @@ pub struct QsaState {
     pub kn: Option<CudaSlice<bf16>>,
     /// value `[cap, kv_heads*head_dim]`（同上）
     pub v: Option<CudaSlice<bf16>>,
-    /// E4M3 量化档（`LINGXI_KV_K8V4=1`，有损、env 门控）：字节 KV + 每 (行, kv头) scale。
+    /// ㊶ E4M3 量化档（`LINGXI_KV_K8V4=1`，有损、env 门控）：字节 KV + 每 (行, kv头) scale。
     /// 量化后 **bf16 的 kn/v 为 None**（省一半显存：256K 上下文 12 层 6.3GB → 3.15GB）；
     /// `stub_kn/stub_v` 是给量化核包装器的 1 元素占位（内核 q8 分支从不读它们）。
     pub kn_q8: Option<CudaSlice<u8>>,
@@ -185,7 +185,7 @@ pub struct QsaState {
     pub kv_rcap: usize,
     pub stub_kn: CudaSlice<bf16>,
     pub stub_v: CudaSlice<bf16>,
-    /// indexer 的 `keep`/`scores` 工作缓冲（grow-only 持久复用）：替代每 token 两次
+    /// ㊸ indexer 的 `keep`/`scores` 工作缓冲（grow-only 持久复用）：替代每 token 两次
     /// `alloc_zeros`——V100 实测 alloc+memset+free ≈500µs/次，12 个 QSA 层 × 2 ≈ decode
     /// 每 token ~10ms 纯 driver 开销（layerprof 实测 QSA 层 bubble ~800µs 的主因）。
     /// rank/scores 核**全量覆写**（rank 对每个 (row,b) 都写 1/0）⇒ 零值无语义，无需 memset。
@@ -205,9 +205,17 @@ pub struct QsaState {
     /// Stage 2 起冷块下沉 host 后表项指向 GPU 空闲槽，被选中时预取回填。
     /// 尺寸按上限 `max_cap` 一次建足（ensure_cap 增长不动它）。
     pub blk_tab: CudaSlice<i32>,
-    /// **P2 Stage 2**：分页模式（`LINGXI_QSA_PAGED=1`，new 时定型）。kn/v 设备缓冲
-    /// 只开 `win_blocks` 个槽（常驻窗口），逻辑上界仍 max_cap；冷块下沉锁页 host 池。
+    /// **P2 Stage 2**：分页模式（`LINGXI_QSA_PAGED=1`，new 时定型）。
+    /// 2026-10-29 prefill 许可模式重构：构造时 kn/v 走**弹性直存**（与 non-paged
+    /// 同构，恒等块表），prefill 不受窗口约束；prefill 喂完后 `paged_seal` 一次性
+    /// 切换成"常驻窗口槽 + host 块池"（`sealed=true`），此后 decode 走分页路径。
+    /// 短 prompt（≤窗口）永不封印——封印只有 admit 开销没有显存收益。
     pub paged: bool,
+    /// **封印标记**：true = kn/v 已换成 win_blocks 槽池、冷块在 host 池（paged 路径
+    /// 生效：paged append / 写前物化 / admit 预取 / rewind 块释放）；false = 弹性直存
+    /// （行为与 non-paged 逐字相同，所有 paged 簿记空转）。`Sequence::reset` 经
+    /// `paged_unseal` 复位回弹性态，供下一轮大 prefill 重新封印。
+    pub sealed: bool,
     /// GPU 常驻窗口（块数）。kn/v = win_blocks × ctok 行。
     pub win_blocks: usize,
     /// 空闲 GPU 槽栈（块号空间 [0, win_blocks)）。
@@ -244,7 +252,7 @@ pub struct QsaState {
     pub pool_tmp2: CudaSlice<bf16>,
     /// 已缓存 token 数
     pub len: usize,
-    /// **当前已分配**的容量（≤ max_cap；弹性 KV 起为懒分配，按需几何增长）。
+    /// **当前已分配**的容量（≤ max_cap；㊿-P1 弹性 KV 起为懒分配，按需几何增长）。
     /// 设备缓冲恒为 `cap × 对应维度`（增长时全量拷贝）⇒ `kn.len()/cap == kv_dim` 不变式保持。
     pub cap: usize,
     /// 容量上限（= 建局时的 rope 容量；RoPE 表只建到这么长，不能越界）
@@ -309,10 +317,14 @@ impl QsaState {
         } else {
             nblk_max
         };
-        // 弹性 KV：只预付 `min(cap, 初始档)`，余量按需 `ensure_cap` 几何增长。
+        // ㊿-P1 弹性 KV：只预付 `min(cap, 初始档)`，余量按需 `ensure_cap` 几何增长。
         // 上限仍是 `cap`（RoPE 表口径）；显式 env `LINGXI_KV_NO_LAZY=1` 回全额预付（对照用）。
         let init = if crate::flag("LINGXI_KV_NO_LAZY") { cap } else { cap.min(kv_init_tokens()) };
-        let kn_init = if paged { win_blocks * ctok } else { init };
+        // ★ 2026-10-29 prefill 许可模式：分页构造也走**弹性直存起步**（恒等块表，
+        // 与非分页完全同构）——prefill 全程不受窗口约束；prefill 喂完后由
+        // `paged_seal` 一次性切换成"常驻窗口 + host 块池"（弹性期绝不走 paged 路径，
+        // 窗口耗尽错误只在 decode 期才可能触发，而 decode 选中工作集 ≪ 窗口）。
+        let kn_init = init;
         Ok(Self {
             // bf16 KV 平面：K8V4（q8）与 FP8-G32（fp8）档都必须为 None——否则追加
             // （step.rs `if state.kn.is_some()`）和注意力分派（同样先匹配 bf16 分支）
@@ -347,14 +359,12 @@ impl QsaState {
             sel_cnt_buf: k.stream.alloc_zeros::<i32>(1 << 12)?,
             hist_buf: k.stream.alloc_zeros::<u32>(2048)?,
             bin_buf: k.stream.alloc_zeros::<i32>(2)?,
-            // P2：块表按上限建足。分页模式全 -2（未分配，随写随分配）；否则恒等。
+            // P2：块表按上限建足。分页**封印后**才启用间接（-2 未分配→随写随分配；
+            // 全 -1 = 全下沉在 host 池）；弹性期（未封印，含非分页）恒等表——
+            // attention 走同一 gather 核，恒等表 = 连续直存读（2026-10-29 许可模式）。
             blk_tab: {
                 let mut idt: Vec<i32> = Vec::with_capacity(nblk_max);
-                if paged {
-                    idt.extend(std::iter::repeat(-2i32).take(nblk_max));
-                } else {
-                    idt.extend(0..nblk_max as i32);
-                }
+                idt.extend(0..nblk_max as i32);
                 let mut t = k.stream.alloc_zeros::<i32>(nblk_max)?;
                 {
                     use cudarc::driver::DevicePtrMut;
@@ -368,12 +378,10 @@ impl QsaState {
                 t
             },
             paged,
+            sealed: false,
             win_blocks,
-            free_slots: if paged {
-                (0..win_blocks as i32).rev().collect()
-            } else {
-                Vec::new()
-            },
+            // 弹性起步：无块槽可分配；封印时由 paged_kv_from_host 建栈。
+            free_slots: Vec::new(),
             host_pool: None,
             host_pool_slots: 0,
             host_blk: vec![u32::MAX; nblk_max],
@@ -382,11 +390,8 @@ impl QsaState {
             step_ctr: 0,
             n_sunk: 0,
             sel_pin: None,
-            tab_host: if paged {
-                vec![-2i32; nblk_max]
-            } else {
-                (0..nblk_max as i32).collect()
-            },
+            // 弹性起步：恒等表（-2/-1 语义只在封印后启用）。
+            tab_host: (0..nblk_max as i32).collect(),
             tab_dirty: false,
             raw_keys_host: Vec::with_capacity(init * ci.head_dim),
             rk_dev: k.stream.alloc_zeros::<bf16>(init * ci.head_dim)?,
@@ -404,7 +409,7 @@ impl QsaState {
         })
     }
 
-    /// 弹性 KV：按需几何增长（alloc + 全量拷贝 + 换绑）。
+    /// ㊿-P1 弹性 KV：按需几何增长（alloc + 全量拷贝 + 换绑）。
     /// - append-only 语义 ⇒ 倍增策略的摊销拷贝 ≈ 2× 最终体积；
     /// - 只在同一条 stream 上排队，顺序由 stream 保证；所有 kernel 按**调用时**指针启动，
     ///   专家段图用的是独立固定槽、不引用本池 ⇒ 换缓冲对数学与图都不可见（逐位等价）；
@@ -424,8 +429,9 @@ impl QsaState {
             new_cap *= 2;
         }
         new_cap = new_cap.min(self.max_cap);
-        // P2 分页：kn/v 是固定窗口池，不随逻辑增长（冷块在 host 池）；只长逻辑缓冲。
-        if self.paged {
+        // P2 分页（已封印）：kn/v 是固定窗口池，不随逻辑增长（冷块在 host 池）；只长逻辑缓冲。
+        // 未封印 = 弹性直存期，走下方完整增长路径（与非分页一致）。
+        if self.paged && self.sealed {
             let hd = self.idx_head_dim;
             let cp = self.idx_compress;
             let mut b = k.stream.alloc_zeros::<bf16>(new_cap * hd)?;
@@ -526,9 +532,10 @@ impl QsaState {
 
     pub fn rewind(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.len, "rewind 只能往回");
-        // P2 分页：释放 [new_len, old_len) 覆盖的块——槽与 host 坑都归还。
+        // P2 分页（已封印）：释放 [new_len, old_len) 覆盖的块——槽与 host 坑都归还。
         // 语义安全：append-only + rewind-only 恢复（被释放的区间只会被重写，不重读）。
-        if self.paged {
+        // 未封印（弹性直存期）无块可释放，恒等表无需动。
+        if self.sealed {
             let cp = self.idx_compress;
             let nb_new = (new_len + cp - 1) / cp;
             let nb_old = (self.len + cp - 1) / cp;
@@ -568,6 +575,101 @@ impl QsaState {
         self.len = new_len;
         self.nblocks = new_len / self.idx_compress;
         self.raw_keys_host.truncate(new_len * self.idx_head_dim);
+    }
+
+    /// **prefill 许可模式·封印**（2026-10-29）：prefill 全部喂完后，把弹性直存的整体 KV
+    /// 切换成"常驻窗口槽 + host 块池"——弹性缓冲里的 [0, len) 一次性 D2H 灌进锁页池，
+    /// 设备缓冲换成 win_blocks 槽池，之后 decode 走分页路径（选中块 PCIe 流取）。
+    ///
+    /// 这是"读时尖峰、读完回落"的落点：prefill 期间显存占用 = 上下文长度（不可避免，
+    /// 注意力 O(N²) 读取必须走 HBM），prefill 结束后回落到窗口大小，腾出的显存给专家槽。
+    ///
+    /// - ≤窗口长度的 prompt **不封印**（封印只有 admit 开销、没有显存收益）；
+    /// - 幂等：!paged / 已封印 / kn 为 None（量化 KV 与分页互斥，构造已拒）直接 no-op；
+    /// - kn/v 换绑 ⇒ CUDA 图地址失效 ⇒ epoch_bump（同 ensure_cap 口径）。
+    pub fn paged_seal(&mut self, k: &Kernels, len: usize) -> Result<()> {
+        if !self.paged || self.sealed {
+            return Ok(());
+        }
+        // ⚠️ 绑上下文：下方有**裸驱动调用**（memcpy_dtoh_sync）与 alloc，双卡下当前
+        // 上下文可能是另一张卡 ⇒ CUDA_ERROR_INVALID_VALUE（gate3 实测抓到）。
+        k.ctx.bind_to_thread()?;
+        let ctok = self.idx_compress.max(1);
+        let win_rows = self.win_blocks * ctok;
+        if len <= win_rows {
+            return Ok(());
+        }
+        let kv_dim = self.kv_dim;
+        let kn = self.kn.as_ref().expect("paged_seal: 弹性 kn 必须存在");
+        let v = self.v.as_ref().expect("paged_seal: 弹性 v 必须存在");
+        anyhow::ensure!(
+            kn.len() >= len * kv_dim,
+            "paged_seal: 弹性 kn 容量 {} < 需要 {}",
+            kn.len(),
+            len * kv_dim
+        );
+        // 1) 弹性 KV 整体 D2H（连续直存，无块表；同步拷——封印是冷路径，一次性）
+        let mut kn_h = vec![0u16; len * kv_dim];
+        let mut v_h = vec![0u16; len * kv_dim];
+        {
+            use cudarc::driver::DevicePtr;
+            let kn_sl = kn.slice(0..len * kv_dim);
+            let (p, _g) = kn_sl.device_ptr(&k.stream);
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync::<u16>(&mut kn_h, p)? };
+            let v_sl = v.slice(0..len * kv_dim);
+            let (p, _g) = v_sl.device_ptr(&k.stream);
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync::<u16>(&mut v_h, p)? };
+        }
+        // 2) 弹性缓冲 → 常驻窗口槽池（逻辑 len 不变，物理只驻留窗口）
+        self.kn = None;
+        self.v = None;
+        self.kn = Some(k.stream.alloc_zeros::<bf16>(win_rows * kv_dim)?);
+        self.v = Some(k.stream.alloc_zeros::<bf16>(win_rows * kv_dim)?);
+        // 3) 复位块账本 + 全量进 host 池（paged_kv_from_host 一套语义：表全 -1、
+        //    GPU 槽全空、首步选块按需预取），并置 sealed。
+        self.paged_kv_from_host(k, &kn_h, &v_h)?;
+        // 封印即"整体下沉"：计入 PAGED_SINKS 账本（gate2 的 perf 计数口径）——
+        // nb = 灌进 host 池的块数。
+        let nb = (len + ctok - 1) / ctok;
+        super::paging::PAGED_SINKS.fetch_add(nb as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::graph::epoch_bump();
+        eprintln!(
+            "[qsa-paged] 封印：{len} tok 整体下沉 host 池（常驻窗口 {win_rows} tok）"
+        );
+        Ok(())
+    }
+
+    /// **反封印**（`Sequence::reset` 调用）：封印态复位回弹性直存——释放窗口槽池与
+    /// host 锁页池，表回恒等，供下一轮大 prefill 重新弹性增长+封印。
+    /// rewind(0) 先行（释放块槽/host 坑的簿记），这里只做缓冲与表的切换。
+    pub fn paged_unseal(&mut self, k: &Kernels) -> Result<()> {
+        if !self.paged || !self.sealed {
+            return Ok(());
+        }
+        // 同 paged_seal：换绑/裸调用前必须先绑本卡上下文。
+        k.ctx.bind_to_thread()?;
+        let kv_dim = self.kv_dim;
+        let init = self.max_cap.min(kv_init_tokens());
+        self.kn = None;
+        self.v = None;
+        self.kn = Some(k.stream.alloc_zeros::<bf16>(init * kv_dim)?);
+        self.v = Some(k.stream.alloc_zeros::<bf16>(init * kv_dim)?);
+        // ⚠️ cap 必须随缓冲一起回落：否则 ensure_cap 看到 `need <= cap` 跳过增长，
+        // 而缓冲只有 init 行 ⇒ 越界写。逻辑缓冲（rk_dev/pooled）重新按需增长。
+        self.cap = init;
+        self.free_slots.clear();
+        self.host_free.clear();
+        self.host_pool = None; // 锁页内存随会话结束释放（池内容已无意义）
+        self.host_pool_slots = 0;
+        self.host_blk.fill(u32::MAX);
+        let nblk = self.tab_host.len();
+        self.tab_host = (0..nblk as i32).collect();
+        self.n_sunk = 0;
+        self.sealed = false;
+        self.tab_dirty = true;
+        self.tab_flush(k)?;
+        crate::graph::epoch_bump();
+        Ok(())
     }
 
     // ───────────────────── P2 Stage 2：分页管理（仅 paged 模式） ─────────────────────

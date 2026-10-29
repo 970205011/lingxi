@@ -3191,6 +3191,7 @@ fn twopass_xfer_states_staged(
             let k = eng.k_of(i as u32);
             if let AttnState::Qsa(q) = &mut self.states[i].attn {
                 q.rewind(0);
+                q.paged_unseal(k)?;
             }
             if let AttnState::Gdn(g) = &mut self.states[i].attn {
                 k.stream.memset_zeros(&mut g.k_hist)?;
@@ -3208,6 +3209,7 @@ fn twopass_xfer_states_staged(
             for st in states_ep.iter_mut() {
                 if let AttnState::Qsa(q) = &mut st.attn {
                     q.rewind(0);
+                    q.paged_unseal(&epx.k1)?;
                 }
                 if let AttnState::Gdn(g) = &mut st.attn {
                     epx.k1.stream.memset_zeros(&mut g.k_hist)?;
@@ -3222,6 +3224,28 @@ fn twopass_xfer_states_staged(
             }
         }
         self.ids.clear();
+        Ok(())
+    }
+
+    /// **prefill 许可模式·封印**（2026-10-29）：prefill 全部喂完后调用（serve 分块路径
+    /// 在最后一块收尾、整块路径与 talk 在 prefill 返回后）——把各 QSA 层的弹性直存 KV
+    /// 一次性切换成"常驻窗口 + host 块池"（`LINGXI_QSA_PAGED=1` 且 prompt 超窗口才实际
+    /// 生效，其余 no-op）。幂等；`reset` 经 `paged_unseal` 复位后可再次封印。
+    pub fn seal_paged_kv(&mut self, eng: &Engine) -> Result<()> {
+        for i in 0..eng.n_layers as usize {
+            if let AttnState::Qsa(q) = &mut self.states[i].attn {
+                let len = q.len;
+                q.paged_seal(eng.k_of(i as u32), len)?;
+            }
+        }
+        if let (Some(epx), Some(states_ep)) = (eng.ep, self.states_ep.as_mut()) {
+            for st in states_ep.iter_mut() {
+                if let AttnState::Qsa(q) = &mut st.attn {
+                    let len = q.len;
+                    q.paged_seal(&epx.k1, len)?;
+                }
+            }
+        }
         Ok(())
     }
 

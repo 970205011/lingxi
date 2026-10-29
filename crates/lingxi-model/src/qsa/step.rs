@@ -42,7 +42,7 @@ pub fn attention_step(
     let scale = 1.0f32 / (c.head_dim as f32).sqrt();
     let len = state.len;
     let t_kv = len + t;
-    // 弹性 KV：容量不足先几何增长（冷路径；对数学逐位无影响），不再硬性 assert。
+    // ㊿-P1 弹性 KV：容量不足先几何增长（冷路径；对数学逐位无影响），不再硬性 assert。
     if t_kv > state.cap {
         state.ensure_cap(k, t_kv)?;
     }
@@ -98,7 +98,7 @@ pub fn attention_step(
     }
 
     // 2) 每头 RMSNorm + partial RoPE（用新 token 的绝对位置）
-    // ★ 2026-10-24：`norm` 与 `rope` 原来各一发（微基准各 ~5.5 µs，全在发射地板上；
+    // ★ 2026-10-24 §三十：`norm` 与 `rope` 原来各一发（微基准各 ~5.5 µs，全在发射地板上；
     //   实测两发合计 11.1 µs 而 work 只有 24×128 个元素）⇒ 合成一发
     //   （`LINGXI_NO_NRM_ROPE_FUSE=1` 回退）。归约树/舍入/RoPE 取值一字未改 ⇒ 逐位相同。
     let fuse_nr = !crate::flag("LINGXI_NO_NRM_ROPE_FUSE");
@@ -134,11 +134,13 @@ pub fn attention_step(
     crate::attn_prof::mark(k, 1)?;
     // P2 分页：写前把 [len, t_kv) 覆盖的块物化出 GPU 槽（本步写入 + gather 尾部读它）。
     state.kv_materialize_write(k, len, t)?;
-    // 3) 追加进 cache（bf16 直拷 / K8V4 E4M3 量化 / FP8-G32 量化）
+    // 3) 追加进 cache（bf16 直拷 / ㊶ K8V4 E4M3 量化 / FP8-G32 量化）
     if state.kn.is_some() {
-        if state.paged {
+        if state.sealed {
+            // 封印态：窗口槽池 + 块表间接（写前物化在上方 kv_materialize_write 完成）
             state.kv_append_paged(k, &kn_new, &v, len, t)?;
         } else {
+            // 弹性直存（非分页 / 分页未封印 = prefill 许可模式的 prefill 期）：连续写
             k.stream.memcpy_dtod(&kn_new, &mut state.kn.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim))?;
             k.stream.memcpy_dtod(&v, &mut state.v.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim))?;
         }
@@ -180,7 +182,7 @@ pub fn attention_step(
     let mut iq = scratch::bf16(k, t * iq_dim)?;
     let mut rk_new = scratch::bf16(k, t * ci.head_dim)?;
     // ★ P15-⑨：t>1 时 x 预转 fp32，indexer 两个 bf16 投影共用一份（主投影已走 Q4 不受影响）
-    // ★ 2026-10-24：默认档（x 仍是 bf16、走 `gemm_skinny_row`）把**两个投影合成一发**
+    // ★ 2026-10-24 §三十：默认档（x 仍是 bf16、走 `gemm_skinny_row`）把**两个投影合成一发**
     //   （`LINGXI_NO_PROJ_PAIR=1` 回退）：实测 640 行 15.9 + 128 行 10.1 = 26.0 µs，
     //   而 128 行那一发的同形纯读只要 5.4 ⇒ 合并后省 ~10 µs/层。算式/归约/写出逐字相同。
     let pair_ok = t <= 8
@@ -232,7 +234,7 @@ pub fn attention_step(
     let host_fallback = crate::flag("LINGXI_QSA_HOST");
     // nblocks_new / keep 提升到分支外：sparse 注意力在分支后也要用
     let nblocks_new = t_kv / ci.compress;
-    // 持久复用（grow-only）：不再每 token `alloc_zeros`。两个核都全量覆写 ⇒ 无需清零。
+    // ㊸ 持久复用（grow-only）：不再每 token `alloc_zeros`。两个核都全量覆写 ⇒ 无需清零。
     //
     // ★ 选块实现按 t 分派（2026-10-18 实测）：
     //   t≥16（prefill chunk）走 radix（O(nblocks)/行、零 scores 缓冲，256K 省 537MB/层）；
@@ -312,7 +314,7 @@ pub fn attention_step(
         let nb = nblocks_new.saturating_sub(b0);
         if nb > 0 {
             let need = nb * ci.head_dim;
-            // ★ 2026-10-24：pool + norm + rope + 落盘 **四发合一**（`LINGXI_NO_POOL_FUSE=1`
+            // ★ 2026-10-24 §三十：pool + norm + rope + 落盘 **四发合一**（`LINGXI_NO_POOL_FUSE=1`
             //   回退）：微基准 4 发 23.5 µs（work 只有 nb×128 个元素）⇒ 全是发射地板，
             //   合成一发后 ~6 µs。三步算式与四发逐字相同（含中间的 bf16 舍入）⇒ 逐位相同。
             let fuse_pool = ci.rot_dim > 0
@@ -369,7 +371,7 @@ pub fn attention_step(
         if nblocks_new > 0 {
             let topk = ci.budget / ci.compress;
             let sqrt_hd = (ci.head_dim as f32).sqrt();
-            // ★ 2026-10-24：**nblocks ≤ topk ⇒ 全部块都保留**。
+            // ★ 2026-10-24 §三十：**nblocks ≤ topk ⇒ 全部块都保留**。
             //   rank(b) ≤ nblocks-1 < topk 恒成立（与 `keep_select` / `keep_from_scores`
             //   里早已存在的早退条件完全相同）⇒ 打分与名次都是恒等变换。短上下文
             //   （≤ budget token = 2048）下直接由 sel_build 的 all 模式一发写 keep+sel，
@@ -428,7 +430,7 @@ pub fn attention_step(
             } else if use_radix {
                 // ★ 2026-10-18：nblocks 不大时走**融合选块**（一次打分 + shared 直方图），
                 //   把旧路径的 4 遍打分（3 遍直方图 + 1 遍填 keep）压成 1 遍。
-                //   32K（nblocks≈8184）实测 select+fill 300ms → 见 docs/BACKLOG。
+                //   32K（nblocks≈8184）实测 select+fill 300ms → 见 docs/BACKLOG §3.3 R。
                 if nblocks_new <= fused_max {
                     k.qsa_keep_fused_bf16(
                         &iqn, &state.pooled, &mut state.keep_buf,
@@ -516,8 +518,8 @@ pub fn attention_step(
         let ctok = 1usize << ci.compress.trailing_zeros();
         let span = topk * ctok + ctok;
         // `LINGXI_ATTN_GATHER_H`：一个 block 合并几个同 kv-group 的 q-head（1/2/4）。
-        // ★ 2026-10-24：decode 小 t 形状（块数少）实测 NH=1 栅格最优（37.7 µs）。
-        // ★ 2026-10-26：prefill t≥16 块数充足，默认 NH=4（K/V 流量 ÷4，配合
+        // ★ 2026-10-24 §三十：decode 小 t 形状（块数少）实测 NH=1 栅格最优（37.7 µs）。
+        // ★ 2026-10-26 §AK：prefill t≥16 块数充足，默认 NH=4（K/V 流量 ÷4，配合
         //   wrapper 的 v3 重排核）；显式设 H=1/2/4 覆盖两档。逐位等价（t25 对拍）。
         let nh_req = match std::env::var("LINGXI_ATTN_GATHER_H") {
             Ok(v) if v.trim() == "1" => 1usize,
@@ -540,10 +542,10 @@ pub fn attention_step(
         } else {
             1
         };
-        // P2 分页 + prefill：按行批 "admit → gather" 成对发射——每批只保自己的选中
+        // P2 分页（已封印）+ 多行：按行批 "admit → gather" 成对发射——每批只保自己的选中
         // 并集（~topk+批内扩散）常驻，窗口 ≥ 批并集即可；整步并集 ≈ 上下文（不可驻留）。
-        // decode（t=1）与非分页：单批（行为同旧）。
-        let batch = if state.paged && t > 1 {
+        // decode（t=1）、prefill 弹性期（未封印，KV 全驻留）与非分页：单批（行为同旧）。
+        let batch = if state.sealed && t > 1 {
             std::env::var("LINGXI_QSA_ADMIT_BATCH")
                 .ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0)
                 .unwrap_or(64)
@@ -593,7 +595,7 @@ pub fn attention_step(
                 )?;
             }
             _ => {
-                // K8V4 量化档：bf16 形参传 1 元素占位（内核 q8 分支从不读），KV 读字节缓冲
+                // ㊶ 量化档：bf16 形参传 1 元素占位（内核 q8 分支从不读），KV 读字节缓冲
                 k.attn_sparse_kvq8_bf16(
                     &qn, &state.stub_kn, &state.stub_v, &state.keep_buf, len, nblocks_new,
                     ci.compress.trailing_zeros(), &mut attn, c.heads, c.kv_heads, t, t_kv,

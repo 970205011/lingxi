@@ -9,7 +9,8 @@ use super::core_::QsaState;
 impl QsaState {
     pub fn kv_admit(&mut self, k: &Kernels, sel: &CudaSlice<i32>, sel_cnt: &CudaSlice<i32>,
                     row0: usize, t: usize, topk: usize, wfrom: usize, wt: usize) -> Result<()> {
-        if !self.paged {
+        // 未封印（弹性直存期，KV 全驻留）与非分页：没有冷块概念，选中块必然可读。
+        if !self.sealed {
             return Ok(());
         }
         if self.n_sunk == 0 {

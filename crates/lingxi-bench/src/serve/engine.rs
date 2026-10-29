@@ -28,7 +28,7 @@ pub struct ServeOpts<'a> {
     pub max_new_default: usize,
 }
 
-/// **只记性能、不记内容**的 JSONL（数据飞轮 M1）。
+/// **只记性能、不记内容**的 JSONL（数据飞轮 M1，见 BACKLOG §6.2）。
 ///
 /// 应用侧拿 `request_id` 与自己的对话日志 join，就能得到“真实 token 流 + 每 token 耗时”。
 /// `LINGXI_SERVE_PERF_LOG` 置空可关；`LINGXI_SERVE_PERF_MAX_MB` 控制轮转（默认 64MB，留 3 份）。
@@ -416,7 +416,7 @@ fn chat(
     // 生成 token 数不能超过剩余容量，否则 decode 会写出 KV 容量。
     let max_tokens = max_tokens.min(opts.max_ctx.saturating_sub(prompt_tokens + 1));
 
-    // ── 会话驻留：按 session_id 物化/切换（沉没的秒级唤醒；不显式传则共享 "default"）──
+    // ── ㊿-P1 会话驻留：按 session_id 物化/切换（沉没的秒级唤醒；不显式传则共享 "default"）──
     let sid = v["session_id"]
         .as_str()
         .or_else(|| v["user"].as_str())
@@ -460,7 +460,7 @@ fn chat(
 
     // ── 智能前缀复用（C3）：最长匹配检查点 + 消息边界检查点 ──
     let cache_on = prefix_cache_enabled();
-    // **按请求选路**（2026-10-25 改）：缓存命中不再一票否决投机。
+    // **按请求选路**（2026-10-25 改，docs §W）：缓存命中不再一票否决投机。
     // 旧设计：命中 ⇒ 纯 AR（吃 TTFT≈0）。但多轮对话的每一轮都命中——于是生产的
     // 典型请求**永远**吃不到投机（实测：168 tok 走 AR 3.9s，投机只需 ~2.2s）。
     // 新判据（重 prefill 成本 vs 投机收益，实测数字：prefill ~0.5ms/tok、
@@ -991,6 +991,8 @@ fn prefill_step_inner(
     if j.hot {
         cache.device_ids = seq.ids.clone();
     }
+    // prefill 许可模式：全部块喂完 ⇒ 封印（大 prompt 的 KV 下沉 host 池、显存回落）。
+    seq.seal_paged_kv(eng)?;
     Ok(PfxStep::Done(j.into_gen(tok)))
 }
 
@@ -1046,7 +1048,7 @@ fn run_prefill(
     let mut restored = 0usize;
     let mut hit = "";
     let mut best: Option<(usize, usize)> = None;
-    // ★ 2026-10-25：spec_on 时**不恢复**检查点——投机要整段重 prefill 收
+    // ★ 2026-10-25（docs §W）：spec_on 时**不恢复**检查点——投机要整段重 prefill 收
     // hyper（命中恢复 ⇒ hyper_p=None ⇒ MTP 被静默跳过，修了选路也不生效）。
     if allow_reuse && cache_on && !spec_on {
         best = cache.best(ids);
@@ -1188,6 +1190,8 @@ fn run_prefill(
             seq.prefill_append(eng, ids, provider)?
         }
     };
+    // prefill 许可模式：整块 prefill 完成 ⇒ 封印（分块路径在 prefill_step_inner 末块）。
+    seq.seal_paged_kv(eng)?;
     Ok(PrefillOutcome::Done { first, restored, hit })
 }
 

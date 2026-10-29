@@ -1,6 +1,6 @@
 //! **host 侧 Q4G64 专家 GEMV**（给"装不进显存的专家"做兜底）。
 //!
-//! 为什么要它：
+//! 为什么要它（2026-10-16 实测，`docs/PLAN.md` §P10.5）：
 //! 真语料下命中率 80.6% ⇒ **每轮仍有 382 个 miss × 2.61 MB = 997 MB 要过 PCIe**，
 //! 在 ~10 GB/s 上就是 **~100 ms/轮**，占真语料整轮（173 ms）的 **58%**。
 //! 而同样的 997 MB 从 **RAM** 读只要 ~10 ms，且 CPU 算力够（1.88 G MAC/轮 ÷ 85 ms ≈ 22 GMAC/s）。
@@ -13,7 +13,7 @@
 //! - 组 `g` 占 32 字节载荷，字节 `z` 里**低 nibble 是列 `2z`、高 nibble 是列 `2z+1`**；
 //! - nibble 是**带符号** 4-bit（0..7 → 0..7，8..15 → −8..−1）；
 //! - `seg_off` / `scale_off` 都相对**槽/blob 起点**（与 CUDA 核同口径：`payload = slot + seg_off`，
-//! `scales = payload + scale_off`）；
+//!   `scales = payload + scale_off`）；
 //! - 累加次序：组内 `dot` 串行、组间 `acc += scale*dot` 串行 —— 与 GPU 核同序。
 //!
 //! ## ⚠️ 结论（2026-10-16 实测）：**这条路暂时不划算，默认关**
@@ -22,8 +22,8 @@
 //! ⇒ **CPU 兜底比"搬过 PCIe"更慢**。根因：GPU 的 Q4 反量化 GEMV 实测能跑到 **271 GB/s**，
 //! CPU 即使 AVX2 拉满（10 GB/s 级）也追不上 —— "DDR3 比 PCIe 快 10 倍"这个前提在**算力**上不成立。
 //! ⇒ **miss 的唯一解是"更多显存"（两卡 ⇒ 槽位 7000→14000 ⇒ miss 19.4%→~3%）**，
-//! 而不是"换个地方算"。本模块保留原因：它是**两卡也装不下**（长会话跨多话题、槽位被填满）时
-//! 唯一的兜底；正确性已由 2 个单测锁死（gu 行级 + 整条 gu→swiglu→dn，都对独立手算参照）。
+//!    而不是"换个地方算"。本模块保留原因：它是**两卡也装不下**（长会话跨多话题、槽位被填满）时
+//!    唯一的兜底；正确性已由 2 个单测锁死（gu 行级 + 整条 gu→swiglu→dn，都对独立手算参照）。
 
 use half::f16;
 
@@ -183,9 +183,9 @@ mod tests {
         let dn_pay = dn_rows * rb_d;
         let dn_sc = dn_rows * rg_d * 2;
         let mut blob = vec![0u8; gu_pay + gu_sc + dn_pay + dn_sc];
-        // 造权重：可被 4bit 精确表示的整数
-        let w_g = |r: usize, c: usize| (((r * 7 + c * 3) % 15) as i32 - 7) as f32 * gu_w;
-        let w_d = |r: usize, c: usize| (((r * 5 + c * 11) % 15) as i32 - 7) as f32 * dn_w;
+        // 造权重：可被 4bit 精确表示的整数（w_g/w_d 仅作文档——实际编码走下方 put 的闭包）
+        let _w_g = |r: usize, c: usize| (((r * 7 + c * 3) % 15) as i32 - 7) as f32 * gu_w;
+        let _w_d = |r: usize, c: usize| (((r * 5 + c * 11) % 15) as i32 - 7) as f32 * dn_w;
         // 但 4bit 载荷只能存整数码、scale 是 fp16 ⇒ 用 scale=1.0、权重取整数，便于手算参照
         let put = |blob: &mut Vec<u8>, base: usize, rb: usize, rg: usize, rows: usize, kk: usize, wf: &dyn Fn(usize, usize) -> i32| {
             for r in 0..rows {
@@ -284,8 +284,8 @@ mod tests {
         // 参照：直接用与实现相同的 gemv_row 造 act，再算 dn —— 但 act 用**独立**的逐列公式重算
         let rb_g = gu_k_pad / 2;
         let rg_g = gu_k_pad / G;
-        let wv = |r: usize, c: usize| ((r * 7 + c * 3) % 15) as i32 - 7;
-        let wd = |r: usize, c: usize| ((r * 5 + c * 11) % 15) as i32 - 7;
+        let _wv = |r: usize, c: usize| ((r * 7 + c * 3) % 15) as i32 - 7;
+        let _wd = |r: usize, c: usize| ((r * 5 + c * 11) % 15) as i32 - 7;
         let seg = |r: usize, c: usize| -> f32 {
             let g = c / G;
             let z = (c % G) / 2;
@@ -304,7 +304,7 @@ mod tests {
         let _ = (rg_g, rg_d);
         let mut want = vec![0.0f32; hidden];
         for r in 0..hidden {
-            let mut acc = 0.0f32;
+            let _acc = 0.0f32;
             for g in 0..inter.div_ceil(G) {   // ⚠️ 不是 inter/G：inter=32 < G=64 时整除会得 0，参照恒为 0
                 let mut dot = 0.0f32;
                 for c in 0..inter {
