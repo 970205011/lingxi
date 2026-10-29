@@ -8,7 +8,7 @@
 //! - MTP 层号必须用哨兵 `100`（避免与主干 layer 0 共用 CUDA Graph/固定缓冲）。
 //! - 每轮草稿从 `(h_last, pending)` 起链，`pending` = KV 里最后喂进去的 token。
 //! - 提交后 MTP 的 KV 要回卷到轮前，再用**主干 h** 重放 `keep` 个 cell
-//! `(h_j, tok_{j+1})`，否则下一轮建立在错 KV 上。
+//!   `(h_j, tok_{j+1})`，否则下一轮建立在错 KV 上。
 //! - `h_last` 每轮更新为 `hyper_rows[keep-1]`。
 
 use anyhow::Result;
@@ -23,8 +23,35 @@ use lingxi_model::layer::{AttnState, LayerEnv, LayerStates};
 pub struct Round {
     pub tokens: Vec<i64>,
     pub accepted: usize,
-    /// 本轮送进验证的行数（= `chunk.len`），供上层算"每验证一行的产出"
+    /// 本轮送进验证的行数（= `chunk.len()`），供上层算"每验证一行的产出"
     pub verified: usize,
+}
+
+/// **每请求的草稿状态**（2026-10-27 从 SpecRuntime 拆出）：MTP 的 KV（`mst`）+
+/// 自适应 kd 的 EMA。serve 每请求本来就重新 prime（草稿 KV 从零重建），所以按**请求**
+/// 持有即可；v1.5 并发路径下多个生成器时间片轮转，各持各的状态互不踩踏。
+/// 权重/常量/复用缓冲留在 [`SpecRuntime`] 全局共享（引擎线程串行步进，无竞争）。
+pub struct SpecState {
+    pub mst: LayerStates,
+    pub acc_ema: f64,
+}
+
+impl SpecState {
+    pub fn new(
+        k: &Kernels,
+        shape: &lingxi_model::layer::LayerShape,
+        cap: usize,
+        kd: usize,
+    ) -> Result<Self> {
+        let mst = LayerStates::for_kind(
+            k,
+            lingxi_ids::LayerKind::QsaSparseAttention,
+            shape,
+            cap,
+            None,
+        )?;
+        Ok(Self { mst, acc_ema: (kd as f64 * 0.6).max(3.0) })
+    }
 }
 
 pub struct SpecRuntime<'a> {
@@ -32,7 +59,6 @@ pub struct SpecRuntime<'a> {
     g: lingxi_model::mtp::MtpWeights,
     ml: crate::MtpLayer,
     arena: Option<crate::mtp_arena::MtpArena<'a>>,
-    mst: LayerStates,
     tables: &'a lingxi_driver::RopeTables,
     endpoints: &'a lingxi_model::trunk::TrunkWeights,
     shape: &'a lingxi_model::layer::LayerShape,
@@ -41,13 +67,6 @@ pub struct SpecRuntime<'a> {
     vocab: usize,
     kd: usize,
     min_p: f32,
-    /// 自适应 kd：尾随接受率 EMA（α=0.35/轮，初值 kd）。草稿只跑到
-    /// `kd_eff = clamp(⌈acc_ema×2⌉, 3, kd)` —— 接受率高的内容（英文 4.1）恒顶到 kd，
-    /// 接受率低的内容（中文 1.5）~7 轮内降到 3 ⇒ 中文 +12%（66.2 vs 59.2，实测）。
-    /// α 取 0.35 是为了扛住英文自己的冷启动轮（α=0.5 实测 −1.3%）。倍率 2.0 让
-    /// kd_eff=7 的线落在 ema>3.0（英文冷启动谷底 ~3.5 安全，中文稳态 1.47 → 3）。
-    /// `LINGXI_SPEC_ADAPT_KD=0` 关闭（恒 kd）。
-    acc_ema: f64,
     /// `gemv_q4g64_struct_exp*` 的 E=1 分组常量（slot id = 0；group_off = [0,1]）
     slot1: CudaSlice<i32>,
     goff2: CudaSlice<i32>,
@@ -85,7 +104,7 @@ struct HeadBufs {
 /// 切出来的两段在新缓冲里必须重新排布）。
 ///
 /// 走 host（D2H → H2D）而不是 device-to-device：一是 cudarc 的跨卡 D2D 需要 P2P 上下文，
-/// 二是本项目对 x8 链路上的持续跨卡流量有明确禁令。
+/// 二是本项目对 x8 链路上的持续跨卡流量有明确禁令（PCIe 跨卡流量的事故教训）。
 /// 一次性 ~170 MB，之后每步只有 5 KB。
 fn q4_tail_to(
     k_src: &Kernels, wq: &lingxi_model::q4::Q4W, k_dst: &Kernels, lo: usize,
@@ -139,24 +158,17 @@ impl<'a> SpecRuntime<'a> {
         let mtp_art = Artifact::open(mtp_path)?;
         let g = lingxi_model::mtp::load(k, &mtp_art)?;
         // ★ serve 默认 **Q4 专家**（`: `LINGXI_MTP_Q4_EXPERTS=0` 可关）：bf16 的 512 专家要 5.03 GiB，
-        // 在"钉表 8.3 GiB + arena 21.9 GiB"的生产配置下会把 GPU0 顶满（实测 32.4/32.8 GB 卡死）。
-        // Q4 版只占 1.34 GiB。
+        //   在"钉表 8.3 GiB + arena 21.9 GiB"的生产配置下会把 GPU0 顶满（实测 32.4/32.8 GB 卡死）。
+        //   Q4 版只占 1.34 GiB。
         let q4 = std::env::var("LINGXI_MTP_Q4_EXPERTS").map(|v| v != "0").unwrap_or(true);
         let ml = crate::build_mtp_layer(k, &mtp_art, q4)?;
         let arena = if q4 { Some(crate::mtp_arena::MtpArena::build(k, &mtp_art)?) } else { None };
-        let mst = LayerStates::for_kind(
-            k,
-            lingxi_ids::LayerKind::QsaSparseAttention,
-            shape,
-            rope_len + 8,
-            None,
-        )?;
         // ★ 2026-10-25：**kd 默认 5 → 7**。
-        // 最优点右移是因为**每步边际成本从 5.1 掉到 3.5 ms**（全驻留专家 + 草稿 head 二分），
-        // 而"多提交一枚"的边际接受率还有 0.49 ⇒ 续投划算了。实测（200 tok，交替 A/B）：
-        // 容器档 91.9 → **96.0 tok/s**（44→39 轮、接受 3.55→4.08、轮 p50 52→58 ms），
-        // 宿主档 88.6 → **94.9**；kd=8/9/10 反而回落到 85.6~88.2（接受饱和在 4.08）。
-        // 文本 md5 `62b508f8` 与 kd=5/8/9 逐位相同 ⇒ 纯速度，不是行为变化。
+        //   最优点右移是因为**每步边际成本从 5.1 掉到 3.5 ms**（全驻留专家 + 草稿 head 二分），
+        //   而"多提交一枚"的边际接受率还有 0.49 ⇒ 续投划算了。实测（200 tok，交替 A/B）：
+        //   容器档 91.9 → **96.0 tok/s**（44→39 轮、接受 3.55→4.08、轮 p50 52→58 ms），
+        //   宿主档 88.6 → **94.9**；kd=8/9/10 反而回落到 85.6~88.2（接受饱和在 4.08）。
+        //   文本 md5 `62b508f8` 与 kd=5/8/9 逐位相同 ⇒ 纯速度，不是行为变化。
         let kd: usize = std::env::var("LINGXI_SERVE_SPEC_KD")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -172,10 +184,10 @@ impl<'a> SpecRuntime<'a> {
         let slot1 = k.stream.clone_htod(&[0i32])?;
         let goff2 = k.stream.clone_htod(&[0i32, 1i32])?;
         // ★ 2026-10-25 `LINGXI_DRAFT_HEAD_SPLIT`（有第二张卡时**默认开**）：草稿 head 的
-        // `lm_head` 按 vocab 行二分到两张卡。草稿相位只有 GPU0 在跑（`SpecRuntime` 一直只拿
-        // `k`），另一张卡在草稿的 ~8 ms 里整段空转 —— 这是那份空闲显存/带宽唯一的用法。
-        // 逐位不变：同一个核、同一行、同一归约次序；top-K 的全序是 (值降序, 下标升序)，
-        // 两半各取 top-20 再按同一全序归并 ≡ 全局 top-20（F.1）。
+        //   `lm_head` 按 vocab 行二分到两张卡。草稿相位只有 GPU0 在跑（`SpecRuntime` 一直只拿
+        //   `k`），另一张卡在草稿的 ~8 ms 里整段空转 —— 这是那份空闲显存/带宽唯一的用法。
+        //   逐位不变：同一个核、同一行、同一归约次序；top-K 的全序是 (值降序, 下标升序)，
+        //   两半各取 top-20 再按同一全序归并 ≡ 全局 top-20。
         let split_on = std::env::var("LINGXI_DRAFT_HEAD_SPLIT").map(|v| v != "0").unwrap_or(true);
         let head_q4_hi = match (k1, endpoints.output_head_q4.as_ref()) {
             (Some(k1), Some(wq)) if split_on && wq.rows > 1 && wq.rows % 2 == 0 => {
@@ -215,13 +227,13 @@ impl<'a> SpecRuntime<'a> {
         } else {
             None
         };
-        Ok(Self { k, k1, head_q4_hi, slot1_hi, goff2_hi, hb, g, ml, arena, mst, tables, endpoints,
-                  shape, hidden, dim, vocab, kd, min_p, acc_ema: (kd as f64 * 0.6).max(3.0), slot1, goff2 })
+        Ok(Self { k, k1, head_q4_hi, slot1_hi, goff2_hi, hb, g, ml, arena, tables, endpoints,
+                  shape, hidden, dim, vocab, kd, min_p, slot1, goff2 })
     }
 
     /// 新请求：把 MTP 的注意力计数退回 0（KV 是 append-only，回卷后旧行不会再被读到）。
-    pub fn reset(&mut self) {
-        if let AttnState::Qsa(q) = &mut self.mst.attn {
+    pub fn reset(&mut self, st: &mut SpecState) {
+        if let AttnState::Qsa(q) = &mut st.mst.attn {
             q.rewind(0);
         }
     }
@@ -246,6 +258,7 @@ impl<'a> SpecRuntime<'a> {
         t: usize,
         ids: &[i64],
         need_head: bool,
+        st: &mut SpecState,
     ) -> Result<(Vec<u32>, Vec<f32>, CudaSlice<bf16>)> {
         let k = self.k;
         let r = lingxi_model::mtp::stem(k, &self.g, hyper, emb, t, self.shape.eps)?;
@@ -262,7 +275,7 @@ impl<'a> SpecRuntime<'a> {
         };
         const MTP_LAYER_SENTINEL: u32 = 100;
         let out = lingxi_model::layer::layer_step(
-            k, &self.ml.weights, self.shape, &r, t, &env, &mut self.mst, MTP_LAYER_SENTINEL,
+            k, &self.ml.weights, self.shape, &r, t, &env, &mut st.mst, MTP_LAYER_SENTINEL,
         )?;
         lingxi_model::scratch::put_bf16(r);
         if !need_head {
@@ -288,8 +301,8 @@ impl<'a> SpecRuntime<'a> {
             lingxi_model::scratch::put_bf16(j);
         }
         // ★ 2026-10-25：整表 `logits`（`t×vocab` bf16 ≈ 0.5 MB）**只有单卡路才用**。
-        // 分卡路（默认开）的两半 top-20 已在各自卡上算完并归并 ⇒ 这里连分配都不需要。
-        // 之前无条件 `alloc_zeros`：每步 1 次 cudaMalloc + memset + free，6 步/轮 ≈ 0.3 ms/轮。
+        //   分卡路（默认开）的两半 top-20 已在各自卡上算完并归并 ⇒ 这里连分配都不需要。
+        //   之前无条件 `alloc_zeros`：每步 1 次 cudaMalloc + memset + free，6 步/轮 ≈ 0.3 ms/轮。
         let mut logits: Option<CudaSlice<bf16>> = None;
         macro_rules! logits_mut {
             () => {{
@@ -310,8 +323,8 @@ impl<'a> SpecRuntime<'a> {
         //
         // 实测（`tests/t19_draft_t1_bw.rs::t19_draft_head_bw`，同进程同权重背靠背，
         // 248320×2560、payload 317.8 MB + scale 19.9 MB，分母 = 同形纯读 382 µs / 883 GB/s）：
-        // 生产 727.8 µs（464，52% 分母）/ u128_r1 553.7（610，72%）/ dp4a 521.9（647，79%）；
-        // 冷 L2 同向（720 → 567）。⇒ u128 1.31×、dp4a 1.39×。
+        //   生产 727.8 µs（464，52% 分母）/ u128_r1 553.7（610，72%）/ dp4a 521.9（647，79%）；
+        //   冷 L2 同向（720 → 567）。⇒ u128 1.31×、dp4a 1.39×。
         // 取 1 而不是 2：dp4a 只多 6%，但要付 int8 激活量化（有损）；u128 只改求和次序。
         // 端到端（128 token 三对）：接受率 2.79/轮 两档完全相同、解码文本 md5 全同。
         let fast_mode: u8 = std::env::var("LINGXI_DRAFT_HEAD_FAST")
@@ -461,9 +474,9 @@ impl<'a> SpecRuntime<'a> {
     ///
     /// 为什么逐位不变：
     /// * 每行 logits 由**同一个核、同一行**算出（GPU1 上只是把权重尾部单独搬了一份，
-    /// `row_bytes`/归约次序都相同）⇒ 数值逐位一致；
+    ///   `row_bytes`/归约次序都相同）⇒ 数值逐位一致；
     /// * top-K 的全序是「值降序, 下标升序」（`topk_ops.cu` 的注释），而全局 top-20 的每一项
-    /// 必在其所在半区的 top-20 里 ⇒ 「两半各取 top-20 再按同一全序归并」≡ 全局 top-20。
+    ///   必在其所在半区的 top-20 里 ⇒ 「两半各取 top-20 再按同一全序归并」≡ 全局 top-20。
     ///
     /// 成本：每步一次 5 KB 的 D2H→H2D（激活）与 160 B×2 的回传；一次性 170 MB 权重搬迁在 `load`。
     #[allow(clippy::too_many_arguments)]
@@ -539,19 +552,20 @@ impl<'a> SpecRuntime<'a> {
     ///
     /// ⚠️ 两个关键点：
     /// 1. **只对最后一行跑 head**：`step(need_head=false)` 已推进 MTP 的 KV，
-    /// 而 head 逐行独立 —— 对 `prompt_len` 行全跑要多算 `prompt_len × vocab` logits + topk。
+    ///    而 head 逐行独立 —— 对 `prompt_len` 行全跑要多算 `prompt_len × vocab` logits + topk。
     /// 2. **分块喂**（默认 128 行）：MTP 层是因果的、位置由 QSA 的 `len` 自动推进，
-    /// 分块与整段等价（与主干的 prefill 分块同一依据）；同时把峰值显存压到可预测。
-    /// 实测整段 867 行会让 MTP head 的 logits 出现非有限值（疑似大 t 的缓冲/路径问题）。
+    ///    分块与整段等价（与主干的 prefill 分块同一依据）；同时把峰值显存压到可预测。
+    ///    实测整段 867 行会让 MTP head 的 logits 出现非有限值（疑似大 t 的缓冲/路径问题）。
     pub fn prime(
         &mut self,
         hyper_prompt: &CudaSlice<bf16>,
         ids: &[i64],
         emb_prompt: CudaSlice<bf16>,
+        st: &mut SpecState,
     ) -> Result<i64> {
         let k = self.k;
-        // ⚠️ 行数取 `h`/`emb` 的实际行数（= prompt 长度），**不是** `ids.len`：
-        // `ids` 比它们多一个（prefill 已把首个生成 token 推进 ids）。
+        // ⚠️ 行数取 `h`/`emb` 的实际行数（= prompt 长度），**不是** `ids.len()`：
+        //    `ids` 比它们多一个（prefill 已把首个生成 token 推进 ids）。
         let n = hyper_prompt.len() / self.dim;
         anyhow::ensure!(
             emb_prompt.len() == n * self.hidden && ids.len() >= n,
@@ -579,7 +593,7 @@ impl<'a> SpecRuntime<'a> {
                 &emb_prompt.slice(off * self.hidden..(off + c) * self.hidden),
                 &mut eb,
             )?;
-            let (_, _, o) = self.step(&hb, &eb, c, ids, false)?;
+            let (_, _, o) = self.step(&hb, &eb, c, ids, false, st)?;
             lingxi_model::scratch::put_bf16(hb);
             lingxi_model::scratch::put_bf16(eb);
             if let Some(prev) = last_out.take() {
@@ -622,6 +636,7 @@ impl<'a> SpecRuntime<'a> {
         provider: &mut dyn lingxi_driver::LayerProvider,
         sb: &mut lingxi_driver::SpecBuffers,
         h_last: &mut CudaSlice<bf16>,
+        st: &mut SpecState,
     ) -> Result<Round> {
         let k = self.k;
         // `LINGXI_SPEC_PROF=1`：一轮的四相位墙上时钟（snapshot/草稿/验证/提交+重放），
@@ -637,7 +652,7 @@ impl<'a> SpecRuntime<'a> {
         seq.spec_snapshot(eng, sb)?;
         let mut t = lap("snapshot", tp);
         let pending = *seq.ids.last().expect("round 需要非空序列");
-        let mlen0 = match &self.mst.attn {
+        let mlen0 = match &st.mst.attn {
             AttnState::Qsa(q) => q.len,
             _ => 0,
         };
@@ -651,13 +666,13 @@ impl<'a> SpecRuntime<'a> {
             .map(|v| v != "0")
             .unwrap_or(true);
         let kd_eff = if adapt {
-            (self.acc_ema * 2.0).ceil().clamp(3.0, self.kd as f64) as usize
+            (st.acc_ema * 2.0).ceil().clamp(3.0, self.kd as f64) as usize
         } else {
             self.kd
         };
         for _ in 0..kd_eff {
             let emb = self.embed1(tok)?;
-            let (d, pr, o) = self.step(&h_in, &emb, 1, &seq.ids, true)?;
+            let (d, pr, o) = self.step(&h_in, &emb, 1, &seq.ids, true, st)?;
             lingxi_model::scratch::put_bf16(emb);
             lingxi_model::scratch::put_bf16(h_in);
             let p1 = pr.first().copied().unwrap_or(1.0);
@@ -671,7 +686,7 @@ impl<'a> SpecRuntime<'a> {
         // ② 主干一次批前向验证
         t = lap("draft", t);
         let chunk: Vec<i64> = std::iter::once(pending).chain(drafts.iter().copied()).collect();
-        // `LINGXI_VERIFY_HEAD_SPLIT`：verify head 的词表行二分到两卡。
+        // `LINGXI_VERIFY_HEAD_SPLIT`（默认开）：verify head 的词表行二分到两卡。
         // 判据见 lib.rs 的 `VerifyHeadAlt`：`gemm_q4_skinny_bf16` 无 split-k ⇒ 逐位等价；
         // 端到端 md5 与不开时相同。GPU1 的尾半权重已由 `head_q4_hi` 常驻。
         let head_alt = match (self.k1, self.head_q4_hi.as_ref()) {
@@ -685,8 +700,8 @@ impl<'a> SpecRuntime<'a> {
         seq.spec_chunk(eng, &chunk, provider, sb, head_alt.as_ref())?;
         t = lap("verify", t);
         // ★ `LINGXI_SPEC_SELFTEST=1`：**验证 A' 的回退原语**（回卷到快照 + 用同一批 token 重跑）。
-        // 判据：两次 argmax 必须逐位相同 —— 这条不通，"乐观执行 + 整轮重算"就没有可依的回退。
-        // 代价：本轮 verify 跑两遍（只在自检开关下）。跑完状态回到"验证后"，正常流程继续。
+        //   判据：两次 argmax 必须逐位相同 —— 这条不通，"乐观执行 + 整轮重算"就没有可依的回退。
+        //   代价：本轮 verify 跑两遍（只在自检开关下）。跑完状态回到"验证后"，正常流程继续。
         if lingxi_model::flag("LINGXI_SPEC_SELFTEST") {
             let a0 = sb.argmax.clone();
             seq.spec_restore(eng, provider, sb)?;
@@ -711,12 +726,12 @@ impl<'a> SpecRuntime<'a> {
         let keep = acc + 1;
         // 自适应 kd 的 EMA 更新（α=0.35：慢到扛住英文自己的冷启动轮——实测 α=0.5 时
         // 前 5 轮冷 miss 会把 ema 砸到 3.1 ⇒ kd_eff=6，英文接受 4.08→3.71、−1.3%）。
-        self.acc_ema = 0.65 * self.acc_ema + 0.35 * (acc as f64);
+        st.acc_ema = 0.65 * st.acc_ema + 0.35 * (acc as f64);
         // ③ 提交
         seq.spec_commit(eng, provider, sb, keep)?;
         t = lap("commit", t);
         // ④ MTP：回卷到轮前，再用主干 h 批量重放 keep 个 cell
-        if let AttnState::Qsa(q) = &mut self.mst.attn {
+        if let AttnState::Qsa(q) = &mut st.mst.attn {
             q.rewind(mlen0);
         }
         let bonus = *seq.ids.last().unwrap();
@@ -728,7 +743,7 @@ impl<'a> SpecRuntime<'a> {
         let d_toks = k.stream.clone_htod(&toks)?;
         let mut emb = k.stream.alloc_zeros::<bf16>(keep * self.hidden)?;
         k.gather_rows_bf16(&self.endpoints.token_embedding, &d_toks, &mut emb, keep, self.hidden, 0)?;
-        let (_, _, o) = self.step(&hb, &emb, keep, &seq.ids, false)?;
+        let (_, _, o) = self.step(&hb, &emb, keep, &seq.ids, false, st)?;
         lingxi_model::scratch::put_bf16(o);
         lingxi_model::scratch::put_bf16(emb);
         lingxi_model::scratch::put_bf16(hb);

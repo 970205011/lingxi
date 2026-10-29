@@ -311,9 +311,9 @@ pub(crate) fn respond_chunked(stream: &mut TcpStream, body: &[u8]) -> Result<()>
     Ok(())
 }
 
-// ─────────────────────────── ㊿-P1 会话驻留（多会话·单物化） ───────────────────────────
+// ─────────────────────────── 会话驻留（多会话·单物化） ───────────────────────────
 //
-// 形态（PLAN_NEXT P1 v1）：**任意数量会话驻留，但同时只物化一个 Sequence**。
+// 形态（v1）：**任意数量会话驻留，但同时只物化一个 Sequence**。
 // 切换时当前会话整份 `save_host_checkpoint` 沉到 host RAM（秒级唤醒 = H2D 灌回，
 // 不是重跑 prefill）；沉没层总量受 `LINGXI_SERVE_SUNK_MB`（默认 32GB）约束，超了按 LRU 丢
 // （数据损失，打响亮日志）。KV 预算走 `KvBudget`（pledge = prompt+生成+余量）；
@@ -551,11 +551,22 @@ pub(crate) fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8
     let reason = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
+    // ★ 错误留痕（2026-10-27）：所有非 200 从这一个口出——把状态码+真实原因打进日志，
+    // 下次任何失败都不用猜"为什么"（用户点名：改数字没用，能知道为什么才有用）。
+    if code >= 400 {
+        eprintln!(
+            "[serve] ✗ HTTP {code} {reason}: {}",
+            String::from_utf8_lossy(body)
+        );
+    }
     write!(
         stream,
         "HTTP/1.1 {code} {reason}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -570,13 +581,13 @@ pub(crate) fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8
 
 // ═══════════════════════════ v1.5 并发路径（多物化 + 真并发） ═══════════════════════════
 //
-// 结构（PLAN_NEXT P1→v1.5）：
-// 连接线程（每连接一个）：读 HTTP/请求体 → `Req` 送进队列 → 阻塞转发 `Ev` 字节回 socket
-// 引擎线程（唯一）：收 `Req` → 物化/切换会话（`Sessions`）→ prefill → 把生成拆成
-// 每会话一个 `Gen`，**轮转步进**（每轮每个活跃 Gen 一个 token）——单流时间片，
-// 无队头阻塞；引擎内部（Kernels/scratch/图固定槽/路由工作区）全线程局部，
-// 串行步进下天然安全。
-// 会话隔离：每会话 per-session CUDA Graph epoch（切换 = epoch_switch，图集各自保留；
-// 新建/唤醒 = epoch_fresh；沉没 = epoch_purge）。`LINGXI_SERVE_MATERIALIZED`（默认 2）
-// 控制同时物化上限，超配把最久未动的 live 会话沉到 host（生成中的会话受 protect）。
-// 投机解码与并发调度不兼容（草稿态绑会话）——投机开时整体走串行路径（见 `run`）。
+// 结构（P1→v1.5）：
+//   连接线程（每连接一个）：读 HTTP/请求体 → `Req` 送进队列 → 阻塞转发 `Ev` 字节回 socket
+//   引擎线程（唯一）：收 `Req` → 物化/切换会话（`Sessions`）→ prefill → 把生成拆成
+//     每会话一个 `Gen`，**轮转步进**（每轮每个活跃 Gen 一个 token）——单流时间片，
+//     无队头阻塞；引擎内部（Kernels/scratch/图固定槽/路由工作区）全线程局部，
+//     串行步进下天然安全。
+//   会话隔离：每会话 per-session CUDA Graph epoch（切换 = epoch_switch，图集各自保留；
+//   新建/唤醒 = epoch_fresh；沉没 = epoch_purge）。`LINGXI_SERVE_MATERIALIZED`（默认 2）
+//   控制同时物化上限，超配把最久未动的 live 会话沉到 host（生成中的会话受 protect）。
+//   投机解码与并发调度不兼容（草稿态绑会话）——投机开时整体走串行路径（见 `run`）。

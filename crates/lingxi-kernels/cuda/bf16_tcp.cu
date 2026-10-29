@@ -12,7 +12,7 @@
 // A 片段直接从 fp16 shared 读 uint4 —— SIMT FMA 的 ~160 issue slot/64 FMA 压到
 // ~22（8 mma + 8 CVT + 少量 load）。
 //
-// 数值口径（有损档，PLAN_NEXT / HANDOFF 原则 4）：V100 无 bf16 HMMA、无 fp32
+// 数值口径（有损档）：V100 无 bf16 HMMA、无 fp32
 // 输入 HMMA —— 乘数走 fp16（x/W 各一次 bf16→fp16 舍入，尾数 8→10 位是放大不缩，
 // |值|>65504 会 inf 的理论风险与 q4_tcp 同），**fp32 累加**、epi fp32、写出 bf16。
 // 判据 = 首 token 相等 + spec_bench 接受率 + 文本质量抽检。

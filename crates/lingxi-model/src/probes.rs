@@ -5,14 +5,14 @@
 //!
 //! 1. `LINGXI_ROUTER_NOSYNC` —— 文档里写着、**代码里根本不存在**，一整组对比实验作废；
 //! 2. `LINGXI_KT` × `LINGXI_DENSE_Q4` —— 组合起来会 **panic**（探针引用空的 bf16 权重），
-//! 连着三次「跑完没有输出」都白跑了；
+//!    连着三次「跑完没有输出」都白跑了；
 //! 3. `LINGXI_SKIP` 剥块 —— **系统性高估**（去掉 MoE 也顺带去掉了每层栅栏，其它块跟着变快），
-//! 差点把那 36 ms 记在 MoE 头上（实际是 GR，见）。
+//!    差点把那 36 ms 记在 MoE 头上（实际是 GR）。
 //!
 //! 本文件提供三件事：
 //! - [`PROBES`]：一张表，登记每个开关的**类型 / 默认 / 用途 / 与谁耦合**；
 //! - [`check_env`]：启动时校验——**拼错的开关会被点名**（以前是静默忽略），
-//! 已知的危险组合**直接报错退出**（而不是崩在内核深处）；
+//!   已知的危险组合**直接报错退出**（而不是崩在内核深处）；
 //! - [`dump`]：把所有开关的当前状态打出来，便于把实验配置写进档案。
 
 /// 开关的类别。分类决定了「它能不能进生产默认路径」。
@@ -51,6 +51,8 @@ pub const PROBES: &[Probe] = &[
         coupling: "与 ARENA_SLOTS / ARENA_PIN_GIB 联动" },
     Probe { name: "LINGXI_PLE_TABLE", kind: Kind::Feature, default_on: false,
         purpose: "PLE 大表路径", coupling: "" },
+    Probe { name: "LINGXI_NINFER_PY", kind: Kind::Feature, default_on: false,
+        purpose: "外部 Python 参考运行时目录（nvidia-smi/参考实现探测用），注入子进程 PYTHONPATH", coupling: "" },
     Probe { name: "LINGXI_ALLOW_MMAP_FALLBACK", kind: Kind::Feature, default_on: false,
         purpose: "**显式**允许在没有 arena 时退回 MmapExpertSource（host LRU）。实测 decode 慢 15~20 倍，只做对照时开",
         coupling: "与 LINGXI_EXPERT_ARENA 互补：给了 arena 就不看它" },
@@ -61,7 +63,7 @@ pub const PROBES: &[Probe] = &[
     // ── 容量 / 缓存（Feature） ──
     Probe { name: "LINGXI_ARENA_SLOTS", kind: Kind::Feature, default_on: false,
         purpose: "设备专家槽数（默认 7000 ≈ 17 GiB）",
-        coupling: "加到 9500 实测无收益 ；与显存预算（DEV_EXPERT_GB）联动" },
+        coupling: "加到 9500 实测无收益；与显存预算（DEV_EXPERT_GB）联动" },
     Probe { name: "LINGXI_ARENA_PIN_GIB", kind: Kind::Feature, default_on: false,
         purpose: "arena 锁页：**不设 = 在 RAM(tmpfs/ramfs) 上默认整段 pin**；=0 显式关闭；**只支持整段或 0**（给中间值启动即报错）",
         coupling: "⚠️ pin 的安全性**按介质判定**（`arena_source` 读 /proc/mounts 硬判）：非 RAM 介质上一律**禁止**——注册会逼内核把整段 arena major-fault 进内存，对机械盘持续顺序读会触发固件假死（2026-10-14 事故）。另：部分 pin 已被实测证明会崩（CUDA_ERROR_INVALID_VALUE）" },
@@ -72,23 +74,23 @@ pub const PROBES: &[Probe] = &[
 
     // ── 量化路线（Feature；2026-10-27 起全部值感知 flag_val，default_on = 引擎默认）──
     Probe { name: "LINGXI_DENSE_Q4", kind: Kind::Feature, default_on: true,
-        purpose: "稠密权重走 W4G64（GDN/QSA 投影）。**p10 −6.6%，序列逐位不变**（）；\
+        purpose: "稠密权重走 W4G64（GDN/QSA 投影）。**p10 −6.6%，序列逐位不变**；\
                   `=0` 关进 bf16 质量模式",
         coupling: "**与 LINGXI_KT 冲突（会 panic）**；非增量 oracle 子命令不要开（会读到 1 元素 stub）" },
     Probe { name: "LINGXI_DENSE_Q4_QSA", kind: Kind::Feature, default_on: true,
-        purpose: "QSA 投影也走 W4G64。与 DENSE_Q4 同开（）；`=0` 关",
+        purpose: "QSA 投影也走 W4G64。与 DENSE_Q4 同开；`=0` 关",
         coupling: "历史记过「长序列 ILLEGAL_ADDRESS」，2026-10-15 400 token 复测无错，暂视为已消" },
     Probe { name: "LINGXI_PROJ_TC", kind: Kind::Feature, default_on: true,
-        purpose: " 投影张量核化：bf16 稠密投影 t>64 大 m 档 mlarge → bf16_tcp（Volta mma.m8n8k4）",
+        purpose: "投影张量核化：bf16 稠密投影 t>64 大 m 档 mlarge → bf16_tcp（Volta mma.m8n8k4）",
         coupling: "**有损档默认开**（2026-10-27 起；`LINGXI_PROJ_TC=0` 关；fp16 乘 + fp32 累加，\
                   实测 64tok 文本逐字节不变、接受率持平）；形状门禁同 mlarge（k%64、k≥512、n≥1024）；\
                   t≤64（含 decode t=1）旧路径不动；Q4 档投影本就 TC 故该档 no-op，\
                   只在 DENSE_Q4=0 的 bf16 质量模式生效" },
     Probe { name: "LINGXI_HEAD_Q4", kind: Kind::Feature, default_on: true,
-        purpose: "lm_head 走 W4G64（1.18 GiB→0.31 GiB）。**再 −3.7%，序列逐位不变**（/）；`=0` 关",
+        purpose: "lm_head 走 W4G64（1.18 GiB→0.31 GiB）。**再 −3.7%，序列逐位不变**；`=0` 关",
         coupling: "输出头对长链路质量最敏感 ⇒ 8 token 之外仍需长链验证" },
     Probe { name: "LINGXI_QSA_DENSE", kind: Kind::Feature, default_on: false,
-        purpose: "跳块稀疏注意力回退密集掩码路径（㊵ 对拍开关；默认走稀疏，只算 keep 选中块的点积）",
+        purpose: "跳块稀疏注意力回退密集掩码路径（对拍开关；默认走稀疏，只算 keep 选中块的点积）",
         coupling: "稀疏路径与被跳过位置的 dense 贡献（恰 0）逐位等价，含退化整行无可见位情形" },
     Probe { name: "LINGXI_QSA_PAGED", kind: Kind::Feature, default_on: false,
         purpose: "P2 页粒度部分驻留：KV 块表间接 + host 锁页块池 + LRU 下沉/预取（常驻窗口 LINGXI_QSA_WIN_TOKENS，默认 32K）",
@@ -115,19 +117,19 @@ pub const PROBES: &[Probe] = &[
         purpose: "QSA 选块列表构建回退到 tid==0 的 1024 次串行前缀和（旧实现，做 A/B）",
         coupling: "只影响 `qsa_sel_build`；新实现是 shared 上的整数前缀和，输出逐位相同" },
     Probe { name: "LINGXI_NO_KEEP_ALL", kind: Kind::Ab, default_on: false,
-        purpose: "：`nblocks ≤ topk`（短上下文）时不再走 **keep 全 1** 的早退，\
+        purpose: "`nblocks ≤ topk`（短上下文）时不再走 **keep 全 1** 的早退，\
                   仍发 scores + rank 两发（做 A/B）。两档数学恒等（rank ≤ nblocks-1 < topk）",
         coupling: "只影响 decode/verify 的 indexer 选块；`sel_build` 的 all 模式一并回退" },
     Probe { name: "LINGXI_NO_POOL_FUSE", kind: Kind::Ab, default_on: false,
-        purpose: "：QSA 增量池化回退到 **pool/rmsnorm/rope/memcpy 四发**（做 A/B）；\
+        purpose: "QSA 增量池化回退到 **pool/rmsnorm/rope/memcpy 四发**（做 A/B）；\
                   默认四发合一（`qsa_pool_norm_rope_bf16`，逐位相同，23.5→~6 µs/层）",
         coupling: "只在 `rot_dim>0 且 head_dim≤256` 时默认生效；与 LINGXI_QSA_FUSED_MAX 无关" },
     Probe { name: "LINGXI_NO_PROJ_PAIR", kind: Kind::Ab, default_on: false,
-        purpose: "：indexer 的 q/k 两个 bf16 投影回退成**两发**（做 A/B）；\
+        purpose: "indexer 的 q/k 两个 bf16 投影回退成**两发**（做 A/B）；\
                   默认合成一发 `gemm_bf16_row_pair`（逐位相同，640+128 行 26.0→~16 µs/层）",
         coupling: "只在 `m≤8` 且走 `gemm_skinny_row` 档（k≥1024、k%8==0、未关 LINGXI_NO_SKINNY_ROW）时生效" },
     Probe { name: "LINGXI_NO_NRM_ROPE_FUSE", kind: Kind::Ab, default_on: false,
-        purpose: "：QSA 的 `grouped_rmsnorm` + `rope_partial` 回退成两发（做 A/B）；\
+        purpose: "QSA 的 `grouped_rmsnorm` + `rope_partial` 回退成两发（做 A/B）；\
                   默认合一 `rmsnorm_rope_bf16`（逐位相同，q/k/indexer 三处各省 ~5 µs）",
         coupling: "rot_dim>0 时生效；q/k/indexer 三处共用" },
     Probe { name: "LINGXI_IDX_SCORES_VEC", kind: Kind::Ab, default_on: false,
@@ -152,13 +154,13 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_MTP_HNORM", kind: Kind::Feature, default_on: false,
         purpose: "MTP stem 的 hidden 分支 **norm 分组**：默认 = `stream`（逐 hyper-connection stream，每 2560 一段，\
                   各归一化 + 各用 gamma 的一片）；`=pooled` = 整段 HC*N(10240) 一起 RMS。\
-                  取自 Strata `--mtp-hnorm`（`src/core/mtp.cpp:686`，其注释明写 stream 才是 \
+                  取自同类开源参考实现的 `--mtp-hnorm`（其注释明写 stream 才是 \
                   **llama.cpp qwen4exp MTP 图的做法**）；同机同模型的「顺子」开着它。\
                   实测（交错 A/B，n=200）：stream 3.67/6 接受、41.0 tok/s ｜ pooled 3.47/6、38.6；\
                   位 1 条件接受率 0.79 vs 0.68",
         coupling: "只改 MTP 草稿质量，**不该改主干输出**；若生成序列变了说明我们在草稿上耦合了主干路径，要查" },
     Probe { name: "LINGXI_SUFFIX_DRAFT", kind: Kind::Feature, default_on: false,
-        purpose: "**后缀查表草稿**（= Strata 的 `--suffix-draft`，值 = 最小匹配长度，**默认 0 = 关**）。\
+        purpose: "**后缀查表草稿**（值 = 最小匹配长度，**默认 0 = 关**）。\
                   零权重、零 GPU、微秒级：把「历史后缀 + MTP 已产出的草稿」当查询，\
                   从上下文里找最长的更早出现，把它后面跟着的 token 当草稿补进窗口。\
                   ⚠️ **查表本身实测是对的**（`LINGXI_SUFFIX_TRACE=1`：提议 `[369,11751,13]`、\
@@ -166,7 +168,7 @@ pub const PROBES: &[Probe] = &[
                   但**挂错位置**了：接受是前缀式的，挂在 MTP 链后面 ⇒ 只有整条链先被接受才轮得到它，\
                   实测「提议 7 枚、接受 0 枚」且白付行钱（47.4→44.3 tok/s）。\
                   要生效必须先做参考实现的 `DraftPolicy::choose`（匹配够长时**用 lookup 顶掉整个 MTP 窗**），\
-",
+                  见实验记录",
         coupling: "只改「提哪些草稿」，被采纳的 token 仍由主干验证 ⇒ 不改对外输出" },
     Probe { name: "LINGXI_SUFFIX_CHAIN", kind: Kind::Probe, default_on: false,
         purpose: "后缀查表一次最多补几枚（0 = 把 MTP 被闸门砍掉的空位全补上）",
@@ -250,10 +252,10 @@ pub const PROBES: &[Probe] = &[
         coupling: "**必须同时关图**（`LINGXI_NO_GRAPHS=1`；跨流+事件在 capture 里语义不同）\
                    —— 只设本开关不关图时会告警并**自动退回老路径**。数学不变（位等价）。" },
     Probe { name: "LINGXI_ARENA_PIN_DMA", kind: Kind::Feature, default_on: false,
-        purpose: "  的那条实验：再开一份**可写** `MAP_SHARED` 别名（同一份 tmpfs 页，\
+        purpose: "再开一份**可写** `MAP_SHARED` 别名实验（同一份 tmpfs 页，\
                   只注册不写），用 `CU_MEMHOSTREGISTER_PORTABLE` 注册，把专家 H2D 从 zero-copy\
                   路径改成 copy-engine DMA。\
-                  ❌ **实测已否决（）**：注册确实成功了（`arena_pinned=1`），但专家段\
+                  ❌ **实测已否决**：注册确实成功了（`arena_pinned=1`），但专家段\
                   \"每 miss 增量\" 完全没变（2.31 → 2.25 ms），tok/s 也在噪声内（40.2 → 40.9）。\
                   ⇒ 留着只作 A/B 杠杆，**别指望它提速**。",
         coupling: "需要 arena 文件**可写**（/dev/shm 上是）；默认关 = 老行为（READ_ONLY 注册）" },
@@ -324,7 +326,7 @@ pub const PROBES: &[Probe] = &[
         coupling: "**位安全**（每行的列集合与累加次序不变）；与 LINGXI_Q4_SLOTS_RPW 各自独立" },
     Probe { name: "LINGXI_NO_SKINNY", kind: Kind::Ghost, default_on: false,
         purpose: "🚫 **已删除**：t>1 回退 cuBLAS 那条路整条移除（实测 t=2 64.7→405.6 ms，
-            且 cuBLAS 在窄 N 上会选到病态内核，见 /）。现在 t>1 一律走自研瘦长 GEMM",
+            且 cuBLAS 在窄 N 上会选到病态内核）。现在 t>1 一律走自研瘦长 GEMM",
         coupling: "设了它 = 什么都没变" },
     Probe { name: "LINGXI_NO_SKINNY_ROW", kind: Kind::Ab, default_on: false,
         purpose: "瘦长 GEMM 回退旧核（并行度差 8 倍）", coupling: "" },
@@ -359,7 +361,7 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_NO_PAIR_MOE", kind: Kind::Ab, default_on: false,
         purpose: "MoE 关闭 (专家,行) 对路径（**长 prompt 会 OOM**，仅调试）", coupling: "" },
     Probe { name: "LINGXI_Q4_ROW4", kind: Kind::Ab, default_on: false,
-        purpose: "稠密 Q4 GEMV 回到「一 warp 4 行」做对照（**默认已翻成单行**：LUT 之后 4 行版被 shared 挤爆，见 ）", coupling: "" },
+        purpose: "稠密 Q4 GEMV 回到「一 warp 4 行」做对照（**默认已翻成单行**：LUT 之后 4 行版被 shared 挤爆）", coupling: "" },
     Probe { name: "LINGXI_Q4_SLOTS_RPW", kind: Kind::Ab, default_on: false,
         purpose: "专家 Q4 GEMV 的每 warp 行数（1/2/4/8）；1 = 历史逐行版、与历史逐位一致",
         coupling: "只影响 MoE 专家段；目标是 dn 段 k=640（每行仅 320 B Q4）那种窄行形状" },
@@ -400,8 +402,8 @@ pub const PROBES: &[Probe] = &[
         purpose: "gather 核的 **q-head 合并数**（`1`/`2`/`4`）：本模型 24 q-head / 2 kv-head\
                   ⇒ 12 个 q-head 共用同一份 K/V，旧版按 (row,head) 各读一遍（49GB/层 ≈ 打满 HBM）。\
                   合并 4 个后 32K 实测 attn 58~62ms/层 → **24~26ms/层**，逐位一致。\
-                  ★ ：decode 小 t（块数少、延迟受限）NH=1 栅格最优。\
-                  ★ （2026-10-26）：默认按 t 分档——**prefill t≥16 默认 4**（块数足、流量账），\
+                  ★ decode 小 t（块数少、延迟受限）NH=1 栅格最优。\
+                  ★ 2026-10-26：默认按 t 分档——**prefill t≥16 默认 4**（块数足、流量账），\
                   decode/verify 小 t 默认 1；显式设值覆盖两档",
         coupling: "`LINGXI_NO_ATTN_GATHER_V3=1` 时 prefill 走旧核的 NH=2/4 档（无流水化）；\
                   smem = span×4B×NH（NH=4 时 ≈33KB，故不再往上加）" },
@@ -410,7 +412,7 @@ pub const PROBES: &[Probe] = &[
                   默认的 v2 按选块分组、块内 4 个 V 地址一起发（逐位相同，微基准 47→32 µs/层）",
         coupling: "只影响 `attn_gather*`；与 `LINGXI_ATTN_GATHER_H` 正交（两档都生效）" },
     Probe { name: "LINGXI_NO_ATTN_GATHER_V3", kind: Kind::Ab, default_on: false,
-        purpose: "：**关闭 prefill 形态的 gather v3 重排核**（默认开）。v3 = pass1 取数流水化\
+        purpose: "**关闭 prefill 形态的 gather v3 重排核**（默认开）。v3 = pass1 取数流水化\
                   + K 行 f32 转换共享 + 分数布局 [idx*NH+g] 向量 LDS；t=512 微基准 −35%，\
                   与旧核逐位等价（t25 对拍 0 差异）；仅 t_q≥16 且 NH∈{2,4} 且 smem 放得下时选路",
         coupling: "与 `LINGXI_ATTN_GATHER_H`（NH 选择）/`LINGXI_NO_ATTN_V2` 正交；\
@@ -420,7 +422,7 @@ pub const PROBES: &[Probe] = &[
                   ⇒ 会打乱双卡流水，只用于归因，不要在生产计时用",
         coupling: "只打印（前 400 次调用）" },
     Probe { name: "LINGXI_GR_FUSE", kind: Kind::Ab, default_on: false,
-        purpose: "GR 的 5 核融成 2 核（**仅 rows==1**；历史实测整机反而慢 11%，故默认关 ）", coupling: "与 gr.rs 的图捕获路径互斥语义" },
+        purpose: "GR 的 5 核融成 2 核（**仅 rows==1**；历史实测整机反而慢 11%，故默认关）", coupling: "与 gr.rs 的图捕获路径互斥语义" },
     Probe { name: "LINGXI_GR_PROF", kind: Kind::Probe, default_on: false,
         purpose: "GR 块（seg0 的 attn_GR / seg2 的 mlp_GR）内部事件口径逐核计时：\
                   旧路 5 段（rmsnorm/down/up/mix/inject），融合路 3 段（rmsnorm/down+inject/up+mix），\
@@ -443,12 +445,12 @@ pub const PROBES: &[Probe] = &[
 
     // ── MTP 草稿头（Ab）——都只影响 mtp-accept / mtp-load ──
     // ⚠️ 这一组是 2026-10-16 补登记的：**它们早就被代码读了，却一直没进本表**
-    // （`check_env` 只在"环境里设了它"时才 warn，且只 warn ⇒ 漏登记是静默的）。
-    // 现在由本文件底部的静态守卫测试兜住。
+    //    （`check_env` 只在"环境里设了它"时才 warn，且只 warn ⇒ 漏登记是静默的）。
+    //    现在由本文件底部的静态守卫测试兜住。
     Probe { name: "LINGXI_MTP_ALIGN", kind: Kind::Ab, default_on: false,
         purpose: "MTP 对齐诊断：`=last` 时改用最后一行对齐（与默认口径对拍）", coupling: "" },
     Probe { name: "LINGXI_MTP_GMIX", kind: Kind::Ab, default_on: false,
-        purpose: "MTP 末步改用**全局** mixer（`text/hyper_connection_mixer`）而非自带的 `mtp/mixer`（ 的遗留对拍开关）",
+        purpose: "MTP 末步改用**全局** mixer（`text/hyper_connection_mixer`）而非自带的 `mtp/mixer`（遗留对拍开关）",
         coupling: "" },
     Probe { name: "LINGXI_MTP_H", kind: Kind::Ab, default_on: false,
         purpose: "MTP 输入 h 的来源诊断：`=mixed` 时改用 mixer 之后那一路", coupling: "" },
@@ -462,12 +464,12 @@ pub const PROBES: &[Probe] = &[
         coupling: "⚠️ **数学作废、只为归因**；与 `LINGXI_MTP_SPEC` 一起用" },
     Probe { name: "LINGXI_SPEC_MIN_P", kind: Kind::Feature, default_on: false,
         purpose: "**草稿链的概率闸门**（值 = 阈值，0 = 关）：某一步草稿的 top-1 概率低于阈值就停链。\
-                  取自参考实现 Strata `generate.cpp:9172` 的 `--spec-min-p`（`while T<S_mtp && pr[...]>=spec_min_p`）。\
+                  取自参考实现的 `--spec-min-p`（`while T<S_mtp && pr[...]>=spec_min_p`）。\
                   实测（n=200 干净 A/B，叠 NO_GRAPHS）：关 → **18.2 tok/s**；0.9 → 25.6；**0.7 → 27.6（+52%）**；0.5 → 22.9。\
                   原理：prob1 ≥0.90 的草稿接受率 0.988、<0.50 只有 0.278 ⇒ 砍掉低概率深位几乎不丢接受数，\
                   但省下的是「行」—— 主干验证段实测 −39%（148.0→89.7 ms/轮）",
         coupling: "⚠️ **必须同时设 LINGXI_NO_GRAPHS=1**（截短链 × 图 会在几轮后崩；已在 check_env 里快速失败）。\
-                   图对整机零成本（），所以不亏。默认不设 = 行为完全不变" },
+                   图对整机零成本，所以不亏。默认不设 = 行为完全不变" },
 
     // ── 投机解码（Probe）——改的是"怎么测"，也会改时序；不进生产 ──
     Probe { name: "LINGXI_MTP_SPEC", kind: Kind::Probe, default_on: false,
@@ -509,6 +511,11 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_PREFILL_LM_CHUNK", kind: Kind::Feature, default_on: false,
         purpose: "layer-major 的外层次块 token 数（默认 16384；0 = 整段 prompt 一块）；越大人越省专家换入但激活常驻越大",
         coupling: "仅 `LINGXI_PREFILL_LM=1` 时生效" },
+    Probe { name: "LINGXI_TWOPASS_PIPE_LAG", kind: Kind::Feature, default_on: false,
+        purpose: "层间流水的 A→B 最大领先层数（默认 8；`LINGXI_PREFILL_TWOPASS=1` + \
+                  `LINGXI_TWOPASS_PIPE=1` 时生效）。回压事件等待的深度：太小打不穿流水、\
+                  太大 B 的交接 D2H 落在 A 的流积压之后退化成串行",
+        coupling: "读点 `lingxi-driver/sequence.rs::twopass_pipe_lag`；仅流水版 two-pass 用" },
     Probe { name: "LINGXI_PLE_PROF", kind: Kind::Probe, default_on: false,
         purpose: "[ple-prof] PLE 的 host 分段计时，两处共用同一个开关：\
                   ① prefill 每 chunk 的 查表+反量化 / f32→bf16+H2D（2026-10-18 实测 512 行约 15~20ms + 15~20ms）；\
@@ -537,11 +544,24 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_SERVE_SPEC", kind: Kind::Feature, default_on: false,
         purpose: "`serve` 启用 MTP 投机解码（`spec.rs`）：顺序 43.8 → 约 60 tok/s（kd=5 + min_p 0.7）",
         coupling: "需要 `LINGXI_MTP_ARTIFACT`；与 `LINGXI_SERVE_PREFIX_CACHE` 互斥（spec 要整段 prompt 的 h）；\
-                  MTP 专家默认 Q4（`LINGXI_MTP_Q4_EXPERTS=0` 可关）" },
+                  **2026-10-27 起接入 v1.5 并发路径**（草稿状态拆成每请求 SpecState，\
+                  多会话轮转互不干扰）+ 双卡草稿 head 二分；串行路径仅排障回退 \
+                  （`LINGXI_SERVE_SERIAL=1`）" },
     Probe { name: "LINGXI_MTP_ARTIFACT", kind: Kind::Feature, default_on: false,
-        purpose: "`serve` 的 MTP 草稿产物路径（默认 ./qwen4_exp.mtp.fixed.ninfer 或 /models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer）", coupling: "" },
+        purpose: "`serve` 的 MTP 草稿产物路径（MTP 产物路径，由 LINGXI_MTP_ARTIFACT 指定）", coupling: "" },
     Probe { name: "LINGXI_SERVE_SPEC_KD", kind: Kind::Feature, default_on: false,
-        purpose: "`serve` 投机窗口（**默认 7**；2026-10-25 复扫：全驻留后边际成本跌到 3.5 ms/步 ⇒ kd=7 最优，kd=8/9/10 回落）", coupling: "" },
+        purpose: "`serve` 投机窗口（**默认 7**；复扫：全驻留后边际成本跌到 3.5 ms/步 ⇒ kd=7 最优，kd=8/9/10 回落）", coupling: "" },
+    Probe { name: "LINGXI_SERVE_SERIAL", kind: Kind::Feature, default_on: false,
+        purpose: "`serve` 强制老式串行路径（每连接一线程、单会话生成；排障回退用）",
+        coupling: "2026-10-27 起默认全部走 v1.5 并发路径（含投机），本开关仅排障" },
+    Probe { name: "LINGXI_SERVE_SPEC_MAX_PROMPT", kind: Kind::Feature, default_on: false,
+        purpose: "投机自适应阈值：prompt 超过该 token 数（默认 16384）的请求不走投机、\
+                  改纯自回归 + 前缀缓存——spec 的 prime 要全 prompt hyper、与前缀缓存互斥，\
+                  长文档会话重灌 prefill 的代价远超 decode 加速",
+        coupling: "仅 LINGXI_SERVE_SPEC=1 时生效；短会话仍全速投机" },
+    Probe { name: "LINGXI_SERVE_CACHE_DEBUG", kind: Kind::Probe, default_on: false,
+        purpose: "[serve] 前缀缓存 best() 逐条目诊断（命中/跳过/分叉点），排障用",
+        coupling: "" },
     Probe { name: "LINGXI_MOE_OUT_DUMP", kind: Kind::Probe, default_on: false,
         purpose: "[moe-out] 打**最后一层** MoE 的 out/shared 全和与最大绝对值——定位同输入同路由却输出不同的段落",
         coupling: "与 LINGXI_PIPE_DUMP 配合定位分层/线程差异" },
@@ -572,6 +592,63 @@ pub const PROBES: &[Probe] = &[
         coupling: "只计时不改数值；驱动调用失败自动自关。paged/直跑路径退化为普通流事件计时" },
     Probe { name: "LINGXI_PREFILL_CHUNK", kind: Kind::Feature, default_on: false,
         purpose: "prefill 分块粒度（默认 2048；0/1=不分块老路）", coupling: "" },
+    Probe { name: "LINGXI_SERVE_PREFILL_CHUNK", kind: Kind::Feature, default_on: false,
+        purpose: "`serve` v1.5 并发路径的**分块抢占式 prefill**（值 = 调度块 token 数，\
+                  **默认 0 = 关**，建议档 4096）：超块 prompt 拆成多块，块之间引擎线程\
+                  回到 gen 轮转（其他会话 decode 先走），下一块轮转一圈后接续——119K 首灌\
+                  不再独占引擎线程 578s（\"一个大文档拖死全站\"）。块边界对 GDN 递推（状态\
+                  原位连续推进）与 QSA KV（append-only）透明，只是喂入顺序切分；首个 token\
+                  仍在最后一块产出，TTFT 口径不变。读点 `serve/engine.rs`。",
+        coupling: "⚠️ 两条硬守卫：**spec_on 请求（≤ LINGXI_SERVE_SPEC_MAX_PROMPT）永不分块**——\
+                  MTP 的 prime 要整段 prompt 的 hyper，分块请求一律退回整块路径（行为与\
+                  关分块逐字相同）；**LINGXI_PREFILL_TWOPASS=1 时整体拒绝分块**（two-pass 只\
+                  支持空序列整段喂，`prefill_append` 续跑必炸）——组合在 check_env 直接 panic。\
+                  与 driver 内部 `LINGXI_PREFILL_CHUNK`（压显存峰值的内层粒度）正交：本开关\
+                  不切数学只切调度；分块不增加显存峰值（每块激活 O(chunk)，与 256K 配方兼容）。\
+                  串行路径（LINGXI_SERVE_SERIAL=1）无轮转，恒整块。" },
+    Probe { name: "LINGXI_SERVE_PREFILL_STALL_MS", kind: Kind::Feature, default_on: false,
+        purpose: "分块 prefill 的**防饿死上限**（毫秒，默认 1000，需 LINGXI_SERVE_PREFILL_CHUNK>0）：\
+                  decode 优先调度下本轮有 decode 在跑时 Pfx 不喂块；距上次喂块超过本值 ⇒ 强制喂一块\
+                  （哪怕有 decode 在跑）——连续 decode 流不会把 prefill 饿死。设 0 = 只要 decode 在动\
+                  就永远让路（恢复旧的 1:1 轮转让路语义，无强制）。",
+        coupling: "只影响 chunk>0 的调度决策，不改数值路径；chunk=0 时读点为空转、恒不生效。" },
+    Probe { name: "LINGXI_SERVE_PREFILL_BURST_MULT", kind: Kind::Feature, default_on: false,
+        purpose: "分块 prefill 的**自适应块长放大倍数**（默认 8；0=不放大，需 LINGXI_SERVE_PREFILL_CHUNK>0）：\
+                  active 里无其他 Gen 竞争且有大量未喂 prompt 时，一块喂 \
+                  min(剩余, max(块配置×本值, 65536))——无竞争时逼近整块（块间成本 = 权重 DRAM 重读\
+                  地板，整块只付一次）；有竞争时回落配置的调度块长。决策每个 Pfx 步现算：竞争消失\
+                  即放大、出现即缩小。**放大结果再被 LINGXI_SERVE_PREFILL_BURST_MAX 钳住**\
+                  （单步不可抢占，不钳会队头阻塞）。",
+        coupling: "放宽终点仍钳在计划块边界/检查点里程碑上（存档时机与逐块喂逐字一致），不切数学；\
+                  chunk=0 时读点为空转、恒不生效。" },
+    Probe { name: "LINGXI_SERVE_PREFILL_BURST_MAX", kind: Kind::Feature, default_on: false,
+        purpose: "单个 Pfx 步的**硬上限**（默认 4096 token，需 LINGXI_SERVE_PREFILL_CHUNK>0）：\
+                  burst 放大后的块长再钳到本值。一个 Pfx 步是不可抢占的同步前向——65494 tok \
+                  的 burst 步实测阻塞循环 ~320s，期间新请求干等（burst 本意省权重 DRAM 地板，\
+                  但单步时长成了新的队头阻塞源）。上限 4096 ⇒ 单步 ≤ ~20s，新请求准入最坏等 \
+                  ~20s，大请求地板开销 119K/4096×0.76s ≈ 22s（3.8%）。",
+        coupling: "只钳调度块长，不切数学（逐块喂与整块喂逐位等价，已认证）；\
+                  上限调大 = 小请求最坏等待变长；chunk=0 时恒不生效。" },
+    Probe { name: "LINGXI_PREFILL_TWOPASS", kind: Kind::Feature, default_on: false,
+        purpose: "**路线 A two-pass 双卡并行 prefill**（默认关）：token 区间切半，\
+                  pass1 卡 A(GPU0) 跑前半全部 48 层（512 对齐切半 ⇒ 每 chunk 的派发序列与\
+                  默认路径逐字相同），按层交接 GDN 末态(f32 字节拷贝)+QSA KV(纯字节拼接)\
+                  +PLE 卷积史；pass2 卡 B(GPU1) 以交接态重跑后半。\
+                  需要双卡 layer-split + 缓存型 provider；权重/专家源在 talk.rs 侧配双卡全层镜像",
+        coupling: "需 LINGXI_LAYER_SPLIT 自动/显式生效（双卡）；与 LINGXI_PREFILL_THREADS/\
+                  _PIPE/_LM 互斥（two-pass 优先）；不支持 collect（prefill_with_hyper）、\
+                  QSA 分页/K8V4/LINGXI_QSA_HOST；prefill 期间作用域禁 CUDA Graph（跨卡同键风险），\
+                  decode 恢复；切半点取 512 倍数（派发序列对齐是逐位判据的一部分）" },
+    Probe { name: "LINGXI_TWOPASS_PIPE", kind: Kind::Feature, default_on: false,
+        purpose: "**two-pass 层间流水**（默认关；需 LINGXI_PREFILL_TWOPASS=1 同开）：\
+                  两个 pass 各一线程并发，B 卡落后 A 卡约一层；逐层 cuda event 交接 \
+                  GDN 末态+QSA KV+PLE 史（事件化 staged 裸拷贝），双向遮盖对方远程 MoE 的 \
+                  stall。层循环改层间序（层外×chunk 内），每 (chunk,层) 的派发序列与 \
+                  串行 two-pass 逐字相同 ⇒ 逐位三条件不变",
+        coupling: "仅 LINGXI_PREFILL_TWOPASS=1 时生效；带 host 同步的诊断开关 \
+                  （KTS/SEG3_SYNC/EVPROF/ROUTE_DEV/ROUTE_FULLDEV/MOE_DEBUG/MOE_DUMP/\
+                  MOE_OUT_DUMP/FULLDEV_SHADOW/MIX_SYNC_DN/MIX_DUMP_DN）开启时回退串行 two-pass；\
+                  流水期间启用专家段段锁（防跨线程槽驱逐竞态），其余路径行为不变" },
     Probe { name: "LINGXI_SERVE_CACHE_DIR", kind: Kind::Feature, default_on: false,
         purpose: "serve 前缀缓存落盘目录", coupling: "与 SERVE_CACHE_GIB/MIN_TOKENS 联动" },
     Probe { name: "LINGXI_SERVE_CACHE_GIB", kind: Kind::Feature, default_on: false,
@@ -580,7 +657,7 @@ pub const PROBES: &[Probe] = &[
         purpose: "短会话不落盘阈值（默认 8192 token）", coupling: "" },
     Probe { name: "LINGXI_SKIP", kind: Kind::Probe, default_on: false,
         purpose: "剥块（attn/moe/gr/ple）",
-        coupling: "⚠️ **会改数学 ⇒ 路由乱跳 ⇒ 槽全失效**，系统性高估被剥的块。**必须叠 LINGXI_ARENA_FIXED_EXPERTS=1**，否则结论作废（/）" },
+        coupling: "⚠️ **会改数学 ⇒ 路由乱跳 ⇒ 槽全失效**，系统性高估被剥的块。**必须叠 LINGXI_ARENA_FIXED_EXPERTS=1**，否则结论作废" },
     Probe { name: "LINGXI_ARENA_FIXED_EXPERTS", kind: Kind::Probe, default_on: false,
         purpose: "把路由钉死成固定专家（数学作废，但 kernel/launch/缓冲/同步点与正常路径一致、槽 100% 命中）",
         coupling: "**与 SKIP 组合才可信**；叠 FIXED_IDS 更稳" },
@@ -615,19 +692,19 @@ pub const PROBES: &[Probe] = &[
         purpose: "关掉 slotsm 的 **x-fp32 预转**（P15-⑤b ①），回退 bf16 现转路径做 A/B",
         coupling: "不设 = 默认预转（位等价：bf16→f32 精确、z 次序不变）" },
     Probe { name: "LINGXI_MOE_DP4A", kind: Kind::Feature, default_on: false,
-        purpose: "slotsm 改走 **int8 行量化 x + __dp4a 内积**（P15-㉖）：x 的 L1 流量 ÷4。\
-                  ⛔ **2026-10-25 实测：生产无效且 Q3 档更慢**（ ）——\
+        purpose: "slotsm 改走 **int8 行量化 x + __dp4a 内积**：x 的 L1 流量 ÷4。\
+                  ⛔ **2026-10-25 实测：生产无效且 Q3 档更慢**——\
                   ① 门控要求 `!q3_on && !dual_q4`（forward.rs）/`!mixed`（batch_dev.rs），\
                   混档生产下两处恒假 ⇒ 开关实际不起作用（端到端专家段 0.427→0.430，噪声内）；\
                   ② 新写的 Q3G128 dp4a 档在真实形状是 0.71×/0.92×/0.98×——这些形状延迟受限，\
                   砍 ALU 换不来带宽。核保留作判据留档，**不要接生产**。",
         coupling: "**默认关：非位等价**（x 量化 int8，误差 ~2^-8）；且只覆盖 Q4 视图 ⇒ 混档下无效" },
     Probe { name: "LINGXI_MOE_TC", kind: Kind::Feature, default_on: false,
-        purpose: "专家段走张量核 `mma.sync.m8n8k4`（P15-㊼）：`1 < rows ≤ 16` 走 QPN 小档（投机验证批），\
-                  `rows > 16` 走 ㊽ prefill 大 tile 档（CTA 64 行×128 列、x 进 shared、M 轴进 grid.z，\
+        purpose: "专家段走张量核 `mma.sync.m8n8k4`：`1 < rows ≤ 16` 走 QPN 小档（投机验证批），\
+                  `rows > 16` 走 prefill 大 tile 档（CTA 64 行×128 列、x 进 shared、M 轴进 grid.z，\
                   目标 MoE 77.6 → ≤20 ms/层）",
         coupling: "**有损档**（fp16 权重×scale + x bf16→fp16，~2^-11，远小于 Q4 权重 2^-4）⇒ 判据 = \
-                  首 token 相等 + 质量抽检（PLAN_NEXT ，2026-10-19 拍板放开逐位红线）；t=1 decode 仍走 SIMT" },
+                  首 token 相等 + 质量抽检（2026-10-19 拍板放开逐位红线）；t=1 decode 仍走 SIMT" },
     Probe { name: "LINGXI_MTP_ATTN_Q4", kind: Kind::Feature, default_on: false,
         purpose: "把 MTP（草稿）层的注意力投影在线量化成 W4G64（`=1` 才开）：\
                   `mtp/layer/attention/query_key_gate_value`（68.2 MB bf16）与 `attention/output`\
@@ -650,7 +727,7 @@ pub const PROBES: &[Probe] = &[
         coupling: "需要 `LINGXI_HEAD_Q4=1` + 第二张卡的 Kernels（talk 的 `LINGXI_LAYER_SPLIT`）；\
                    serve 无层切分 ⇒ 自动关。与 `LINGXI_DRAFT_HEAD_FAST` 叠加（分卡优先）" },
     Probe { name: "LINGXI_VERIFY_HEAD_SPLIT", kind: Kind::Feature, default_on: true,
-        purpose: "**验证批 head 的 `lm_head` 按词表行二分到两张卡**：\
+        purpose: "**验证批 head 的 `lm_head` 按词表行二分到两张卡**（默认开，`=0` 回退）：\
                   verify 相位最后那道 `proj_q4_epi(n=248320,k=2560,t≤7)` 要读 ~338 MB，\
                   而那时 **GPU1 刚跑完最后一层、整段空闲** ⇒ lo 半（`[0,V/2)`）在 GPU0、\
                   hi 半在 GPU1（复用草稿相位已常驻的 `head_q4_hi`），两半各 `part+fin` argmax，\
@@ -672,25 +749,25 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_MOE_GEMV_TIER", kind: Kind::Feature, default_on: true,
         purpose: "Q4 专家 GEMV 的取数结构档：`1`（**默认**）= `slotsm_t2_bf16`（**与旧核逐位相同**，\
                   只把 PF=4 移位预取换成两个独立 load + 移位对解包）。实测 gu E40 m=1 317→453 GB/s、\
-                  线上 E7 m=1 269→374，专家段 −8%，tok/s +3%。`0` = 回退旧核。docs ",
+                  线上 E7 m=1 269→374，专家段 −8%，tok/s +3%。`0` = 回退旧核",
         coupling: "只作用于 `rows_per_warp==1 && xf==0`（rows=1 的混档 decode）；prefill 的 xf 档、\
                    rpw=2/4、dp4a、TC、Q3 全部原样" },
     Probe { name: "LINGXI_NO_Q3_T2", kind: Kind::Ab, default_on: false,
         purpose: "**Q3 专家 GEMV 回退旧核**：默认走 `slotsm_t2_*`（**与旧核逐位相同**，只换\
                   取数结构：两对齐 u32 + `__funnelshift_r`、移位对解包、UNR 个独立 load、\
                   每组 1 对时用 MB=1 实例）。实测 gu E10 m=1 161→303 GB/s（1.88×）、\
-                  dn 119→196；`=1` 回退 `slotsm_body<1>`（3×1 B 取数 + PF=4）。docs ",
+                  dn 119→196；`=1` 回退 `slotsm_body<1>`（3×1 B 取数 + PF=4）",
         coupling: "只作用于 `rows_per_warp==1 && xf==0`；`MB=1` 实例另需每组恰好 1 对（调用方按 \
                    `tmax==1` 选核）。rpw=2/4、xf 档、dp4a、TC 原样" },
     Probe { name: "LINGXI_NO_BF16_FLAT", kind: Kind::Ab, default_on: false,
         purpose: "**bf16 瘦长 GEMM（m≤8）回退旧形态**：默认走 `gemm_skinny_m8_flat_bf16`\
                   （**逐位相同**，只去掉 `r0=blockIdx.y*8` 的运行期行偏移与 `mt` 截断 ⇒ 行偏移\
                   变编译期常量、内层不再每轮重建 8 个 64 位地址）。实测 m=6：n10240 k320\
-                  42.5→28.0 µs（154→234 GB/s）、n2560 k640 25.0→12.9 µs（131→254）。docs ",
+                  42.5→28.0 µs（154→234 GB/s）、n2560 k640 25.0→12.9 µs（131→254）",
         coupling: "只作用于 `gemm_skinny_bf16_ptr` 且 `1≤m≤8`；m>8（prefill 行分块）、\
                    row 核（k≥1024）、shared/GR 融合核、f32x、Q4 系全部原样" },
     Probe { name: "LINGXI_KV_NO_LAZY", kind: Kind::Feature, default_on: false,
-        purpose: "弹性 KV 关闭懒分配：QsaState 按建局 cap 全额预付（㊿-P1 的回归对照档）",
+        purpose: "弹性 KV 关闭懒分配：QsaState 按建局 cap 全额预付（回归对照档）",
         coupling: "默认懒分配（初始 8192 token，按需几何增长）对数学逐位无影响；判据翻车用本开关对拍" },
     Probe { name: "LINGXI_MOE_PROF", kind: Kind::Probe, default_on: false,
         purpose: "段 4 细分剖面：CUDA event 链打 gu / swiglu+xf / dn 的真实 GPU 时间\
@@ -703,7 +780,7 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_F32X_PROJ", kind: Kind::Feature, default_on: false,
         purpose: "启用 bf16 投影的 **x-fp32 预转**（P15-⑨ gemm_skinny_row_f32x）",
         coupling: "**默认关**：整机 fwd t=7 实测 +2.6 ms 净亏（x fp32 使每 block 的 x L2 读翻倍）；\
-                  微基准 m=8 带宽 350→700 GB/s 不在整机兑现；GR mix_up 另有未解的整机漂移" },
+                  微基准 m=8 带宽 350→700 GB/s 不在整机兑现；GR mix_up 另有未解的整机漂移（见 PLAN P15-⑨）" },
     Probe { name: "LINGXI_HOST_ARGMAX", kind: Kind::Feature, default_on: false,
         purpose: "回退开关：argmax 走 host（锁页 D2H t×vocab + host 遍历），关掉 GPU 两段式 argmax 核（A/B 对照）",
         coupling: "" },
@@ -745,6 +822,44 @@ pub const PROBES: &[Probe] = &[
         purpose: "整体关 vram-autotune（启动逐卡算账定槽位），回落 talk/serve 内建默认 7000/4000/9600", coupling: "" },
     Probe { name: "LINGXI_KV_K8V4", kind: Kind::Feature, default_on: false,
         purpose: "KV 走 8-bit（k8v4，每 token 每层 1184B vs bf16 2368B）量化路径", coupling: "与 QSA_PAGED 互斥" },
+    Probe { name: "LINGXI_KV_FP8", kind: Kind::Feature, default_on: false,
+        purpose: "**KV FP8-G32 探索档**（值感知：`=0` 显式关，默认关）：K/V 都存 1B/元素，\
+                  **每 32 维一组配一个 f16 scale**（细粒度分组 KV 量化，\
+                  每 32 维一组 scale），每 token 每层 1088B = bf16 的 45.9%。与翻车的 K8V4 \
+                  （每 (行,头) 一个 scale）完全独立的新实现；量化核 \
+                  lingxi_quant_rows_fp8g32{,_res}_bf16，注意力 \
+                  attn{2s,5}_sparse_kvfp8 / attn{2,3}_masked_kvfp8。子模式 \
+                  LINGXI_KV_FP8_MODE（int8 默认/e4m3）+ KIVI 式残差窗 \
+                  （LINGXI_KV_FP8_RESIDUAL 默认开，SINK/RECENT 可调，见 \
+                  docs/kv-fp8-design.md）。⚠️ **有损档，未经质量判据 \
+                  （tools/kvfp8_quality.py，三组消融）实测前禁止进生产**",
+        coupling: "**与 LINGXI_KV_K8V4 互斥**（同时开报错，QsaState::new 守卫）；无 gather \
+                  路径（gather 核是 bf16-only）⇒ 与 LINGXI_QSA_PAGED / LINGXI_ATTN_GATHER \
+                  互斥；twopass 与 host 检查点暂不支持（sequence.rs 守卫）；spec 组合待实测 \
+                  （K8V4 实测杀投机接受率，FP8 档同样风险）；残差窗 rewind 依赖草稿回卷量 \
+                  ≤ KV_FP8_RES_DRAFT_PAD(1024)+1（core_.rs debug_assert，草稿长度 ≪ 余量）" },
+    Probe { name: "LINGXI_KV_FP8_MODE", kind: Kind::Feature, default_on: false,
+        purpose: "KV FP8 档子模式（值感知，默认 `int8`）：`int8` = 每 32 维一组 amax/127 的\
+                  对称 int8（**安全档**，均匀码距，相对误差 ≤1/254≈0.39%，文献口径 4-bit \
+                  per-channel 即近无损）；`e4m3` = 每 32 维一组 amax/448 的 E4M3。两档共用同一\
+                  字节平面与 f16 scale 平面，仅编解码不同",
+        coupling: "只在 LINGXI_KV_FP8=1 生效；拼错/未设置回落 int8（安全档宁可高估精度）" },
+    Probe { name: "LINGXI_KV_FP8_RESIDUAL", kind: Kind::Feature, default_on: false,
+        purpose: "KV FP8 残差窗（KIVI 式，两档共用，默认开）：头 sink 段（前 \
+                  LINGXI_KV_FP8_SINK=16 token）+ 最近 LINGXI_KV_FP8_RECENT=128 token 的 \
+                  K/V 常驻 bf16，尾窗滑出的 4-token 页才惰性量化进压缩平面（KIVI residual \
+                  flush，追加零成本）；`=0` 关残差窗（消融档：全量量化）",
+        coupling: "只在 LINGXI_KV_FP8=1 生效；残差平面为恒定大小（sink+recent+4+1024 行），\
+                  不进上下文预算；rewind 时水位按新尾窗回退" },
+    Probe { name: "LINGXI_KV_FP8_SINK", kind: Kind::Feature, default_on: false,
+        purpose: "残差窗头 sink 段 token 数（默认 16，必须 4 的倍数）：前 N token 的 K/V \
+                  永不量化（KVSink：sink 像 Key bias，量化首 token 直接坏首 token 输出——\
+                  K8V4 实测『首 token 1543 应 11751』正是此因）",
+        coupling: "只在 LINGXI_KV_FP8=1 且残差窗开时生效；非 4 的倍数回落默认 16" },
+    Probe { name: "LINGXI_KV_FP8_RECENT", kind: Kind::Feature, default_on: false,
+        purpose: "残差窗尾窗 token 数（默认 128，必须 4 的正倍数）：最近 N token 的 K/V \
+                  保持 bf16，滑出后按 4-token 页量化",
+        coupling: "只在 LINGXI_KV_FP8=1 且残差窗开时生效；非 4 的倍数回落默认 128" },
     Probe { name: "LINGXI_KV_INIT_TOKENS", kind: Kind::Feature, default_on: false,
         purpose: "paged 模式下 KV 初始物化 token 数", coupling: "只在 QSA_PAGED 生效" },
     Probe { name: "LINGXI_ARENA_MIX_Q4_SLOTS", kind: Kind::Feature, default_on: false,
@@ -756,7 +871,7 @@ pub const PROBES: &[Probe] = &[
     Probe { name: "LINGXI_GDN_SMEM", kind: Kind::Ab, default_on: false,
         purpose: "GDN 核 sm_70 dynamic smem 路径（smem ≤96KB 时可用）；实测默认关，仅留档 A/B", coupling: "" },
     Probe { name: "LINGXI_NO_GDN_REC_REG", kind: Kind::Ab, default_on: false,
-        purpose: "GDN 递推回退**旧核**（默认走 2026-10-24 的 state 常驻寄存器版：\
+        purpose: "GDN 递推回退**旧核**（默认走 state 常驻寄存器版（2026-10-24）：\
 q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相同**，t16 微基准 82.6→32.1 µs）",
         coupling: "只对 hk==hv==128 且 n_seq==1 生效；`LINGXI_GDN_SMEM=1` 时强制走旧核" },
     Probe { name: "LINGXI_F32X_SITES", kind: Kind::Ab, default_on: false,
@@ -796,8 +911,8 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
                   指纹=形状五元组+源 payload 每 1MiB 采样 XOR。读点 `bench/mtp_arena.rs`。",
         coupling: "容器 tmpfs 独立 ⇒ 宿主/容器各付一次 28s 冷启动；缓存字节即量化产物，\
                   命中时设备字节与重算逐位相同" },
-    // ── （2026-10-27）prefill 25ms 同步判决实验链的探针组：全部只改等待方式/
-    // 分配来源，不改任何数值路径；结论=GPU-bound，本组留档复测 ──
+    // ── 2026-10-27 prefill 25ms 同步判决实验链的探针组：全部只改等待方式/
+    //    分配来源，不改任何数值路径；结论=GPU-bound，本组留档复测 ──
     Probe { name: "LINGXI_MEMPOOL_KEEP", kind: Kind::Probe, default_on: false,
         purpose: "默认内存池 RELEASE_THRESHOLD 0→u64::MAX（读点 lingxi-kernels wrappers.rs\
                   Kernels::load）：排除「同步点 drain 池化 VMM 回收」假设。实测中性。",
@@ -823,29 +938,29 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
                   ⇒ CE/锁页/流本身健康，慢的只是「带前序工作的路由拷贝」= 前序 GPU 工作回压。",
         coupling: "会改时序（探针本身）" },
     Probe { name: "LINGXI_MLARGE_MIN_K", kind: Kind::Ab, default_on: false,
-        purpose: "mlarge 门禁的 k 下限（默认 512）。 负结果：mix_up [512×320] 改走\
+        purpose: "mlarge 门禁的 k 下限（默认 512）。负结果：mix_up [512×320] 改走\
                   mlarge 更慢（4.26 vs 2.60ms）——mlarge 适合大 k 大 n，小形状回 skinny。",
         coupling: "=512 或未设 = 原行为" },
     Probe { name: "LINGXI_MLARGE_MIN_N", kind: Kind::Ab, default_on: false,
-        purpose: "mlarge 门禁的 n 下限（**默认 1024， 起生效**）。小 n 时 mlarge 的\
+        purpose: "mlarge 门禁的 n 下限（**默认 1024**）。小 n 时 mlarge 的\
                   grid.x=n/8 塌 parallelism（n=8→8 CTA），down/inject 回 skinny_row 逐位档：\
                   GR 15.05→7.45ms/层，prefill −35%（16.5→10.5s）。读点 gpu.rs。",
         coupling: "默认行为变更（有损档→逐位档），env 调回 0 = 旧行为" },
     Probe { name: "LINGXI_NO_MWIDE", kind: Kind::Ab, default_on: false,
-        purpose: "回退  mwide 核（小 k 大 m 瘦长 GEMM，mix_up [20480,320,512] 2.6ms\
+        purpose: "回退 mwide 核（小 k 大 m 瘦长 GEMM，mix_up [20480,320,512] 2.6ms\
                   → 目标 ~1ms；与 skinny_m8 逐位等价：同 lane j 偏分 + 同 shuffle 树）。\
                   读点 gpu.rs skinny_call + moe_ops.cu。",
         coupling: "不设 = 默认走 mwide（k≤352 且 m≥64）" },
     Probe { name: "LINGXI_NO_TOPK_PAR", kind: Kind::Ab, default_on: false,
-        purpose: "回退  host topk 逐行并行化（A 并行算每行 softmax/topk，B 串行按行\
+        purpose: "回退 host topk 逐行并行化（A 并行算每行 softmax/topk，B 串行按行\
                   合并——与旧单线程循环 push 次序逐项相同，逐位等价）。t=512 时省\
                   ~3ms/层。读点 moe/forward.rs 路由簿记。", coupling: "不设 = 默认并行" },
     Probe { name: "LINGXI_PLE_NOMMAP", kind: Kind::Ab, default_on: false,
-        purpose: "回退 补 PLE mmap 直达（随机行读免 syscall、跳过 RowCache；表在\
+        purpose: "回退 PLE mmap 直达（随机行读免 syscall、跳过 RowCache；表在\
                   /dev/shm 时 PLE 71~79ms/chunk ≈ 0.65s/prefill，6%）。逐位等价（同字节\
                   同 dequant）。读点 plet.rs。", coupling: "不设 = 默认 mmap" },
     Probe { name: "LINGXI_NO_PLE_PAR", kind: Kind::Ab, default_on: false,
-        purpose: "回退 补 PLE 查表并行化（8192 行独立查表 16 线程，55~105ms→\
+        purpose: "回退 PLE 查表并行化（8192 行独立查表 16 线程，55~105ms→\
                   ~10ms/chunk；逐位等价：读-only 表 + 不相交输出切片）。\
                   读点 plet.rs ple_step。", coupling: "不设 = 默认并行" },
     Probe { name: "LINGXI_GDN_PREFETCH", kind: Kind::Ab, default_on: false,
@@ -869,7 +984,7 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
         purpose: "🚫 **代码里已无实现**（全仓只剩注释）——文档里仍在引用它，害得一整组对比实验作废",
         coupling: "用到它 = 什么都没变" },
     Probe { name: "LINGXI_Q4_ROW1", kind: Kind::Ghost, default_on: false,
-        purpose: "🚫 已失效：稠密 Q4 的默认**已翻成单行版**（），本开关不再有任何效果",
+        purpose: "🚫 已失效：稠密 Q4 的默认**已翻成单行版**，本开关不再有任何效果",
         coupling: "改用 LINGXI_Q4_ROW4 做反向对照" },
     Probe { name: "LINGXI_GRAPHS", kind: Kind::Ghost, default_on: false,
         purpose: "🚫 **反向命名的遗留**：图一直是**默认开**，代码只读 `LINGXI_NO_GRAPHS`；\
@@ -879,12 +994,12 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
         purpose: "🚫 **已否决并撤除**：GR 的 mix_down/mix_up 转 W4G64。实测 `mix_down[320,10240]` 的 Q4 **14.2 µs 慢于** bf16 row8 **8.6 µs**（Q4 只有 `n/8=40` 个 block），逐形状算下来净亏；代码已撤，全仓只剩注释",
         coupling: "设了它 = 什么都没变；结论要引用否决表" },
 
-    // ── 分段归因探针（2026-10-23，~）──
+    // ── 分段归因探针（2026-10-23）──
     Probe { name: "LINGXI_SEG3_SYNC", kind: Kind::Probe, default_on: false,
         purpose: "**MoE 段 3（路由+建表）四分探针**：在 seg3 的四个边界各插一次流同步，\
                   用主机钟量出 shared / router gemm / top-k / pair 建表的真耗时，每 240 层打一行。\
                   为什么要它：evprof 的 seg3 把这几块包在一起，而跨运行 seg3 会从 0.28 漂到 0.85，\
-                  用两次不同运行相减归因**会得出错误结论**（ D 就被这样坑过）。",
+                  用两次不同运行相减归因**会得出错误结论**（历史归因就被这样坑过）。",
         coupling: "⚠️ 每段一次 `stream.synchronize()` ⇒ 显著拖慢整轮，**只用于归因，别用它评吞吐**" },
     Probe { name: "LINGXI_SEG3_LAYER", kind: Kind::Probe, default_on: false,
         purpose: "配合 `LINGXI_SEG3_SYNC`：只把**指定轮号**（48 层）的四分结果逐层打出来，\
@@ -962,7 +1077,7 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
                   逐位等价（`LINGXI_FULLDEV_SHADOW` 可验），实测 +1%。",
         coupling: "与 EP 互斥；legacy 路径是它的回退" },
     Probe { name: "LINGXI_ROUTE_FULLDEV_BIG", kind: Kind::Feature, default_on: true,
-        purpose: "**批量设备路由扩 rows≤512**（prefill 形态，）：`LINGXI_ROUTE_FULLDEV=1` 时\
+        purpose: "**批量设备路由扩 rows≤512**（prefill 形态）：`LINGXI_ROUTE_FULLDEV=1` 时\
                   `route_dev_batch_attempt` 的 rows 上限从 16 扩到 512，prefill 的路由/\
                   topk/pair/CSR 全在设备建，host 不读 logits、不簿记、不逐层同步。\
                   设备核勘察：全部对 rows 不敏感（topk grid.x=rows；pair 单块循环上界 S；\
@@ -972,16 +1087,16 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
                   读点 `moe/batch_dev.rs`。",
         coupling: "需 `LINGXI_ROUTE_FULLDEV=1`；**2026-10-27 起默认开**（用户裁定路线 B；\
                   `LINGXI_ROUTE_FULLDEV_BIG=0` 关）；不回退 rows≤16 行为；逐层回退仍可用 \
-                   `LINGXI_FULLDEV_OFF=<layer>`。：BIG=1 时层内 scratch 改走 \
+                   `LINGXI_FULLDEV_OFF=<layer>`。BIG=1 时层内 scratch 改走 \
                    `scratch::*_keep` 常驻复用（无视 bench/serve 入口的 \
                    `disable_pool_forever`，池键已含设备号）——只改分配时序不改数学。\
-                   ：pair 建表核尾部清零 + TCP `_dyn` 乐观发射核（默认关，见 \
+                   pair 建表核尾部清零 + TCP `_dyn` 乐观发射核（默认关，见 \
                    `LINGXI_ROUTE_OPT`）。" },
     Probe { name: "LINGXI_ROUTE_OPT", kind: Kind::Feature, default_on: false,
-        purpose: "** 乐观发射实验**（BIG=1 且全视图 TCP 档）：pair 建表核入队后不自旋，\
+        purpose: "**乐观发射实验**（BIG=1 且全视图 TCP 档）：pair 建表核入队后不自旋，\
                   按组数上界 min(E,s) 直接发射专家段（dyn 核设备侧组数守卫 + 组大小行块循环），\
                   CPU 不钉在 pair 完成上。读点 `moe/batch_dev.rs` 的 `route_dev_batch_attempt_opt`。\
-                  ⚠ **实测负结果**：12 对成对 A/B 干净档位墙钟无差异—— 的 pair 0.41ms×432 \
+                  ⚠ **实测负结果**：12 对成对 A/B 干净档位墙钟无差异——pair 建表 0.41ms×432 \
                   是串行 GPU 时间非发射空窗；保留供复验，默认关。",
         coupling: "只影响 BIG=1 + rows>16 + 全视图 TCP 档；不改数学（dyn 与旧 TCP 核逐 \
                    (组,行块) 算术相同，decode md5 开=关=BIG0 逐位同已实证）" },
@@ -1023,6 +1138,59 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
                   代价：启动多 5~7 s（本卡 ~32 GB over PCIe），而 tok/s 口径不含启动 ⇒ 净赚；\
                   serve 这种长寿命进程更是纯赚。启动会打一行 `[preload] 全驻留：新搬 …`",
         coupling: "只改**何时搬**（启动 vs 首次路由），不改任何数值；槽位不够时自动停在池满" },
+    Probe { name: "LINGXI_ARENA_PREFETCH", kind: Kind::Feature, default_on: false,
+        purpose: "**router lookahead 预取**（next-layer router 预取）：\
+                  预测**下一路由层 L+1**（48 层全是 MoE，间隔 1；层 47 回绕 0 = 下一 token 首路由层）\
+                  会选谁，取至多 2 个当前不在卡上的专家，在层 L 专家 GEMM 期间经 **stream2 异步 DMA**\
+                  进空闲 LRU 槽（复用 miss-DMA 的 victim+整段 H2D 路径与跨流门，不新造 DMA 机制）。\
+                  命中即省一次 ~2.6 MB / 350~450 µs 的 miss。预测信号由 \
+                  `LINGXI_ARENA_PREFETCH_SIGNAL` 选（默认 router_logits）。",
+        coupling: "**位等价**：预取只改「谁驻留」，字节与 miss DMA 同源自 arena ⇒ 输出逐位不变；\
+                  在途槽不进 flat/slot_map（无半拷贝窗口），claim 时 compute 流等 prefetch 事件。\
+                  `LINGXI_ARENA_PRELOAD_ALL=1` 时**自动闲置**（全驻留无 miss 可省，打日志说明）；\
+                  `LINGXI_ARENA_NOH2D=1` 时同样闲置（保持消融语义）。自适应：**2048 次预测采样窗**，\
+                  判据 = **命中节省（hit × 400µs）vs 预测成本**（实测 host 开销 + 每笔决策 50µs DMA \
+                  机会成本）⇒ 节省 ≤ 成本则休眠 8192 个 pass，窗尾/睡醒都打成本账。预测 GEMV 挂在 \
+                  **stream2**（挂 compute 流会把 ~50µs 加进每层路由同步）。只在 **legacy host 路由**\
+                  （load_hits）触发——`LINGXI_ROUTE_DEV` 全中路径不经 load_hits，不触发；miss 回退的 \
+                  A2 `load_missing` 会认领在途预取。混档（Q4/Q3 双 cache）可用。\
+                  ⚠️ **首版 topk_set 信号实测命中率仅 2.4%（负结果）**，router_logits 是其修正。\
+                  读点 `arena_source/prefetch.rs`、`arena_source/source.rs`（pf_predict_enqueue/pf_issue）。" },
+    Probe { name: "LINGXI_ARENA_PREFETCH_SIGNAL", kind: Kind::Ab, default_on: false,
+        purpose: "router lookahead 预取的**预测信号子开关**（值感知，默认 `router_logits`）：\
+                  `router_logits` = 原设计——**用层 L+1 自己的 router 权重 W \
+                  作用在层 L 的 router 输入 h 上**（W·h 真 logits，top-k 取候选；发射端 \
+                  `ExpertSource::pf_predict_enqueue` 在 router GEMV 入队后、同步前把预测 GEMV \
+                  挂 stream2，消费点 = 本层 load_hits 的 pf_issue，事件自旋 ≈ 0）；`topk_set` = \
+                  旧信号（层 L top-k 集合原样预测层 L+1，host 零成本），**留作对照/消融**。",
+        coupling: "两信号与实测负结果的关系：topk_set（跨层 top-k 相关性假设）实测命中率仅 **2.4%** \
+                  ⇒ 信号本身不成立，这正是换成 router_logits 的动机；在**经济判据**（命中节省 vs \
+                  预测成本，含每笔决策 50µs DMA 机会成本）下 topk_set 的低命中会被自动休眠闲置，\
+                  因此留作对照也不会白灌 PCIe。router_logits 依赖 dense trunk 常驻显存 \
+                  （`router_shared_gate`，DeviceLayerCache 建后地址不变）⇒ 首圈预测大多跳过、\
+                  第二圈起全量生效。只改「预取谁」，不改任何数值（位等价）。\
+                  读点 `arena_source/prefetch.rs`（PfSignal/pred_topk）、`arena_source/source.rs`。" },
+    Probe { name: "LINGXI_ARENA_TOPK_FETCH", kind: Kind::Feature, default_on: false,
+        purpose: "**同层 write-through top-k 预取**（与计算流并行 DMA，\
+                  值感知默认关）：legacy `load_hits` / A2 `load_missing` 的 **miss 分支**在\
+                  **首个 miss** 时 —— (a) 该 miss 照旧同步 DMA（本次步要用，关键路径）；\
+                  (b) 本层路由 top-k 里**其余未驻留/在途**的专家（至多 TOPK_FETCH_MAX=2 个）\
+                  经 **stream2 异步 DMA** 进空闲 LRU 槽，记在途表 `pf_pending`；(c) 本批后续条目\
+                  在既有 claim 分支转正（compute 流等 `pf_done`）。N 个同层 miss 只有第一个\
+                  阻塞关键路径，其余与首个 DMA / 专家 GEMV 并行。候选非预测（必被本批用到）\
+                  ⇒ 不走 prefetch 的自适应休眠。",
+        coupling: "**位等价同 prefetch**：字节同源自 arena 同一区间、在途槽不进 flat/slot_map\
+                  （无半拷贝窗口）、claim 时 compute 流等 pf_done ⇒ 输出逐位不变。与 \
+                  `LINGXI_ARENA_PREFETCH` **共存**：两者同时在途、**共用** pf_pending/pf_gate/\
+                  pf_done 与 load_hits/load_missing 的 claim 分支，互斥由共用表的 contains_key 保证\
+                  （不会同 key 双发/覆盖）；⚠️ topk-fetch 的 claim 也会记进 prefetch 的 note_hit ⇒ \
+                  同开时 prefetch 经济判据的命中率被抬高（偏乐观）。`LINGXI_ARENA_PRELOAD_ALL=1` / \
+                  `LINGXI_ARENA_NOH2D=1` 时**自动闲置**（同 prefetch，打日志）。`LINGXI_ROUTE_DEV=1` \
+                  设备路由**全中**路径不经 load_hits ⇒ 不启动（与 prefetch 同性质）；miss 回退的 \
+                  A2 `load_missing` 会启动并 claim。与 `LINGXI_MOE_OVERLAP` 并存时 claim 的 pf_done \
+                  等待排在**全部**专家 GEMV 之前（hit 组也等）⇒ 重叠粒度比纯 OVERLAP 粗，只建议 \
+                  非 OVERLAP 档开。读点 `arena_source/source.rs`（tf_issue）、\
+                  `arena_source/prefetch.rs`（topk_fetch_candidates）。" },
     Probe { name: "LINGXI_PREP_PROF", kind: Kind::Probe, default_on: false,
         purpose: "**MoE 设备路由的 prep 段逐步计时**（volatile 写 / `slot_map` 指针 / `fmt+alt` / \
                   `group_slots_alt` 指针），只在 prep > 50 µs 的层打一行。\
@@ -1103,7 +1271,7 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
     Probe { name: "LINGXI_TALK_SPEC_BATCH", kind: Kind::Feature, default_on: false,
         purpose: "`talk` 投机**双会话交错判决原型**：两个 host 线程各驱动一套 \
                   (Sequence, SpecRuntime)，量并发聚合吞吐。读点 `cmd/talk.rs`。\
-                  尺子 `tools/golden/spec_dual_bench.sh`；判决 docs  R（**否决**：\
+                  尺子 `tools/golden/spec_dual_bench.sh`；判决（**否决**：\
                   聚合 1.00×，根因是每层 host 同步耦合）。",
         coupling: "强制关 CUDA Graph（线程本地捕获会互捕）；要求 sparse 常驻层缓存" },
     Probe { name: "LINGXI_TALK_SPEC_PHASE", kind: Kind::Feature, default_on: false,
@@ -1114,12 +1282,12 @@ q/k 每 token 只搬 1 次进 smem、S 整段 1 读 1 写；与旧核**逐位相
     Probe { name: "LINGXI_SPEC_ON_HIT", kind: Kind::Feature, default_on: true,
         purpose: "**前缀缓存命中也开投机**的按请求选路：`max_tokens ≥ max(prompt/25, 48)`\
                   ⇒ 放弃复用、整段重 prefill 开投机（收益 12.7ms/tok vs 重 prefill \
-                  ~0.5ms/tok）。旧设计命中即 AR ⇒ 多轮对话永远吃不到投机（ ）。\
+                  ~0.5ms/tok）。旧设计命中即 AR ⇒ 多轮对话永远吃不到投机。\
                   `=0` 回滚。读点 `serve/engine.rs`。",
         coupling: "纯性能路由：两条路都是 trunk 贪心 ⇒ 文本逐位相同" },
     Probe { name: "LINGXI_SPEC_ADAPT_KD", kind: Kind::Feature, default_on: true,
         purpose: "**自适应草稿链长**：尾随接受率 EMA（α=0.5/轮）→ `kd_eff=clamp(⌈EMA×1.75⌉,3,kd)`。\
-                  接受率低的内容（中文 1.5）3~4 轮内降到 3 ⇒ +12%；\
+                  接受率低的内容（中文 1.5）3~4 轮内降到 3 ⇒ +12%（实测）；\
                   接受率高的内容恒顶到 kd、零影响。`=0` 关闭。读点 `bench/spec.rs`。",
         coupling: "只影响投机草稿链长；缓冲按 kd+1 预开，kd_eff ≤ kd 无需重备" },
     Probe { name: "LINGXI_SPEC_NO_GATE", kind: Kind::Probe, default_on: false,
@@ -1183,6 +1351,21 @@ pub fn check_env() {
 
     // 危险组合：直接报错退出，而不是崩在内核深处 / 得出错结论。
     let on = |n: &str| std::env::var(n).is_ok();
+    // serve 分块 prefill × two-pass 互斥：two-pass 只支持空序列整段 prefill，
+    // 分块续跑走 prefill_append（start>0）会在 prefill_from_impl 里 ensure 炸。
+    {
+        let serve_chunk = std::env::var("LINGXI_SERVE_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if serve_chunk > 0 && crate::flag_val("LINGXI_PREFILL_TWOPASS", false) {
+            panic!(
+                "[probes] LINGXI_SERVE_PREFILL_CHUNK>0 与 LINGXI_PREFILL_TWOPASS=1 互斥：\
+                 two-pass 只支持空序列整段 prefill，serve 分块走的是 prefill_append 续跑 \
+                 （start>0，prefill_from_impl 里 ensure 必炸）。请关掉其中一个。"
+            );
+        }
+    }
     if on("LINGXI_KT") && on("LINGXI_DENSE_Q4") {
         panic!(
             "[probes] LINGXI_KT 与 LINGXI_DENSE_Q4 不能同时开：KT 探针引用的 bf16 weight 在 W4 路径下是空的，\
@@ -1193,7 +1376,7 @@ pub fn check_env() {
     if on("LINGXI_SKIP") && !on("LINGXI_ARENA_FIXED_EXPERTS") {
         eprintln!(
             "[probes] ⚠️ 只开 LINGXI_SKIP 而未叠 LINGXI_ARENA_FIXED_EXPERTS：\
-             剥块会改数学 ⇒ 路由乱跳 ⇒ 专家槽全失效，**被剥的块会被系统性高估**（/）。\
+             剥块会改数学 ⇒ 路由乱跳 ⇒ 专家槽全失效，**被剥的块会被系统性高估**。\
              结论仅在同时叠加 FIXED_EXPERTS（+ FIXED_IDS）时才可信。"
         );
     }
@@ -1206,11 +1389,11 @@ pub fn check_env() {
     }
     // ★ P15-⑩（2026-10-17）：**spec × CUDA Graph 的 NaN 守卫正式解除**。
     // 原守卫（2026-10-16）：spec+graph 几轮后 NaN ⇒ 强制 NO_GRAPHS。
-    // 根因是**四个叠加的"图内指针漂移"**：
-    // 1. MoE rows==1 图的 x/gu/act/o 用 scratch（t=7 验证批打乱借还序列）⇒ 改 take_fixed+stage
-    // 2. MoE 图的 slot_ids 双缓冲（层间交替）⇒ 图外 stage 进固定槽
-    // 3. GR rows==1 与 rows=7 共用 gkey 固定槽互相覆盖 ⇒ 统一按 rows 分键
-    // 4. layer.rs 输出缓冲键不带 t + mixed_m/injw_m 的 give 用旧键 ⇒ 键带 `(1+t)<<40`
+    // 根因是**四个叠加的"图内指针漂移"**（全部修复）：
+    //   1. MoE rows==1 图的 x/gu/act/o 用 scratch（t=7 验证批打乱借还序列）⇒ 改 take_fixed+stage
+    //   2. MoE 图的 slot_ids 双缓冲（层间交替）⇒ 图外 stage 进固定槽
+    //   3. GR rows==1 与 rows=7 共用 gkey 固定槽互相覆盖 ⇒ 统一按 rows 分键
+    //   4. layer.rs 输出缓冲键不带 t + mixed_m/injw_m 的 give 用旧键 ⇒ 键带 `(1+t)<<40`
     // 修复后判据：spec+min_p+graph 接受率 4.14/6 与 OFF 逐位一致；t=1 decode 图 ON 快 21%。
 }
 
@@ -1242,7 +1425,7 @@ pub fn dump() -> String {
 mod guard {
     //! **静态守卫**：把"漏登记开关"从**静默**变成**红测试**。
     //!
-    //! 为什么必须补这一道：`check_env` 只能发现「**环境里设了**但没登记」的开关，
+    //! 为什么必须补这一道：`check_env()` 只能发现「**环境里设了**但没登记」的开关，
     //! 而且只 `eprintln!` 一声 warn。于是一个「代码读了、但谁都没设过」的开关可以永远
     //! 悄悄活着 —— 2026-10-16 一查就抓到 **12 个**（整套 `LINGXI_SPEC_*` / `LINGXI_MTP_SPEC`），
     //! 而它们正是当轮所有提速结论的依据。
@@ -1321,7 +1504,7 @@ mod guard {
         );
     }
 
-    /// 表里不许有重名（重名会让 `dump` 打两份、`check_env` 判断歧义）。
+    /// 表里不许有重名（重名会让 `dump()` 打两份、`check_env` 判断歧义）。
     #[test]
     fn probe_names_are_unique() {
         for (i, a) in PROBES.iter().enumerate() {

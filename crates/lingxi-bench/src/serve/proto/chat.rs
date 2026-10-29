@@ -4,23 +4,22 @@
 use anyhow::Result;
 use std::collections::VecDeque;
 
-use crate::spec::SpecRuntime;
+use crate::spec::{SpecRuntime, SpecState};
 
-
-
-
-/// 投机解码的**单请求状态**：MTP 运行时 + 本请求的验证缓冲 + 待发 token 队列。
+/// 投机解码的**单请求状态**（v1.5 并发：每个进行中的生成各持一份，轮转互不干扰；
+/// 权重/复用缓冲在 SpecRuntime 全局共享）。MTP 运行时引用改为 `next()` 调用时传入——
+/// 否则 Gen 长期持有 `&mut SpecRuntime` 会挡住别的请求的 prime。
 ///
 /// 为什么队列：一轮会一次接受 `keep` 个 token，而 HTTP/SSE 是一个一个发；
 /// 队列空了再跑下一轮（`SpecRuntime::round`）。
-pub(crate) struct SpecGen<'a, 'k> {
-    pub(crate) rt: &'a mut SpecRuntime<'k>,
+pub(crate) struct SpecGen {
+    pub(crate) st: SpecState,
     pub(crate) sb: lingxi_driver::SpecBuffers,
     pub(crate) h_last: cudarc::driver::CudaSlice<half::bf16>,
     pub(crate) queue: VecDeque<i64>,
     pub(crate) accepted: usize,
     pub(crate) rounds: usize,
-    /// 已送进验证的行数（= 每轮 `chunk.len`）——用来算"每验证一行产出几个 token"
+    /// 已送进验证的行数（= 每轮 `chunk.len()`）——用来算"每验证一行产出几个 token"
     pub(crate) verified: usize,
     /// 自适应关闸：长上下文/低接受率时投机反而更慢（实测 875-token 文档：20 vs 25 tok/s），
     /// 连续 3 轮 `产出/验证行 < 0.5` 就本请求切回纯自回归（KV 状态本来就是连续的，切换安全）。
@@ -34,15 +33,16 @@ pub(crate) struct SpecGen<'a, 'k> {
     pub(crate) eff: std::collections::VecDeque<f64>,
 }
 
-impl<'a, 'k> SpecGen<'a, 'k> {
+impl SpecGen {
     pub(crate) fn next(
         &mut self,
+        rt: &mut SpecRuntime,
         seq: &mut lingxi_driver::Sequence,
         eng: &lingxi_driver::Engine<'_>,
         provider: &mut dyn lingxi_driver::LayerProvider,
     ) -> Result<i64> {
         // ⚠️ 顺序：**先发完上一轮队列里的 token**，再决定要不要关闸。
-        // 否则关闸时会把"已提交但还没发"的 token 静默吞掉（ids 里已经有它们，AR 会从更后面接）。
+        //    否则关闸时会把"已提交但还没发"的 token 静默吞掉（ids 里已经有它们，AR 会从更后面接）。
         if let Some(t) = self.queue.pop_front() {
             return Ok(t);
         }
@@ -72,7 +72,7 @@ impl<'a, 'k> SpecGen<'a, 'k> {
             }
         }
         let tr = std::time::Instant::now();
-        let r = self.rt.round(seq, eng, provider, &mut self.sb, &mut self.h_last)?;
+        let r = rt.round(seq, eng, provider, &mut self.sb, &mut self.h_last, &mut self.st)?;
         let ms = tr.elapsed().as_secs_f64() * 1e3;
         self.accepted += r.accepted;
         self.verified += r.verified;

@@ -13,13 +13,14 @@ use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat, ExpertArena};
 use lingxi_kernels::Kernels;
 
 use super::pin::backing_fs_type;
+use super::prefetch::{self, PfCtl, PfSignal, PF_MAX};
 use super::slot::SlotCache;
 use super::{mark_expert, EXPERT_HITS, EXPERT_MISSES};
 
 pub struct ArenaExpertSource<'a> {
     k: &'a Kernels,
     arena: ExpertArena,
-    /// **可写别名映射**（`LINGXI_ARENA_PIN_DMA=1`，见）：与 `arena` 是**同一份 tmpfs 页**，
+    /// **可写别名映射**（`LINGXI_ARENA_PIN_DMA=1`）：与 `arena` 是**同一份 tmpfs 页**，
     /// 只是 VMA 可写 ⇒ 才能用 `PORTABLE` 做 DMA 注册。`None` = 老行为（READ_ONLY 注册）。
     alias: Option<memmap2::MmapMut>,
     cache: UnsafeCell<SlotCache>,
@@ -57,7 +58,7 @@ pub struct ArenaExpertSource<'a> {
     /// 只给 `layers` 区间内的层分槽 / 钉住（默认 `0..48`；配合 `LINGXI_MOE_SPLIT` 用：
     /// GPU0 那份拿 `0..split_lo`、GPU1 那份拿 `split_lo..48`）
     layers: std::ops::Range<u32>,
-    /// ㊺ A2 设备路由：`[层, E]` 的槽位表（slot+1、0=未缓存）。路由核在设备端直查它，
+    /// 设备路由：`[层, E]` 的槽位表（slot+1、0=未缓存）。路由核在设备端直查它，
     /// 省掉每层"sync → host top-k → host 查槽 → staging"的整条决策链。
     slot_map: CudaSlice<i32>,
     /// 混档次格式（Q3）cache 的 `[层, E]` 槽位表；单格式时全 0（不读）。
@@ -81,6 +82,36 @@ pub struct ArenaExpertSource<'a> {
     /// **每线程路径内**的论证（同一条 k0 FIFO + 每层路由同步在各自路径上排干），
     /// 与并发无关 ⇒ 不需要为 scratch 加锁。
     op_lock: std::sync::Mutex<()>,
+    /// ── router lookahead 预取（`LINGXI_ARENA_PREFETCH`，默认关）──
+    /// 自适应控制器（采样窗 [`prefetch::WINDOW`]；休眠判据 = 命中节省 vs 预测成本）。
+    /// UnsafeCell：trait 方法全是 `&self`，与 cache/scratch 同一约定（op_lock 内访问）。
+    pf: UnsafeCell<PfCtl>,
+    /// 预测信号（`LINGXI_ARENA_PREFETCH_SIGNAL`，默认 router_logits = 层 L+1 的
+    /// router W × 层 L 的 router 输入；topk_set = 旧信号，实测命中率 2.4%）。
+    pf_signal: PfSignal,
+    /// 每层 router 权重的**设备地址**登记（router_logits 信号用）：dense trunk
+    /// 常驻显存（DeviceLayerCache 建后不再搬动），`pf_predict_enqueue` 每过一层
+    /// 登记一层 ⇒ 首圈预测大多跳过（目标层 W 未登记），第二圈起全量生效。
+    /// 只存裸指针、不持有所有权（权重块归 model 层缓存）。
+    pf_router_w: UnsafeCell<Vec<Option<u64>>>,
+    /// 跨流门：prefetch DMA（stream2）必须等 compute 流上"读被驱逐槽的旧 GEMV"完成
+    /// （与 miss-overlap 的 ev_mo_pre 完全同款）。
+    pf_gate: cudarc::driver::CudaEvent,
+    /// 本批 prefetch DMA 的完成事件（一张一批：load_hits 发新批前会把旧批结清）。
+    /// claim/promote 时让 compute 流等它 ⇒ 读者永远读到完整 blob。
+    pf_done: cudarc::driver::CudaEvent,
+    /// **在途预取**：(层, 专家) → 槽号。槽已 victim 出池，但**未进** index/flat/
+    /// slot_map（对设备路由不可见 ⇒ 不存在"读到 DMA 一半"的窗口）；实际路由到时
+    /// claim 转正，没路由到的 promote 转正（字节有效，保留驻留）。
+    /// UnsafeCell：trait 方法全是 `&self`，与 cache/pf 同一约定（op_lock 内访问）。
+    /// **topk-fetch 与 prefetch 共用**这张表（LINGXI_ARENA_TOPK_FETCH 的在途条目
+    /// 同样记这里、同样经 load_hits/load_missing 的 claim 分支转正）。
+    pf_pending: UnsafeCell<HashMap<(u32, u32), usize>>,
+    /// ── 同层 write-through top-k 预取（`LINGXI_ARENA_TOPK_FETCH`，值感知，默认关）──
+    /// miss 分支发现首个 miss 时：该 miss 照旧同步 DMA（关键路径），本层路由
+    /// top-k 里**其余未驻留/在途**的专家改走 stream2 异步 DMA（见 `tf_issue`）。
+    /// 与 PRELOAD_ALL / NOH2D 的闲置关系同 prefetch（构造期一次性判定）。
+    tf_on: bool,
 }
 
 /// 全部按需扩容：decode 每层槽数固定，正常只分配一次；
@@ -98,7 +129,7 @@ struct Scratch {
     ids_pin_alt: [Option<cudarc::driver::PinnedHostSlice<i32>>; 2],
     /// 轮换相位（每次 `load_hits` 取反）。
     ///
-    /// ★ **为什么必须双缓冲**：
+    /// ★ **为什么必须双缓冲**（2026-10-16 抓到的真 bug）：
     /// `slot_ids` 被上一个 `load_hits` **异步 H2D** 上去后，**上一层的内核还在异步读它**；
     /// 单缓冲时下一次 `load_hits` 会直接把内容覆写成新一层的槽号 ⇒ 上一层读到**别的层的槽号**
     /// ⇒ 取错专家、token 流静默分叉（实测：投机路径第 103 个 token 起与纯贪心不同，而同权重
@@ -112,6 +143,38 @@ struct Scratch {
 
 unsafe impl Send for ArenaExpertSource<'_> {}
 unsafe impl Sync for ArenaExpertSource<'_> {}
+
+/// 线程级 router_logits 预测状态：预测 GEMV 的**映射 host 落盘** + 完成事件 +
+/// 本 pass 有效性标记。enqueue（发射）与 pf_issue（消费）在同一次
+/// `sparse_moe_forward` 调用内、同一线程完成 ⇒ 按 (线程 × 上下文) 各存一份，
+/// 既免锁又天然隔离 two-pass 双线程并发驱动同一只 source 的竞态。
+struct PfPred {
+    ctx: usize,
+    logits: lingxi_model::scratch::MappedHost<bf16>,
+    ev: cudarc::driver::sys::CUevent,
+    /// 本 pass 是否已发预测 GEMV（enqueue 置真、消费后置假 ⇒ 首圈缺 W 跳过
+    /// 时不会读到上一层留下来的陈旧 logits）。
+    valid: bool,
+}
+
+impl PfPred {
+    fn new(k: &Kernels, ctx: usize, n: usize) -> Result<Self> {
+        use cudarc::driver::{result, sys};
+        let logits = unsafe { lingxi_model::scratch::MappedHost::new(k, n) }?;
+        let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DEFAULT)?;
+        Ok(Self { ctx, logits, ev, valid: false })
+    }
+
+    fn record(&self, s: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        unsafe { cudarc::driver::result::event::record(self.ev, s.cu_stream()) }?;
+        Ok(())
+    }
+}
+
+thread_local! {
+    /// 见 [`PfPred`] 的说明（按上下文隔离，双卡同线程不会拿错别名）。
+    static PF_PRED: std::cell::RefCell<Option<PfPred>> = const { std::cell::RefCell::new(None) };
+}
 
 
 impl<'a> ArenaExpertSource<'a> {
@@ -129,17 +192,17 @@ impl<'a> ArenaExpertSource<'a> {
         let arena = ExpertArena::open(arena_path)?;
         // ── pin 策略：**按介质判定**（2026-10-16 改；事故见 project_memory）──────────
         // 旧策略"默认 0 = 不 pin + 允许给任意 GiB 上限"有两个问题（都已实测）：
-        // 1. 分开源 ⇒ 驱动只能走内部 staging 的**同步**拷贝 ⇒ 慢 28% 且 p50 掉到 8.8 tok/s
-        // （实测 34.4 ms/29 tok/s vs 整段锁页 26.7 ms/37.4 tok/s，p50 29 ms/34.5 tok/s）；
-        // 2. **部分 pin 是坏的** ⇒ `LINGXI_ARENA_PIN_GIB=16` 会在 decode 第 15 个 token 崩
-        // `arena blob H2D: CUDA_ERROR_INVALID_VALUE`（同一 mmap 只注册一段时，
-        // 落到注册区间之外的拷贝源会被驱动拒）。
+        //   1. 分开源 ⇒ 驱动只能走内部 staging 的**同步**拷贝 ⇒ 慢 28% 且 p50 掉到 8.8 tok/s
+        //      （实测 34.4 ms/29 tok/s vs 整段锁页 26.7 ms/37.4 tok/s，p50 29 ms/34.5 tok/s）；
+        //   2. **部分 pin 是坏的** ⇒ `LINGXI_ARENA_PIN_GIB=16` 会在 decode 第 15 个 token 崩
+        //      `arena blob H2D: CUDA_ERROR_INVALID_VALUE`（同一 mmap 只注册一段时，
+        //      落到注册区间之外的拷贝源会被驱动拒）。
         // 新策略：
-        // * 介质是 **RAM（tmpfs/ramfs）** ⇒ 注册不触发任何磁盘读（前提：swap 关）
-        // ⇒ **允许且默认整段 pin**（`LINGXI_ARENA_PIN_GIB` 不设 = 整段）；
-        // * 介质**不是 RAM** ⇒ **硬禁**（2026-10-14 那次整机重启就是机械盘被 60 GiB
-        // major-fault 持续顺序读 15 min+ 触发固件假死）——要关 pin 请显式 `=0`；
-        // * 只支持"整段或 0"：给中间值直接报错（不再留到运行中段崩）。
+        //   * 介质是 **RAM（tmpfs/ramfs）** ⇒ 注册不触发任何磁盘读（前提：swap 关）
+        //     ⇒ **允许且默认整段 pin**（`LINGXI_ARENA_PIN_GIB` 不设 = 整段）；
+        //   * 介质**不是 RAM** ⇒ **硬禁**（2026-10-14 那次整机重启就是机械盘被 60 GiB
+        //     major-fault 持续顺序读 15 min+ 触发固件假死）——要关 pin 请显式 `=0`；
+        //   * 只支持"整段或 0"：给中间值直接报错（不再留到运行中段崩）。
         let fs_type = backing_fs_type(arena_path);
         let on_ram = matches!(fs_type.as_deref(), Some("tmpfs") | Some("ramfs"));
         let arena_bytes = arena.data_region().len() as u64;
@@ -174,9 +237,9 @@ impl<'a> ArenaExpertSource<'a> {
                 arena_bytes as f64 / 1073741824.0
             );
         }
-        // ★ **DMA 注册**（`LINGXI_ARENA_PIN_DMA=1`，）：先拿一份**可写**别名映射，
-        // 再用 `PORTABLE` 注册 ⇒ 从它发起的 H2D 才是 copy-engine DMA（**可重叠**）。
-        // 老行为（READ_ONLY 注册）实测：8.6 GB/s 且与 kernel 完全不可重叠。
+        // ★ **DMA 注册**（`LINGXI_ARENA_PIN_DMA=1`）：先拿一份**可写**别名映射，
+        //    再用 `PORTABLE` 注册 ⇒ 从它发起的 H2D 才是 copy-engine DMA（**可重叠**）。
+        //    老行为（READ_ONLY 注册）实测：8.6 GB/s 且与 kernel 完全不可重叠。
         let alias = if lingxi_model::flag("LINGXI_ARENA_PIN_DMA") && want_bytes > 0 {
             Some(
                 lingxi_artifact::expert_arena::mmap_shared_rw(arena_path)
@@ -268,9 +331,9 @@ impl<'a> ArenaExpertSource<'a> {
             arena.n_experts as usize,
         )?;
         // ★ 2026-10-25：预算按"余量吃满"算（ledger 上"占用 = 余"），槽位本身是一次性大块
-        // `cudaMalloc` ⇒ 偶发 `CUDA_ERROR_OUT_OF_MEMORY`（实测 200 token 跑里约 1/20 起不来，
-        // 栈顶就在 `SlotCache::new`）。`SlotCache::new` 现在 OOM 会逐级退让，这里**回读实际槽数**，
-        // 让下游（钉表/ledger/命中统计）用真值而不是请求值。
+        //   `cudaMalloc` ⇒ 偶发 `CUDA_ERROR_OUT_OF_MEMORY`（实测 200 token 跑里约 1/20 起不来，
+        //   栈顶就在 `SlotCache::new`）。`SlotCache::new` 现在 OOM 会逐级退让，这里**回读实际槽数**，
+        //   让下游（钉表/ledger/命中统计）用真值而不是请求值。
         let pri_want = pri_slots;
         let pri_slots = cache.n_slots;
         let mut cache_alt = if mixed {
@@ -296,7 +359,7 @@ impl<'a> ArenaExpertSource<'a> {
             );
         }
         // ── `LINGXI_ARENA_PREWARM=<hist.csv>`：**预热 + 钉住**每层最热的 N 个专家 ──
-        // 依据：**工作集 ≈ 槽数**（bench 负载 6774 个
+        // 依据（实测，见 docs/speedup-audit.md）：**工作集 ≈ 槽数**（bench 负载 6774 个
         // (层,专家) / 7000 槽）⇒ 纯 LRU 会抖，稳定命中率只有 93%，而且那 7% 里绝大部分是
         // **首触（compulsory）**——LRU 再聪明也躲不掉"第一次见到它"。
         // 直方图显示每层 top-145 覆盖 99.65% 的请求 ⇒ 把这批**提前搬进显存并钉住**，
@@ -411,9 +474,9 @@ impl<'a> ArenaExpertSource<'a> {
                     None => arena.bytes(&(b.gu.start..b.down.end)),
                 };
                 // ⚠️ 与 `maybe_repin` 同一条纪律：预热的字节数**必须**正好一个 blob。
-                // 缺这条断言时（2026-10-16 排查中发现），一旦 `gu.start..down.end` 不是
-                // 恰好 blob 长，就会**静默多拷/少拷**，钉进去的专家权重与懒加载不一致 ⇒
-                // token 流在几十个 token 后分叉。这里补上（并且是真检查，不只是打印）。
+                //    缺这条断言时（2026-10-16 排查中发现），一旦 `gu.start..down.end` 不是
+                //    恰好 blob 长，就会**静默多拷/少拷**，钉进去的专家权重与懒加载不一致 ⇒
+                //    token 流在几十个 token 后分叉。这里补上（并且是真检查，不只是打印）。
                 if done == 0 {
                     eprintln!(
                         "[prewarm] 首个 blob 长度核对：src.len()={} blob={} gu.start={} down.end={} gu_bytes={} down_bytes={}",
@@ -574,15 +637,16 @@ impl<'a> ArenaExpertSource<'a> {
             }
             }
         }
-        // ── ★ 2026-10-25`LINGXI_ARENA_PRELOAD_ALL`：把本卡服务层的
-        // **全部专家**一次搬进显存（幂等：已驻留的跳过）。
+        // ── ★ 2026-10-25 `LINGXI_ARENA_PRELOAD_ALL`：把本卡服务层的
+        //    **全部专家**一次搬进显存（幂等：已驻留的跳过）。
         //
-        // 动机（实测）：`[htime-spike]` 里那笔"prep 4.4 ms/轮"其实是**首触补槽** ——
-        // `prep` 从 `t_pre_pairs` 起算，而 miss 时第 2 次 attempt 会把它连
-        // `load_missing` 的整段 DMA 一起算进去（`[prep-prof]` 四个子步骤全是 0 µs 就是铁证）。
-        // 全驻留后 decode 期 miss=0 ⇒ 这笔钱变成启动时一次性搬完。
-        // 代价：启动多 5~7 s（本卡 ~32 GB over PCIe）；而 tok/s 口径**不含启动** ⇒ 净赚。
-        if lingxi_model::flag("LINGXI_ARENA_PRELOAD_ALL") && !prewarm_off {
+        //    动机（实测）：`[htime-spike]` 里那笔"prep 4.4 ms/轮"其实是**首触补槽** ——
+        //    `prep` 从 `t_pre_pairs` 起算，而 miss 时第 2 次 attempt 会把它连
+        //    `load_missing` 的整段 DMA 一起算进去（`[prep-prof]` 四个子步骤全是 0 µs 就是铁证）。
+        //    全驻留后 decode 期 miss=0 ⇒ 这笔钱变成启动时一次性搬完。
+        //    代价：启动多 5~7 s（本卡 ~32 GB over PCIe）；而 tok/s 口径**不含启动** ⇒ 净赚。
+        //    值感知（2026-10-28）：=0 必须真关——旧 flag() 存在即真，单卡档 export 0 关不掉。
+        if lingxi_model::flag_val("LINGXI_ARENA_PRELOAD_ALL", false) && !prewarm_off {
             let t0 = std::time::Instant::now();
             k.ctx.bind_to_thread()?;
             let (mut n_new, mut n_skip) = (0usize, 0usize);
@@ -655,7 +719,7 @@ impl<'a> ArenaExpertSource<'a> {
             if pinned { arena_bytes as f64 / 1073741824.0 } else { 0.0 },
             layers,
         );
-        // ── ㊺ A2 设备路由：槽位表 + Q4/Q3 几何 ──
+        // ── 设备路由：槽位表 + Q4/Q3 几何 ──
         let n_layers = arena.n_layers as usize;
         let n_experts = arena.n_experts as usize;
         let rows_gu = 2 * arena.n_ff as usize;
@@ -731,6 +795,52 @@ impl<'a> ArenaExpertSource<'a> {
                 k.stream.context().alloc_pinned_with_flags::<i32>(n_experts.max(1), 0)?
             });
         }
+        // ── router lookahead 预取（`LINGXI_ARENA_PREFETCH`，值感知，默认关）──
+        // 与 PRELOAD_ALL 的关系：**全驻留时 decode 期 miss=0，预取无收益只剩 PCIe 带宽
+        // 占用 ⇒ 自动闲置**。NOH2D 是"只记槽不真拷"的消融诊断档，同样闲置（保持其
+        // "LRU/命中统计/槽位编号完全不变"的语义纯净）。
+        let pf_want = lingxi_model::flag_val("LINGXI_ARENA_PREFETCH", false);
+        let pf_signal = PfSignal::from_env();
+        let pf_on = pf_want
+            && !lingxi_model::flag_val("LINGXI_ARENA_PRELOAD_ALL", false)
+            && !lingxi_model::flag_val("LINGXI_ARENA_NOH2D", false);
+        if pf_want && !pf_on {
+            eprintln!(
+                "[arena-prefetch] LINGXI_ARENA_PREFETCH 已设但自动闲置 \
+                 （LINGXI_ARENA_PRELOAD_ALL / LINGXI_ARENA_NOH2D 生效中，预取无意义）"
+            );
+        }
+        if pf_on {
+            eprintln!(
+                "[arena-prefetch] router lookahead 预取开启：信号 = {}｜每至多 {PF_MAX} 个未驻留\
+                 专家经 stream2 异步 DMA｜采样窗 {} / 休眠判据 = 命中节省 vs 预测成本（{} pass）",
+                pf_signal.describe(),
+                prefetch::WINDOW,
+                prefetch::SLEEP_PASSES,
+            );
+        }
+        // ── 同层 write-through top-k 预取（`LINGXI_ARENA_TOPK_FETCH`，值感知，默认关）──
+        // 与 PRELOAD_ALL / NOH2D 的闲置关系**同 prefetch**：全驻留时 decode 期 miss=0，
+        // 无收益只剩 PCIe 占用；NOH2D 是"只记槽不真拷"的消融档，保持其语义纯净。
+        let tf_want = lingxi_model::flag_val("LINGXI_ARENA_TOPK_FETCH", false);
+        let tf_on = tf_want
+            && !lingxi_model::flag_val("LINGXI_ARENA_PRELOAD_ALL", false)
+            && !lingxi_model::flag_val("LINGXI_ARENA_NOH2D", false);
+        if tf_want && !tf_on {
+            eprintln!(
+                "[arena-topk-fetch] LINGXI_ARENA_TOPK_FETCH 已设但自动闲置 \
+                 （LINGXI_ARENA_PRELOAD_ALL / LINGXI_ARENA_NOH2D 生效中，预取无意义）"
+            );
+        }
+        if tf_on {
+            eprintln!(
+                "[arena-topk-fetch] 同层 write-through 预取开启：首个 miss 照旧同步 DMA，\
+                 本层 top-k 其余未驻留专家至多 {} 个经 stream2 异步 DMA（复用 pf_pending/claim）",
+                prefetch::TOPK_FETCH_MAX,
+            );
+        }
+        let pf_gate = k.ctx.new_event(None)?;
+        let pf_done = k.ctx.new_event(None)?;
         let me = Self {
             k,
             arena,
@@ -770,6 +880,13 @@ impl<'a> ArenaExpertSource<'a> {
             q4c_alt,
             q4_ok,
             op_lock: std::sync::Mutex::new(()),
+            pf: UnsafeCell::new(PfCtl::new(pf_on)),
+            pf_signal,
+            pf_router_w: UnsafeCell::new(vec![None; n_layers]),
+            pf_gate,
+            pf_done,
+            pf_pending: UnsafeCell::new(HashMap::new()),
+            tf_on,
         };
         // 初始表：把预热后的全部层刷一次（之后只有 legacy load_hits / load_missing 会改它）。
         me.slot_map_sync_dirty()?;
@@ -788,7 +905,7 @@ impl<'a> ArenaExpertSource<'a> {
         Ok(me)
     }
 
-    /// ㊺ A2：把 `layer` 这一层的槽位表（E 项）同步上卡。
+    /// 把 `layer` 这一层的槽位表（E 项）同步上卡。
     /// 只在表**会被路由核读取**时需要：legacy `load_hits` / A2 `load_missing` 末尾，
     /// 以及构造期把预热结果刷一次。2 KB/层，锁页 H2D（每层独立暂存，异步安全）。
     fn slot_map_sync_layer(&self, layer: u32) -> Result<()> {
@@ -840,7 +957,7 @@ impl<'a> ArenaExpertSource<'a> {
         Ok(())
     }
 
-    /// ㊺ A2：把**所有变过的层**（insert/victim 都可能改到别的层）刷上卡，然后清脏位。
+    /// 把**所有变过的层**（insert/victim 都可能改到别的层）刷上卡，然后清脏位。
     fn slot_map_sync_dirty(&self) -> Result<()> {
         let cache = unsafe { &*self.cache.get() };
         for l in 0..cache.dirty.len() {
@@ -916,6 +1033,417 @@ impl<'a> ArenaExpertSource<'a> {
         }
     }
 
+    /// **位等价铁律**（同类实践的原始表述："a copy holds the pool slot's bytes,
+    /// so outputs do not change"）：预取只改"谁驻留"——字节取自 arena 同一区间、用
+    /// 与 miss-DMA 完全相同的整段 H2D ⇒ 槽内容逐位等于 miss 时搬的那份。在途槽
+    /// **不进** index/flat/slot_map：host 的 flat_get 查不到 ⇒ 不会当真槽用；
+    /// 设备路由（slot_map）也看不见 ⇒ 不存在"读到 DMA 一半"的窗口。实际路由到时
+    /// claim 转正（compute 流先等 pf_done），没路由到的 promote 转正（保留驻留）。
+    fn pf_promote_to(&self, key: (u32, u32), sl: usize) -> Result<()> {
+        let Ok(Some(b)) = self.arena.routed(key.0, key.1) else {
+            // arena 里没这个专家（不该发生）：槽不返册，等价于惰性交还池。
+            return Ok(());
+        };
+        let is_alt = self.mixed && Some(b.format) == self.fmt2;
+        let cache: &mut SlotCache = if is_alt {
+            unsafe { &mut *self.cache_alt.as_ref().unwrap().get() }
+        } else {
+            unsafe { &mut *self.cache.get() }
+        };
+        self.k.stream.wait(&self.pf_done)?;
+        cache.insert(key, sl);
+        Ok(())
+    }
+
+    /// 把**非本层**的在途预取全部转正。为什么需要：prefetch 一批以层为单位发
+    /// （层 L ⇒ L+1），双会话并发或请求中途结束时，下一发 load_hits 可能属于
+    /// 别的层 —— 那些"预测给层 X、来的却是层 Y"的条目不能干等到层 X（槽会泄漏），
+    /// 直接转正（字节有效，本来就是"猜它会热"才搬的；命中率统计略稀释，可接受）。
+    fn pf_resolve_stale(&self, layer: u32) -> Result<()> {
+        if self.pf_pend().is_empty() {
+            return Ok(());
+        }
+        let stale: Vec<((u32, u32), usize)> = self
+            .pf_pend()
+            .iter()
+            .filter(|(k, _)| k.0 != layer)
+            .map(|(k, &s)| (*k, s))
+            .collect();
+        for (k, s) in stale {
+            self.pf_pend().remove(&k);
+            self.pf_promote_to(k, s)?;
+        }
+        Ok(())
+    }
+
+    /// load_hits 收尾：本层预测了但**没路由到**的在途预取转正（预测未中，槽保留），
+    /// 必须在发下一批之前调用 —— pf_done 事件每张只保留一批。
+    fn pf_resolve_current(&self, layer: u32) -> Result<()> {
+        if self.pf_pend().is_empty() {
+            return Ok(());
+        }
+        let cur: Vec<((u32, u32), usize)> = self
+            .pf_pend()
+            .iter()
+            .filter(|(k, _)| k.0 == layer)
+            .map(|(k, &s)| (*k, s))
+            .collect();
+        for (k, s) in cur {
+            self.pf_pend().remove(&k);
+            self.pf_promote_to(k, s)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn pf_enabled(&self) -> bool {
+        unsafe { (*self.pf.get()).enabled }
+    }
+
+    /// 预测候选过滤谓词：该 (目标层, 专家) 已驻留（主/次 cache 任一）或在途 ⇒
+    /// 预取无收益 / 重复，跳过。op_lock 保护下访问（pf_issue 内调用）。
+    #[inline]
+    fn pf_unavailable(&self, target: u32, e: u32) -> bool {
+        let key = (target, e);
+        if self.pf_pend().contains_key(&key) {
+            return true;
+        }
+        if unsafe { &*self.cache.get() }.flat_get(key).is_some() {
+            return true;
+        }
+        if let Some(alt) = self.cache_alt.as_ref() {
+            if unsafe { &*alt.get() }.flat_get(key).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn pf_pend(&self) -> &mut HashMap<(u32, u32), usize> {
+        // SAFETY：与 cache/scratch/pf 同一约定 —— 只在 op_lock（或段锁，同一把）
+        // 保护的簿记窗口内访问；SlotCache 本身的 victim/insert 也不持第二引用。
+        unsafe { &mut *self.pf_pending.get() }
+    }
+
+    /// router_logits 信号的**发射端**：`sparse_moe_forward` 在 router GEMV 入队后、
+    /// 首个同步**之前**调用（Trait 方法，见 `ExpertSource::pf_predict_enqueue`）。
+    ///   1. 登记本层 router W 的设备地址（目标层 L+1 的 W 要等处理过层 L+1 才知道
+    ///      ⇒ 首圈预测大多跳过，第二圈起全量生效；dense 权重常驻显存，地址不变）；
+    ///   2. 已知目标层 W、且目标层归本份 arena 服务、且不在休眠冷却期时，在
+    ///      **stream2** 上异步发预测 GEMV `logits_pred = W_{L+1}·h`（h = 本层
+    ///      router 输入 x 的第 0 行；prefill rows>1 也只取第 0 行做前瞻），直写
+    ///      映射 host 内存，完成记线程级 `PF_PRED` 事件。
+    ///
+    /// 为什么放 stream2：路由段末尾有一次全流同步（取本层 logits），预测 GEMV
+    /// 若挂 compute 流会把 ~50µs 加进**每层**的同步等待；stream2 + 事件自旋把这笔
+    /// 成本藏进层 L 专家段的 ~0.5 ms（消费点自旋 ≈ 0）。跨流门复用 `pf_gate`：
+    /// stream2 必须等 compute 流上 h 的全部生产者完成。
+    fn pf_predict_enqueue(&self, layer: u32, x: &CudaSlice<bf16>, router_w_dev: u64) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        if !self.pf_enabled() || self.pf_signal != PfSignal::RouterLogits {
+            return Ok(());
+        }
+        let n_layers = self.arena.n_layers as usize;
+        if layer as usize >= n_layers {
+            return Ok(());
+        }
+        // 登记本层 W（op_lock 内：与 pf_issue 的簿记同一约定）。
+        {
+            let _op = lingxi_model::moe::expert_acquire(&self.op_lock);
+            unsafe { (&mut *self.pf_router_w.get())[layer as usize] = Some(router_w_dev) };
+        }
+        // MOE_SPLIT：目标层不归本份 arena 服务 ⇒ 不跨卡预取（与 pf_issue 同判据）。
+        let target = if layer as usize + 1 < n_layers { layer + 1 } else { 0 };
+        if !self.layers.contains(&target) {
+            return Ok(());
+        }
+        if unsafe { &*self.pf.get() }.sleeping() {
+            return Ok(()); // 休眠期连预测 GEMV 都不发（白占 stream2）
+        }
+        let reg = unsafe { &*self.pf_router_w.get() };
+        let Some(w_ptr) = reg[target as usize] else {
+            return Ok(()); // 首圈：目标层 dense 权重尚未登记（懒加载），下一圈起生效
+        };
+        let n_experts = self.arena.n_experts as usize;
+        let hidden = self.arena.n_in as usize;
+        if x.len() < hidden {
+            return Ok(());
+        }
+        PF_PRED.with(|c| -> Result<()> {
+            let mut g = c.borrow_mut();
+            let ctx_id = self.k.ctx.cu_ctx() as usize;
+            let reuse = g
+                .as_ref()
+                .map_or(false, |p| p.ctx == ctx_id && p.logits.len() >= n_experts);
+            if !reuse {
+                *g = Some(PfPred::new(self.k, ctx_id, n_experts)?);
+            }
+            let p = g.as_mut().unwrap();
+            p.valid = false;
+            let _op = lingxi_model::moe::expert_acquire(&self.op_lock);
+            self.bind_ctx()?;
+            let (xp, _g2) = x.device_ptr(&self.k.stream);
+            // 跨流门：stream2 的 GEMV 读 h（本层 MoE 输入）⇒ 排在 compute 流上
+            // h 的全部生产者之后（它们都在本调用点之前入队）。
+            self.pf_gate.record(&self.k.stream)?;
+            self.k.stream2.wait(&self.pf_gate)?;
+            self.k.gemv_bf16_ptr_stream(
+                &self.k.stream2,
+                w_ptr,
+                xp,
+                p.logits.dev,
+                n_experts,
+                hidden,
+            )?;
+            p.record(&self.k.stream2)?;
+            p.valid = true;
+            unsafe { &mut *self.pf.get() }.note_pred_cost(t0.elapsed().as_nanos() as u64);
+            Ok(())
+        })
+    }
+
+    /// router_logits 信号的**消费端**：自旋等预测 GEMV 完成（层 L 专家段已给足
+    /// ~0.5 ms 余量 ⇒ 几乎必已就绪；忙等与 `route_spin` 同款，不线程让出），返回
+    /// 本 pass 的预测 logits。`None` = 本 pass 没发预测（首圈缺 W / 目标层越界 /
+    /// 休眠期）⇒ 本层不发 router_logits 预取。
+    fn pf_pred_take(&self) -> Result<Option<Vec<bf16>>> {
+        use cudarc::driver::sys;
+        PF_PRED.with(|c| {
+            let mut g = c.borrow_mut();
+            let Some(p) = g.as_mut() else { return Ok(None) };
+            if !p.valid {
+                return Ok(None);
+            }
+            p.valid = false;
+            loop {
+                let r = unsafe { sys::cuEventQuery(p.ev) };
+                if r == sys::CUresult::CUDA_SUCCESS {
+                    break;
+                }
+                if r != sys::CUresult::CUDA_ERROR_NOT_READY {
+                    anyhow::bail!("pf_pred_take: cuEventQuery -> {r:?}");
+                }
+                std::hint::spin_loop();
+            }
+            Ok(Some(p.logits.slice()?.to_vec()))
+        })
+    }
+
+    /// router lookahead 预取：**预测信号决定候选**（`LINGXI_ARENA_PREFETCH_SIGNAL`）：
+    ///   - `router_logits`（默认）：消费本层早些时候在 stream2
+    ///     上发射的预测 GEMV 结果（`W_{L+1}·h_L` 的真 logits），按全序取至多
+    ///     [`PF_MAX`] 个"目标层未驻留、不在途"的专家；
+    ///   - `topk_set`（旧信号，对照/消融）：**层 L 的 top-k（本批命中列表，升序）
+    ///     原样预测层 L+1 选同样的专家**（跨层路由相关性假设——实测命中率仅 2.4%，
+    ///     留作负结果基线）。
+    /// 本模型 48 层全是 MoE（layer.rs 每层的 `w.moe`）⇒ 路由层间隔 = 1，lookahead
+    /// 目标 = L+1（层 47 回绕 0 = 下一 token 的首路由层）。候选在层 L 的专家 GEMM
+    /// 期间经 **stream2 异步 DMA** 进空闲 LRU 槽（复用 miss-DMA 的 victim + 整段
+    /// 锁页 H2D 路径，不新造 DMA 机制）。
+    ///
+    /// `prot`/`prot_alt` = 本批已分配的槽（victim 保护集，见 `SlotCache::victim`）。
+    fn pf_issue(
+        &self,
+        layer: u32,
+        hit_list: &[u32],
+        prot: &[usize],
+        prot_alt: &[usize],
+    ) -> Result<()> {
+        if !self.pf_enabled() {
+            return Ok(());
+        }
+        if !unsafe { &mut *self.pf.get() }.allow() {
+            return Ok(()); // 休眠期：不占带宽
+        }
+        // MOE_SPLIT：目标层不归本份 arena 服务（它的槽在另一张卡）⇒ 不跨卡预取。
+        let target = if layer + 1 < self.arena.n_layers { layer + 1 } else { 0 };
+        if !self.layers.contains(&target) {
+            return Ok(());
+        }
+        // ── 预测信号 → 候选序列（按信号序，滤掉已驻留/在途的，至多 PF_MAX 个）──
+        let t_sel = std::time::Instant::now();
+        let pred: Vec<u32> = match self.pf_signal {
+            PfSignal::TopkSet => prefetch::topk_set_candidates(
+                hit_list,
+                PF_MAX,
+                &mut |e| self.pf_unavailable(target, e),
+            ),
+            PfSignal::RouterLogits => match self.pf_pred_take()? {
+                Some(logits) => prefetch::pred_candidates(
+                    &logits,
+                    PF_MAX,
+                    &mut |e| self.pf_unavailable(target, e),
+                ),
+                None => Vec::new(),
+            },
+        };
+        unsafe { &mut *self.pf.get() }
+            .note_pred_cost(t_sel.elapsed().as_nanos() as u64);
+        // 先挑候选（含 victim 出池）；一张一批，至多 PF_MAX 个。
+        let mut prot: Vec<usize> = prot.to_vec();
+        let mut prot_alt: Vec<usize> = prot_alt.to_vec();
+        let mut cands: Vec<(u32, usize, bool, usize, std::ops::Range<usize>)> = Vec::new();
+        for &e in &pred {
+            if cands.len() >= PF_MAX {
+                break;
+            }
+            let key = (target, e);
+            if self.pf_pend().contains_key(&key) {
+                continue;
+            }
+            let Ok(Some(b)) = self.arena.routed(target, e) else { continue };
+            let is_alt = self.mixed && Some(b.format) == self.fmt2;
+            let (cache, cblob): (&mut SlotCache, usize) = if is_alt {
+                (
+                    unsafe { &mut *self.cache_alt.as_ref().unwrap().get() },
+                    self.blob_alt,
+                )
+            } else {
+                (unsafe { &mut *self.cache.get() }, self.blob_pri)
+            };
+            if cache.flat_get(key).is_some() {
+                continue; // 已驻留（含 prewarm 钉表）⇒ 无收益
+            }
+            // victim 的保护集按 cache 分（与 load_hits miss 分支同一纪律）；
+            // 槽耗尽不是错 —— 预取是锦上添花，break 即可。
+            let prot_ref: &[usize] = if is_alt { &prot_alt } else { &prot };
+            let Some(sl) = cache.victim(prot_ref) else { break };
+            if is_alt {
+                prot_alt.push(sl);
+            } else {
+                prot.push(sl);
+            }
+            cands.push((e, sl, is_alt, cblob, b.gu.start..b.down.end));
+        }
+        if cands.is_empty() {
+            return Ok(());
+        }
+        // 跨流门：被 victim 槽的旧读者（更早层的专家 GEMV）可能还在 compute 流上飞，
+        // DMA 覆写前必须等它完 —— 与 miss-overlap 的 ev_mo_pre 完全同款的手艺。
+        self.bind_ctx()?;
+        self.pf_gate.record(&self.k.stream)?;
+        self.k.stream2.wait(&self.pf_gate)?;
+        for (e, sl, is_alt, cblob, range) in cands {
+            let cache: &SlotCache = if is_alt {
+                unsafe { &*self.cache_alt.as_ref().unwrap().get() }
+            } else {
+                unsafe { &*self.cache.get() }
+            };
+            let src = self.src_bytes(&range);
+            anyhow::ensure!(
+                src.len() == cblob,
+                "prefetch 字节数不符：src.len()={} cblob={cblob}（layer {target} expert {e}）",
+                src.len()
+            );
+            let sv = cache.slots.slice(sl * cblob..(sl + 1) * cblob);
+            let (dptr, _g) = sv.device_ptr(&self.k.stream);
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(dptr, src, self.k.stream2.cu_stream())
+                    .context("prefetch blob H2D")?;
+            }
+            drop(_g);
+            self.pf_pend().insert((target, e), sl);
+            unsafe { &mut *self.pf.get() }.note_predicted();
+        }
+        self.pf_done.record(&self.k.stream2)?;
+        Ok(())
+    }
+
+    /// 同层 write-through top-k 预取（`LINGXI_ARENA_TOPK_FETCH`）的**发射端**：
+    /// `load_hits` / `load_missing` 的 miss 分支在**首个 miss** 时调用 —— 该 miss
+    /// 本人已照旧同步 DMA（关键路径，本次步要用），**本层**路由 top-k 里其余
+    /// 「未驻留且不在途」的专家（候选选择见 [`prefetch::topk_fetch_candidates`]，
+    /// 至多 [`prefetch::TOPK_FETCH_MAX`] 个）经 **stream2 异步 DMA** 进空闲 LRU 槽，
+    /// 记进**与 prefetch 共用**的 `pf_pending` 在途表；本批后续条目在 load_hits /
+    /// load_missing 的既有 claim 分支转正（compute 流等 `pf_done` ⇒ 读到完整 blob）。
+    /// N 个同层 miss 只有第一个阻塞关键路径，其余与首个 DMA / 专家 GEMV 并行
+    /// （同类实践中 DMA 与计算并行的同款设计）。
+    ///
+    /// 与 `pf_issue` 的差异：候选 = **本层** top-k 的剩余条目（非预测、必被本批
+    /// 用到 ⇒ 不走 PfCtl 自适应休眠，无预测 GEMV / top-k 的 host 成本，只有 DMA
+    /// 本身）；不记 note_predicted（这笔 DMA 的账由"省下的 miss"自己付）。其余
+    /// 纪律完全同 pf_issue：victim 带保护集（发出去的槽追加进 `prot`/`prot_alt`，
+    /// 本批循环与随后的 pf_issue 都不会再 victim 它）、跨流门 `pf_gate`、
+    /// `pf_done` 一张一批 —— 本调用**先于** `pf_resolve_current`/`pf_issue`，
+    /// 而 claim 的 `stream.wait(&pf_done)` 取到的是**本批**的记录；stream2 是 FIFO
+    /// ⇒ 该记录同样覆盖更早的在途 DMA，不会提前放行进读者。
+    fn tf_issue(
+        &self,
+        layer: u32,
+        rest: &[u32],
+        prot: &mut Vec<usize>,
+        prot_alt: &mut Vec<usize>,
+    ) -> Result<()> {
+        if !self.tf_on {
+            return Ok(());
+        }
+        // 候选：剩余 top-k 里「未驻留且不在途」的（与 prefetch 共用 pf_pending ⇒
+        // 在途者必须跳过，否则同 key 双发会双占槽 / 覆盖在途条目）。
+        let pred = prefetch::topk_fetch_candidates(rest, prefetch::TOPK_FETCH_MAX, &mut |e| {
+            self.pf_unavailable(layer, e)
+        });
+        // 先挑候选（含 victim 出池）；一张一批，至多 TOPK_FETCH_MAX 个。
+        let mut cands: Vec<(u32, usize, bool, usize, std::ops::Range<usize>)> = Vec::new();
+        for &e in &pred {
+            let key = (layer, e);
+            let Ok(Some(b)) = self.arena.routed(layer, e) else { continue };
+            let is_alt = self.mixed && Some(b.format) == self.fmt2;
+            let (cache, cblob): (&mut SlotCache, usize) = if is_alt {
+                (
+                    unsafe { &mut *self.cache_alt.as_ref().unwrap().get() },
+                    self.blob_alt,
+                )
+            } else {
+                (unsafe { &mut *self.cache.get() }, self.blob_pri)
+            };
+            if cache.flat_get(key).is_some() {
+                continue; // 已被本批更早的条目 claim 转正 ⇒ 无需预取
+            }
+            // victim 的保护集按 cache 分（与 miss 分支 / pf_issue 同一纪律）；
+            // 槽耗尽不是错 —— 预取是锦上添花，break 即可。
+            let prot_ref: &[usize] = if is_alt { prot_alt } else { prot };
+            let Some(sl) = cache.victim(prot_ref) else { break };
+            if is_alt {
+                prot_alt.push(sl);
+            } else {
+                prot.push(sl);
+            }
+            cands.push((e, sl, is_alt, cblob, b.gu.start..b.down.end));
+        }
+        if cands.is_empty() {
+            return Ok(());
+        }
+        // 跨流门：被 victim 槽的旧读者（更早层的专家 GEMV）可能还在 compute 流上飞，
+        // DMA 覆写前必须等它完 —— 与 pf_issue 完全同款的手艺（复用 pf_gate）。
+        self.bind_ctx()?;
+        self.pf_gate.record(&self.k.stream)?;
+        self.k.stream2.wait(&self.pf_gate)?;
+        for (e, sl, is_alt, cblob, range) in cands {
+            let cache: &SlotCache = if is_alt {
+                unsafe { &*self.cache_alt.as_ref().unwrap().get() }
+            } else {
+                unsafe { &*self.cache.get() }
+            };
+            let src = self.src_bytes(&range);
+            anyhow::ensure!(
+                src.len() == cblob,
+                "topk-fetch 字节数不符：src.len()={} cblob={cblob}（layer {layer} expert {e}）",
+                src.len()
+            );
+            let sv = cache.slots.slice(sl * cblob..(sl + 1) * cblob);
+            let (dptr, _g) = sv.device_ptr(&self.k.stream);
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(dptr, src, self.k.stream2.cu_stream())
+                    .context("topk-fetch blob H2D")?;
+            }
+            drop(_g);
+            self.pf_pend().insert((layer, e), sl);
+        }
+        self.pf_done.record(&self.k.stream2)?;
+        Ok(())
+    }
+
     /// **在线自适应重钉**：每累计 `repin_window` 次请求，就按"最近热度"把每层的 top-N 重排一次
     /// —— 新进 top-N 的搬进来钉住，掉出 top-N 的解钉（还给 LRU），热度计数**减半**（滑动窗口）。
     ///
@@ -973,17 +1501,17 @@ impl<'a> ArenaExpertSource<'a> {
             for k in to_unpin {
                 if let Some(sl) = cache.index.get(&k).copied() {
                     cache.pinned[sl] = false;
-                    // ⚠️ **必须放回 LRU 队**：`victim` 只从 `order` 取，钉住的槽从不进队，
-                    // 所以解钉后不入队 ⇒ `order` 会逐渐空 ⇒ `victim` 走到 `return 0` 的兜底
-                    // ⇒ 多个 key 撞在 0 号槽（实测 `驻留 9166/9000` 就是这么来的）。
+                    // ⚠️ **必须放回 LRU 队**：`victim()` 只从 `order` 取，钉住的槽从不进队，
+                    //    所以解钉后不入队 ⇒ `order` 会逐渐空 ⇒ `victim()` 走到 `return 0` 的兜底
+                    //    ⇒ 多个 key 撞在 0 号槽（实测 `驻留 9166/9000` 就是这么来的）。
                     cache.touch(k, sl);
                 }
             }
             // 4) 新钉：**已经在缓存里的直接钉住（零搬运）**，不在的才取槽 + H2D
             //
             // ⚠️ 第一版没有这一步，而且踩了个真坑：`(l,e)` 可能已在 `index` 里（挂在未钉的槽上），
-            // 这时再 `victim` 拿新槽会**覆盖 `index[key]` 而旧槽永远回收不了** ⇒ 槽泄漏
-            // （实测 `驻留 9000 → 6299` 一路掉、命中率 84.8% → 73.9%、tok/s 32.5 → 19.7）。
+            //    这时再 `victim()` 拿新槽会**覆盖 `index[key]` 而旧槽永远回收不了** ⇒ 槽泄漏
+            //    （实测 `驻留 9000 → 6299` 一路掉、命中率 84.8% → 73.9%、tok/s 32.5 → 19.7）。
             // 本次重钉已发出去的槽同样要保护（理由见 `victim` 的 `prot` 说明）。
             let mut prot: Vec<usize> = Vec::new();
             for (l, e) in to_pin {
@@ -1043,7 +1571,7 @@ impl<'a> ArenaExpertSource<'a> {
         let stats_on = lingxi_model::flag("LINGXI_ARENA_STATS");
         let hist_on = lingxi_model::flag("LINGXI_ARENA_HIST");
         // ⚠️ 两个开关**各管各的**：以前这里是"STATS 没开就直接 return"，
-        // 那样单开 HIST 会静默什么都不落（本轮写完才发现，已修）。
+        //    那样单开 HIST 会静默什么都不落（本轮写完才发现，已修）。
         if !stats_on && !hist_on {
             return;
         }
@@ -1066,10 +1594,10 @@ impl<'a> ArenaExpertSource<'a> {
             let _ = tot;
             // `LINGXI_ARENA_HIST=<path>`：把 (层,专家,请求数) 落盘。
             // ⚠️ **必须合并而不是整文件覆写**（2026-10-18 实测踩到）：双卡 layer-split 下
-            // 有**两个** ArenaExpertSource（GPU0 管 0..24、GPU1 管 24..48），各自只统计自己
-            // 那段层；整文件覆写会让后写的那份把另一半层抹掉 ⇒ 用这种残缺表做 prewarm
-            // 实测 43.9 tok/s（完整表 48.5）。这里改成"读回旧表 → 只替换本实例负责的层 →
-            // 写回"，并用全局锁串行化两个实例的写入。
+            //   有**两个** ArenaExpertSource（GPU0 管 0..24、GPU1 管 24..48），各自只统计自己
+            //   那段层；整文件覆写会让后写的那份把另一半层抹掉 ⇒ 用这种残缺表做 prewarm
+            //   实测 43.9 tok/s（完整表 48.5）。这里改成"读回旧表 → 只替换本实例负责的层 →
+            //   写回"，并用全局锁串行化两个实例的写入。
             if let Ok(path) = std::env::var("LINGXI_ARENA_HIST") {
                 use std::sync::{Mutex, OnceLock};
                 static W: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1161,7 +1689,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
         })
     }
 
-    /// ㊺ A2：补槽。与 `load_hits` 的 miss 分支同一条纪律（victim 带保护集、blob 整段 H2D），
+    /// 补槽。与 `load_hits` 的 miss 分支同一条纪律（victim 带保护集、blob 整段 H2D），
     /// 但**只搬缺的**、不做解量化、不填 scratch。返回时槽位表已对设备可见。
     /// 混档按各专家自己的格式落到主/次 cache（两者的槽号空间独立、保护集也分开）。
     fn load_missing(
@@ -1175,12 +1703,18 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
             return Ok(());
         }
         // 双会话并发下的簿记串行化（见字段 `op_lock` 的注释）。
-        let _op = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // `expert_acquire` 与 two-pass 层间流水的**段锁**同一把锁、可嵌套安全：
+        // 外层已持锁（本线程进了 `sparse_moe_forward` 的专家段）时这里自动跳过。
+        let _op = lingxi_model::moe::expert_acquire(&self.op_lock);
         self.bind_ctx()?;
+        // router lookahead：在途预取里属于别的层的先转正（同 load_hits 的约定）。
+        self.pf_resolve_stale(layer)?;
         let mut prot: Vec<usize> = prot_pri.to_vec();
         let mut prot2: Vec<usize> = prot_alt.to_vec();
         let mut n_new = 0usize;
-        for &e in experts {
+        // 同层 write-through 预取（LINGXI_ARENA_TOPK_FETCH）：一批只发射一次（首个 miss 时）。
+        let mut tf_fired = false;
+        for (i, &e) in experts.iter().enumerate() {
             mark_expert(layer, e);
             let key = (layer, e);
             let b = self
@@ -1201,6 +1735,18 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
             if let Some(sl) = cache.flat_get(key) {
                 EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
                 cache.touch(key, sl);
+                continue;
+            }
+            // router lookahead 预取命中（A2 设备路由路径）：在途槽转正，省掉这次 miss
+            // DMA。compute 流等本批 prefetch 事件 ⇒ 重跑的路由核/GEMV 读到完整 blob。
+            if let Some(sl) = self.pf_pend().remove(&key) {
+                self.k.stream.wait(&self.pf_done)?;
+                cache.insert(key, sl);
+                EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
+                cache.hits += 1;
+                unsafe { &mut *self.pf.get() }.note_hit();
+                prot_ref.push(sl);
+                n_new += 1;
                 continue;
             }
             EXPERT_MISSES.fetch_add(1, Ordering::Relaxed);
@@ -1224,11 +1770,26 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
             cache.insert(key, sl);
             cache.misses += 1;
             n_new += 1;
+            // 同层 write-through 预取：首个 miss 已同步 DMA（关键路径），本层
+            // top-k 里其余未驻留/在途专家走 stream2 异步 DMA —— 本批后续条目
+            // 经上方 claim 分支（pf_pending）转正，省掉各自的关键路径 DMA。
+            if self.tf_on && !tf_fired {
+                tf_fired = true;
+                self.tf_issue(layer, &experts[i + 1..], &mut prot, &mut prot2)?;
+            }
         }
         if n_new > 0 {
             self.slot_map_sync_dirty()?;
         }
         Ok(())
+    }
+
+    fn expert_lock(&self) -> Option<&std::sync::Mutex<()>> {
+        Some(&self.op_lock)
+    }
+
+    fn pf_predict_enqueue(&self, layer: u32, x: &CudaSlice<bf16>, router_w_dev: u64) -> Result<()> {
+        ArenaExpertSource::pf_predict_enqueue(self, layer, x, router_w_dev)
     }
 
     fn load_hits<'b>(
@@ -1245,7 +1806,9 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
             bail!("ArenaExpertSource::load_hits 收到空专家列表");
         }
         // 双会话并发下的簿记串行化（见字段 `op_lock` 的注释）。
-        let _op = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // `expert_acquire` 可嵌套安全：two-pass 层间流水的段锁与本锁同一把，
+        // 外层已持锁（`sparse_moe_forward` 专家段）时这里自动跳过，不会死锁。
+        let _op = lingxi_model::moe::expert_acquire(&self.op_lock);
         self.tick_stats();
         // `LINGXI_ARENA_HIST`：记每 `(层, 专家)` 的**请求**次数（含命中与未命中）。
         // 这是"每层该钉多少个热专家"的唯一依据（P1）。
@@ -1255,6 +1818,9 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                 *h.entry((layer, e)).or_insert(0) += 1;
             }
         }
+        // router lookahead：把"预测给别的层"的在途预取转正（本层的留给下方逐条
+        // claim，好记命中统计）。必须在任何簿记之前 —— 转正会改 index/flat。
+        self.pf_resolve_stale(layer)?;
         let repin_on = self.repin_window > 0;
         // 在线自适应重钉：窗口到了就按"最近热度"重排每层 top-N（详见 `maybe_repin`）
         self.maybe_repin(inter, hidden)?;
@@ -1279,7 +1845,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
 
         // 1) 槽位定位：命中直接用；未命中 → H2D 填进（未用/被淘汰的）槽
     // ★ P15-⑱：本批簿记走 thread_local 复用（原来每次 4 个容器分配）；`prot` 改 `Vec`
-    // 线性扫（本批对数 ≤ 64，`victim` 里 HashSet 哈希反而慢）。语义全同。
+    //    线性扫（本批对数 ≤ 64，`victim` 里 HashSet 哈希反而慢）。语义全同。
     thread_local! {
         static LH_WS: std::cell::RefCell<(
             Vec<BlobFormat>, Vec<usize>, Vec<usize>, Vec<bool>, Vec<u8>, Vec<usize>,
@@ -1297,24 +1863,26 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
     hit_flag.clear();
     which.clear();
     prot_alt.clear();
-    // **本批已分配的槽**（传给它 `victim`，见那里的说明）：同一次调用里已经发出去的槽
+    // **本批已分配的槽**（传给它 `victim()`，见那里的说明）：同一次调用里已经发出去的槽
     // 绝不能又被"淘汰"给另一个专家 —— 否则两个专家共用一块权重、数学静默出错。
     // 每个条目是命中还是未命中 —— `LINGXI_MOE_OVERLAP` 按它切"命中组 / 未命中组"。
     let mut n_miss = 0usize;
+        // 同层 write-through 预取（LINGXI_ARENA_TOPK_FETCH）：一批只发射一次（首个 miss 时）。
+        let mut tf_fired = false;
         // 裸 `memcpy_htod_async` 前必须绑本源的上下文（见 `bind_ctx`）。
         self.bind_ctx()?;
         // ★ **专家段重叠**（`LINGXI_MOE_OVERLAP`）：把 miss 的 blob H2D 挪到**第二流**上飞，
-        // compute 流先算命中组 ⇒ 两边并行（；`NOH2D` 实测这一趟值 28 ms/轮）。
+        //    compute 流先算命中组 ⇒ 两边并行（`NOH2D` 实测这一趟值 28 ms/轮）。
         let ov_stream = if overlap { Some(self.k.stream2.clone()) } else { None };
         if let Some(s2) = ov_stream.as_ref() {
             // 跨流门：`stream2` 上的覆写必须等 compute 流上**更早那些读同一个槽的 GEMV** 跑完。
-            // （现在它是空转：MoE 的路由读取每层都会 `stream.synchronize`，队列本来就是空的；
-            // 留着是为了不依赖那个巧合。）
+            // （现在它是空转：MoE 的路由读取每层都会 `stream.synchronize()`，队列本来就是空的；
+            //   留着是为了不依赖那个巧合。）
             self.k.ev_mo_pre.record(&self.k.stream)?;
             s2.wait(&self.k.ev_mo_pre)?;
         }
         {
-            for &e in experts.iter() {
+            for (i, &e) in experts.iter().enumerate() {
                 mark_expert(layer, e);
                 let key = (layer, e);
                 let b = self
@@ -1341,6 +1909,24 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                     cache.hits += 1;
                     EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
                     cache.touch(key, sl);
+                    if use_alt {
+                        prot_alt.push(sl);
+                    } else {
+                        prot.push(sl);
+                    }
+                    slot_ids.push(sl);
+                    hit_flag.push(true);
+                    continue;
+                }
+                // router lookahead 预取命中：在途槽转正（字节与 miss DMA 逐位相同），
+                // 省掉这次 ~2.6 MB / 350~450 µs 的 H2D。转正前 compute 流等本批
+                // prefetch 事件 ⇒ 随后的专家 GEMV 读到的一定是完整 blob。
+                if let Some(sl) = self.pf_pend().remove(&key) {
+                    self.k.stream.wait(&self.pf_done)?;
+                    cache.insert(key, sl);
+                    cache.hits += 1;
+                    EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
+                    unsafe { &mut *self.pf.get() }.note_hit();
                     if use_alt {
                         prot_alt.push(sl);
                     } else {
@@ -1378,7 +1964,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                 // 诊断：`LINGXI_ARENA_NOH2D=1` 只记槽不真拷 DMA。
                 // 槽内容因此是旧的（数学结果作废），但**LRU/命中统计/槽位编号完全不变**，
                 // 于是能干净地回答"每层这 1ms 到底是不是被专家 DMA 占掉的"。
-                if !lingxi_model::flag("LINGXI_ARENA_NOH2D") {
+                if !lingxi_model::flag_val("LINGXI_ARENA_NOH2D", false) {
                     let src = self.src_bytes(&(b.gu.start..b.down.end));
                     // 混档纪律：净字节数必须正好等于**该格式**的槽步长。
                     anyhow::ensure!(
@@ -1397,7 +1983,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                             .context("arena blob H2D")?;
                     }
                     // [探针] `LINGXI_ARENA_SLOT_CHECK=<layer>`：把刚灌进去的槽回读 64 B 与 arena 源字节比对，
-                    // 并在 slot_ids 上传后核对其回读 —— 一次判掉"槽内容/槽号到底对不对"。
+                    //   并在 slot_ids 上传后核对其回读 —— 一次判掉"槽内容/槽号到底对不对"。
                     if lingxi_model::flag("LINGXI_ARENA_SLOT_CHECK")
                         && std::env::var("LINGXI_ARENA_SLOT_CHECK")
                             .ok()
@@ -1427,9 +2013,9 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                         }
                     }
                     // ★ 判决性诊断（`LINGXI_ARENA_SYNC_H2D=1`）：每次 miss 的 H2D 立刻同步。
-                    // 用途：如果"同一份权重、只差命中/未命中"就能让 token 流分叉，那要么是
-                    // **字节不同**、要么是 **H2D 与后续 GEMV 之间没有真正可见**。这条开关把
-                    // 后一种可能一刀排除（同步之后就不可能有"还没到位"这回事）。
+                    //   用途：如果"同一份权重、只差命中/未命中"就能让 token 流分叉，那要么是
+                    //   **字节不同**、要么是 **H2D 与后续 GEMV 之间没有真正可见**。这条开关把
+                    //   后一种可能一刀排除（同步之后就不可能有"还没到位"这回事）。
                     if lingxi_model::flag("LINGXI_ARENA_SYNC_H2D") {
                         self.k.stream.synchronize()?;
                     }
@@ -1437,9 +2023,22 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
                 cache.insert(key, sl);
                 slot_ids.push(sl);
                 hit_flag.push(false);
+                // 同层 write-through 预取：首个 miss 已同步 DMA（关键路径，本步要用），
+                // 本层 top-k 里**其余**未驻留/在途专家走 stream2 异步 DMA（复用
+                // pf_pending/claim）—— 循环后续条目命中上方 claim 分支转正，N 个
+                // 同层 miss 只有第一个阻塞关键路径（同类实践中 DMA 与计算并行）。
+                if self.tf_on && !tf_fired {
+                    tf_fired = true;
+                    self.tf_issue(layer, &experts[i + 1..], prot, prot_alt)?;
+                }
             }
         }
-        // ㊺ A2：槽位表可能被本批的 miss 改过（也可能挤掉了**别的层**的 key）⇒ 刷脏行。
+        // router lookahead：本层在途预取结算（预测了却没路由到的转正），然后为下一
+        // 路由层（L+1）发新一批。必须在 slot_map 同步**之前** —— claim/promote/issue
+        // 里 victim 出的槽会改 flat/dirty（claim/promote 的脏行要随本批一起上卡）。
+        self.pf_resolve_current(layer)?;
+        self.pf_issue(layer, experts, &prot, &prot_alt)?;
+        // 槽位表可能被本批的 miss 改过（也可能挤掉了**别的层**的 key）⇒ 刷脏行。
         // 无脏行时是 48 次 bool 检查（零 H2D），所以无条件调用。
         self.slot_map_sync_dirty()?;
         // 本层所有 miss 的 blob 都发完了 ⇒ 在第二流上打个点（调用方跑 miss 组之前等它）
@@ -1469,7 +2068,7 @@ impl<'a> lingxi_model::moe::ExpertSource for ArenaExpertSource<'a> {
         }
 
         // 2) 从**设备槽**解量化：全 Q4G64 / 全 Q3G128（统一格式）走**批量版**（2 次 launch/层，
-        // 而非 2S 次）；否则逐专家（含 BF16 原样直落）。
+        //    而非 2S 次）；否则逐专家（含 BF16 原样直落）。
         let all_q4 = !fmts.is_empty()
             && fmts.iter().all(|f| *f == fmts[0])
             && matches!(fmts[0], BlobFormat::Q4G64F16S | BlobFormat::Q3G128F16S);

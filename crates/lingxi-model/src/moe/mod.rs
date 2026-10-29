@@ -1,14 +1,14 @@
 //! MoE（稀疏专家）前向。数学对齐 HF `Qwen4ExpTextSparseMoeBlock`：
-//! `text
-//! logits = router(hs) # [n, E]
-//! probs = softmax(logits.float); top-k -> 归一化（norm_topk_prob=True）
+//! ```text
+//! logits = router(hs)                     # [n, E]
+//! probs  = softmax(logits.float); top-k -> 归一化（norm_topk_prob=True）
 //! for e in 命中的专家:
-//! gate, up = split(gate_up_e @ hs_e) # [n_e, 2I] → chunk(2, -1)
-//! h = silu(gate) * up
-//! out[idx] += probs_e * (down_e @ h)
+//!     gate, up = split(gate_up_e @ hs_e)   # [n_e, 2I] → chunk(2, -1)
+//!     h = silu(gate) * up
+//!     out[idx] += probs_e * (down_e @ h)
 //! shared = sigmoid(shared_expert_gate(hs)) * down(swiglu(gate_up(hs)))
 //! out = expert_out + shared
-//! `
+//! ```
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
@@ -30,7 +30,7 @@ pub(crate) use router::route_dev_attempt;
 ///
 /// 为什么要有它：evprof 的 seg3（路由+host）把「shared 专家 / router+topk / 设备端建 pair 表」
 /// 全包在一起，而这段在跨运行之间会从 0.28 跳到 0.85 ms，
-/// 用两次不同运行的差值去归因是**不可信**的（D 的 0.19 ms 就是这么来的，已作废）。
+/// 用两次不同运行的差值去归因是**不可信**的（旧口径的 0.19 ms 就是这么来的，已作废）。
 /// 这里在每个边界插一次流同步，用**同一次运行内**的主机钟量出三段的真耗时。
 ///
 /// ⚠️ 同步会显著拖慢整轮 ⇒ **只在归因时开**，不要用它跑吞吐。
@@ -81,10 +81,10 @@ pub mod s3 {
                 return;
             }
             // ★ 2026-10-25 修：没有 t0 也必须**计数**。旧写法把整段记账放在
-            // `let Some(t0) = *last else { return }` 之后 ⇒ 一旦 `mark(0)` 与
-            // `mark(2..4)` 不在同一条语句链上（或 mark(0) 没跑），后三发直接早退，
-            // 表现为"同步照付钱、`[s3]` 一行不打"（200 token 实测 96 → 64.6 tok/s 却零输出）。
-            // 缺 t0 的次数单独记在 acc[dev][5]，一跑就能证实/证伪这条假设。
+            //   `let Some(t0) = *last else { return }` 之后 ⇒ 一旦 `mark(0)` 与
+            //   `mark(2..4)` 不在同一条语句链上（或 mark(0) 没跑），后三发直接早退，
+            //   表现为"同步照付钱、`[s3]` 一行不打"（200 token 实测 96 → 64.6 tok/s 却零输出）。
+            //   缺 t0 的次数单独记在 acc[dev][5]，一跑就能证实/证伪这条假设。
             match *last {
                 Some(t0) => {
                     let us = now.duration_since(t0).as_secs_f64() * 1e6;
@@ -130,6 +130,18 @@ pub mod s3 {
 }
 
 pub trait ExpertSource: Sync {
+    /// **专家段串行化锁**（two-pass 层间流水用，默认无）：
+    /// 层间流水下两个线程会并发驱动**同一只** expert source（一个跑本命层、一个跑
+    /// 远程层的内层调用）——`load_hits` 内部的簿记锁只保护调用本身，**返回后、
+    /// GEMV 入队前**仍存在"对方把槽驱逐覆写、而本线程读该槽的核还在队列里"的窗口。
+    /// 返回 `Some` 时，`sparse_moe_forward` 会把「load_hits ~ 专家 GEMV 全部入队 ~
+    /// combine」整段持锁，封掉该窗口（锁内无 host 同步 ⇒ 不破坏双卡流水）。
+    /// 持有检测走 [`expert_acquire`] 的线程级标记 ⇒ 与 `load_hits` 内部取同一把锁
+    /// 不会死锁（嵌套调用自动跳过）。
+    fn expert_lock(&self) -> Option<&std::sync::Mutex<()>> {
+        None
+    }
+
     /// 按命中专家 id 列表（moe 保证已去重、按 id 升序）填充并返回**紧凑**权重。
     /// 允许（也应当）复用内部 scratch：host 聚合缓冲与 device 张量都只分配一次、
     /// 之后逐层覆写——decode 每层槽位数相同，重复分配大缓冲会造成缺页/cuMalloc 风暴。
@@ -150,15 +162,31 @@ pub trait ExpertSource: Sync {
         overlap: bool,
     ) -> Result<ExpertHits<'a>>;
 
-    /// ㊺ A2 设备路由：设备侧 Q4 直读视图（槽区 + 每层槽位表 + 段几何常量）。
+    /// router lookahead 预取的 **router_logits 信号供给**（`LINGXI_ARENA_PREFETCH=1`
+    /// 且 `LINGXI_ARENA_PREFETCH_SIGNAL=router_logits`）：在 **router GEMV 已入队、
+    /// 首个同步尚未发生**的窗口调用。实现方登记本层 router 权重的设备地址，并在
+    /// **独立流**上异步发起"层 L+1 的 router 权重 × 本层 router 输入 x"的预测
+    /// GEMV（真 logits），预测结果在同一层随后的
+    /// `load_hits`（pf_issue）里消费、发起 stream2 预取 DMA。因为发射点在同步前，
+    /// 本调用不得含任何流同步。默认空实现 = 非 arena 源（/ 旧信号档）零开销。
+    fn pf_predict_enqueue(
+        &self,
+        _layer: u32,
+        _x: &CudaSlice<bf16>,
+        _router_w_dev: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// 设备路由：设备侧 Q4 直读视图（槽区 + 每层槽位表 + 段几何常量）。
     /// `Some` = 支持设备端 top-k 直查（免 host 同步决策）；`None` = 回退 host 路径。
     fn q4_dev(&self) -> Option<Q4DevView<'_>> {
         None
     }
 
-    /// ㊺ A2：把 `experts` 里**尚未入槽**的搬进设备槽（已在槽里的是空操作），并保证
+    /// 把 `experts` 里**尚未入槽**的搬进设备槽（已在槽里的是空操作），并保证
     /// `prot_pri`/`prot_alt`（本批已在用的槽，按 cache 分开）以及本批新分配的槽不会被
-    /// `victim` 选中。实现方**必须**让槽位表的改动对设备可见（含被淘汰的**其它层**的槽位行）。
+    /// `victim()` 选中。实现方**必须**让槽位表的改动对设备可见（含被淘汰的**其它层**的槽位行）。
     /// 混档 arena 按各专家自己的格式落到对应 cache；`prot_alt` 在单格式实现里忽略。
     fn load_missing(
         &self,
@@ -170,7 +198,7 @@ pub trait ExpertSource: Sync {
         Ok(())
     }
 
-    /// ㊺ A2：把 `layer` 这一层的槽位表（E 项）同步上卡。**只在 legacy（miss 回退）
+    /// 把 `layer` 这一层的槽位表（E 项）同步上卡。**只在 legacy（miss 回退）
     /// load_hits 之后调用**——设备路由快路径全中时 load_hits 根本不被调用，表无需改动。
     fn slot_map_sync_layer(&self, _layer: u32) -> Result<()> {
         Ok(())
@@ -303,7 +331,7 @@ pub fn build_ep_expert_assign(
     out
 }
 
-/// ㊺ A2 设备路由用的 Q4 常量（`Q4Slots` 里不随命中变化的部分）。
+/// 设备路由用的 Q4 常量（`Q4Slots` 里不随命中变化的部分）。
 #[derive(Clone, Copy)]
 pub struct Q4Consts {
     pub blob: u64,
@@ -317,7 +345,7 @@ pub struct Q4Consts {
     pub bits: u32,
 }
 
-/// ㊺ A2 设备路由视图：`slot_map` 是 `[层, E]` 的 i32 表（存 slot+1、0=未缓存）。
+/// 设备路由视图：`slot_map` 是 `[层, E]` 的 i32 表（存 slot+1、0=未缓存）。
 /// 混档 arena（Q4G64+Q3G128）再给 `alt`（次格式 cache 的槽区/表/几何）与 `fmt`
 /// （`[层, E]`：0=主视图、1=次视图）——批量设备路由据此一次建两组槽号（互斥 -1 哨兵）。
 pub struct Q4DevView<'a> {
@@ -336,14 +364,14 @@ pub struct Q4DevAlt<'a> {
 }
 
 /// `LINGXI_MOE_OVERLAP` 是否**真的生效**：它依赖"专家段不受 CUDA Graph 捕获"（跨流 + 事件
-/// 在捕获里是另一套语义）。所以要求同时设 `LINGXI_NO_GRAPHS=1`（实测关图本来就更快，）。
+/// 在捕获里是另一套语义）。所以要求同时设 `LINGXI_NO_GRAPHS=1`（实测关图本来就更快）。
 /// 只设了本开关却没关图时**大声告警并自动退回老路径**（宁可慢，也不静默错）。
 pub fn moe_overlap_on() -> bool {
     if !crate::flag("LINGXI_MOE_OVERLAP") {
         return false;
     }
-    // ★ P15-㊶：判定从"env 设了 NO_GRAPHS"改成"graph 真的启用"。原判定有洞：
-    // 双卡自动 layer-split 时图是被 force_disable 关掉的（不要求用户设 env），
+    // ★ 判定从"env 设了 NO_GRAPHS"改成"graph 真的启用"。原判定有洞：
+    // 双卡自动 layer-split 时图是被 force_disable() 关掉的（不要求用户设 env），
     // 于是 overlap 在生产默认配置下被误报"失效"——其实图根本没开。
     if crate::graph::enabled() {
         static WARNED: std::sync::atomic::AtomicBool =
@@ -359,7 +387,7 @@ pub fn moe_overlap_on() -> bool {
     true
 }
 
-// ─────────────────────── ㊺ A2 设备路由：辅助 + 快路径 ───────────────────────
+// ─────────────────────── 设备路由：辅助 + 快路径 ───────────────────────
 
 /// 诊断对拍用：FNV-1a 64 位哈希（`LINGXI_PAIR_DUMP` 比较 host/设备构建的 pair/CSR 表）。
 pub(crate) fn hash_i32(v: &[i32]) -> u64 {
@@ -445,12 +473,12 @@ pub struct MoOverlap {
 pub struct MoeWeights {
     /// [E+1, H]：前 E 行是 router，最后一行是 `shared_expert_gate`
     pub router_shared_gate: CudaSlice<bf16>,
-    /// [E*2I, H]：专家主序（每个专家 `[gate(I); up(I)]`）。
+    /// [E*2I, H]：专家主序（每个专家 `[gate(I) ; up(I)]`）。
     /// `None` = 瘦身路径：不预装全量专家，运行时经 [`ExpertSource`] 只取命中专家。
     pub routed_gate_up: Option<CudaSlice<bf16>>,
     /// [E*H, I]；`None` 含义同 `routed_gate_up`
     pub routed_down: Option<CudaSlice<bf16>>,
-    /// [2I, H]：`[gate(I); up(I)]`
+    /// [2I, H]：`[gate(I) ; up(I)]`
     pub shared_gate_up: CudaSlice<bf16>,
     /// [H, I]
     pub shared_down: CudaSlice<bf16>,
@@ -472,9 +500,54 @@ pub struct MoeOutput {
     pub sel_rows: Vec<(u32, i32, f32)>,
 }
 
+// ───────────── 专家段段锁（two-pass 层间流水的跨线程槽保护）─────────────
+
+thread_local! {
+    /// 本线程是否已持有某只 source 的段锁/`op_lock`（嵌套取锁的跳过判据）。
+    static EXPERT_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 专家段段锁开关（`LINGXI_PREFILL_TWOPASS=1` + `LINGXI_TWOPASS_PIPE=1` 的层间流水期间置真）。
+/// 关掉时 `sparse_moe_forward` 不取段锁 ⇒ 默认/talk_spec 路径行为与以前逐字一致。
+static EXPERT_LOCKS_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 层间流水编排入口调：进出各一次（true/false）。
+pub fn set_expert_locks_on(on: bool) {
+    EXPERT_LOCKS_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 段锁当前是否生效（`sparse_moe_forward` 查询）。
+pub fn expert_locks_on() -> bool {
+    EXPERT_LOCKS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 取专家锁（可嵌套安全）：本线程已持有（外层段锁）⇒ 返回 `None`（内部簿记已被保护）；
+/// 否则取锁并打线程级持有标记，guard drop 时释放并清标记。
+/// poison 容忍（`into_inner`）——与 arena 内部既有的取锁口径一致。
+pub fn expert_acquire(m: &std::sync::Mutex<()>) -> Option<ExpertGuard<'_>> {
+    if EXPERT_HELD.with(|c| c.get()) {
+        return None;
+    }
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    EXPERT_HELD.with(|c| c.set(true));
+    Some(ExpertGuard { g })
+}
+
+/// [`expert_acquire`] 的守卫（Drop 清线程级持有标记）。
+pub struct ExpertGuard<'a> {
+    g: std::sync::MutexGuard<'a, ()>,
+}
+
+impl<'a> Drop for ExpertGuard<'a> {
+    fn drop(&mut self) {
+        EXPERT_HELD.with(|c| c.set(false));
+    }
+}
+
 /// `x[n, H] → out[n, H]`。
 #[allow(clippy::too_many_arguments)]
-/// **跨卡跑 MoE**。
+/// **跨卡跑 MoE**（`LINGXI_MOE_SPLIT`，跨卡 MoE 设计见仓库设计文档）。
 ///
 /// 为什么：真语料下**整轮 43% 的时间**花在"专家 miss 的 PCIe 搬运"上（603 MB/轮 @10 GB/s），
 /// 根因是 GPU0 的专家槽位不够（9000 槽 / 每层 183 个 ⇒ 覆盖 88%，而 9200 就 OOM）。
@@ -497,7 +570,7 @@ pub struct RemoteMoe<'a> {
 }
 
 /// ② 路由 host 簿记的**复用工作区**（P15-⑧ 行动清单第 1 条：消灭每层 ~512 个 Vec 分配）。
-/// 为什么值得做：路由段在 `synchronize`（取回 logits）之后、专家 GEMV 入队之前，
+/// 为什么值得做：路由段在 `synchronize()`（取回 logits）之后、专家 GEMV 入队之前，
 /// **全程压在 GPU 空闲的关键路径上**——这里每省 1 µs 就是 1 µs 的 GPU 死时间（48 层累乘）。
 /// 原来这层新分配 `per_expert`（512 个内层 Vec）+ 8 张簿记表 ≈ 520 次分配，实测 ~30 µs/层。
 /// 用 `take`/`replace` 取出归还（不长期持锁）；意外 early-return 丢一份也只是下次重建。
@@ -536,9 +609,9 @@ thread_local! {
 
 // [探针 2026-10-22] router 段三项分解（host-bound 诊断：把 MoE 括号里的
 // "等 GPU 积压"从真实 host 工作中剥出来）：
-// SYNC_WAIT_NS = 锁页 D2H + sync 的累计（GPU 积压等待的主体）
-// ROUTER_ALLOC_NS = scratch::bf16(logits) 分配
-// ROUTER_LAUNCH_NS = router GEMM 发射（device_ptr ×3 + launch）
+//   SYNC_WAIT_NS   = 锁页 D2H + sync 的累计（GPU 积压等待的主体）
+//   ROUTER_ALLOC_NS = scratch::bf16(logits) 分配
+//   ROUTER_LAUNCH_NS = router GEMM 发射（device_ptr ×3 + launch）
 pub(crate) static SYNC_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static ROUTER_ALLOC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static ROUTER_LAUNCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

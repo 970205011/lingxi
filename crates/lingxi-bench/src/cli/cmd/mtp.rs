@@ -113,7 +113,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         std::env::set_var("LINGXI_NO_GRAPHS", "1");
         lingxi_model::graph::force_disable();
     }
-    // ㊿-P0：未显式给槽数时走显存预算自动分配。tune_lo 在 ls_lo 定案前先用
+// 未显式给槽数时走显存预算自动分配。tune_lo 在 ls_lo 定案前先用
     // env 口径（缺省 24；无 GPU1 时 ls_lo 实为 0，此处按 24 只会**少估**槽数，安全方向）。
     let tune_lo: u32 = std::env::var("LINGXI_LAYER_SPLIT")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
@@ -154,7 +154,7 @@ pub fn accept(args: &[String]) -> Result<()> {
     // ★★ **全量 layer-split**：
     // 与 `LINGXI_MOE_SPLIT`（只搬 MoE）互斥。这里必须在建 `Sequence` **之前**把
     // 两张卡都建好 —— 因为 `[lo, n_layers)` 的**状态**要直接建在 GPU1 上。
-    // ★ P15-㉜（2026-10-17）：**双卡时默认自动开 split**（lo=24）——真实语料实测
+    // ★ 2026-10-17：**双卡时默认自动开 split**（lo=24）——真实语料实测
     // 20.7 → 54.1 tok/s（+161%：每卡 arena 减半 → 专家 miss 崩塌；bench 英文
     // 高命中语境 −1%）。显式设 `LINGXI_LAYER_SPLIT=0` 可关（回归对照用）。
     let ls_env: Option<u32> = if ep_on {
@@ -177,7 +177,7 @@ pub fn accept(args: &[String]) -> Result<()> {
     );
     if ls_on {
         if auto_split {
-            // ㊸：不再整体禁图——所录的图全是**单层本地段**（专家段 3 核固定槽），
+// 不再整体禁图——所录的图全是**单层本地段**（专家段 3 核固定槽），
             // 层⇄设备一一对应（key=layer*8+7 只在那一台设备上出现），捕获/重放都在
             // 本层自己的 stream 上；跨卡拷贝（cross_copy）在层循环之外，不进图。
             // 若实测判据翻车，回退 = 恢复 force_disable 一行。
@@ -188,12 +188,12 @@ pub fn accept(args: &[String]) -> Result<()> {
         } else {
             if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
                 eprintln!(
-                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS。㊸ 起单层本地图（专家段）\
+                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS：单层本地图（专家段）\
                      在 split 下保持可用；若出现数值异常请先设 LINGXI_NO_GRAPHS=1 对照。"
                 );
             }
         }
-        // ★ P15-㉞：池已 device-aware（键=(设备,长度)）⇒ 不再需要禁池。
+        // ★ 池已 device-aware（键=(设备,长度)）⇒ 不再需要禁池。
         // 禁池正是 split+分块确定性发散的根因（直连 alloc/free 与在飞 kernel 竞争）。
     }
     let ls_k1: Option<lingxi_kernels::Kernels> =
@@ -202,7 +202,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         Some(kk) => Some(crate::cli::common::load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
         None => None,
     };
-    // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
+// 未显式给槽数时走显存预算自动分配（env 显式值优先）。
     // talk 路径 KV 容量 = rope_len+8（prompt+n_new+spec 余量+16）。
     let ls_slots: usize = if ep_on {
         ep_slots
@@ -219,7 +219,7 @@ pub fn accept(args: &[String]) -> Result<()> {
             None => 9600,
         },
     }
-    };  // ★㊲ 工作集≥槽位判决(375/卡层)
+    };  // ★ 工作集≥槽位判决(375/卡层)
     let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
         match ls_k1.as_ref() {
             Some(kk) => {
@@ -923,7 +923,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         let mut pb_hit = [0usize; 4];
         let mut pb_n0 = [0usize; 4];
         let mut pb_hit0 = [0usize; 4];
-        // ── ★ 后缀查表草稿（Strata `--suffix-draft`，他那边默认开）──
+        // ── ★ 后缀查表草稿（同类开源参考实现的能力，那边默认开）──
         // 见 `lingxi_model::suffix` 的模块说明与 `probes.rs` 的登记项。
         // `sd_cursor`：历史里已经喂进查表器的位置游标（`seq.ids` 是单调前推的）。
         // ⚠️ **默认 0 = 关**（这是本轮的实测教训，别急着开）：
@@ -989,7 +989,7 @@ pub fn accept(args: &[String]) -> Result<()> {
             let diag = std::env::var("LINGXI_MTP_CHAIN_DIAG").unwrap_or_default();
             let diag_noh = diag.contains("noh");
             let diag_nokv = diag.contains("nokv");
-            // `LINGXI_SPEC_MIN_P`：草稿自己的 top-1 概率低于阈值就**停链**（参考实现 Strata
+            // `LINGXI_SPEC_MIN_P`：草稿自己的 top-1 概率低于阈值就**停链**（同类开源参考实现
             // `generate.cpp:9172` 的 `--spec-min-p`）。实测依据（prob1 vs 实际接受）：
             // ≥0.90 → 0.988 ｜ 0.70~0.90 → 0.750 ｜ 0.50~0.70 → 0.250 ｜ <0.50 → 0.278
             // ⇒ 深位的低概率草稿几乎不被接受，砍掉它们**不丢接受数、但省下来的是"行"**。
@@ -1091,7 +1091,7 @@ pub fn accept(args: &[String]) -> Result<()> {
             lingxi_model::scratch::put_bf16(h_step0);
             lingxi_model::scratch::put_bf16(h_in);
             // ★ 后缀查表草稿：把 MTP 被闸门砍掉的空位用"上下文里原样出现过的续写"补上。
-            // 语义与 Strata 的 `--lookup-chain` 一致：查询 = 「历史后缀 + 已产出的草稿」，
+            // 语义与同类开源参考实现的 `--lookup-chain` 一致：查询 = 「历史后缀 + 已产出的草稿」，
             // 命中就从"那个更早的位置之后"取 token。**只改提哪些草稿**，被采纳与否仍由主干验证决定。
             // ⚠️ `chose` 时**不能**把 lookup 草稿记成 MTP 产的（否则 `sd_acc` 恒 0，
             // 上一版就是这么把自己的成绩单写错的）

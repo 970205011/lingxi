@@ -1,7 +1,7 @@
 //! MTP（多 token 预测）草稿层：权重加载 + **stem**。
 //!
 //! 规格与权威参考见：
-//! - 前向顺序取自 **Strata 的 `src/core/mtp.cpp` L669–693**（跑过 `--mtp`、已验证）；
+//! - 前向顺序取自 **同类开源参考实现的 MTP 前向** L669–693 段落（跑过 `--mtp`、已验证）；
 //! - 图结构对照 llama.cpp `qwen3next.cpp::graph_mtp`（L627–755）；
 //! - **不照抄 ninfer**（用户明确：它的 MTP 接受率是错的）。
 //!
@@ -119,7 +119,7 @@ pub fn load(k: &Kernels, art: &Artifact) -> Result<MtpWeights> {
 
 /// **MTP stem**：`(Rin[T, HC*N], emb[T, N]) -> R[T, HC*N]`。
 ///
-/// 逐字对应 （Strata `src/core/mtp.cpp` L669–693）：
+/// 逐字对应同类开源参考实现（mtp.cpp L669–693）：
 /// `text
 /// en = RMSNorm_N(emb, embedding_norm) // 整段 N 宽
 /// e2 = fc_embedding @ en // [T, N]
@@ -161,7 +161,7 @@ pub fn stem(
     // | **stream** | **3.67/6** | **41.0 / 41.0** | **81.6 / 81.6** |
     // 逐位条件接受率（位 0→5）：pooled 0.98/0.68/0.83/1.00/0.76/0.68；
     // **stream 0.98/0.79/0.79/0.96/0.72/0.78** ⇒ 位 1 是主要改善点。
-    // 旁证：① Strata `src/core/mtp.cpp:686` 的注释明写逐 stream 才是
+    // 旁证：① 同类开源参考实现的注释明写逐 stream 才是
     // **"as llama.cpp's qwen4exp MTP graph does"**；② 同机同模型的「顺子」
     // 开着 `--mtp-hnorm stream`（峰值 +3.7%）且 MTP 接受率 93~99%。
     // ⚠️ 测量陷阱：第一次 A/B 是"pooled 先跑、stream 后跑"，stream 那轮温度上来了
@@ -169,12 +169,12 @@ pub fn stem(
     let pooled = std::env::var("LINGXI_MTP_HNORM").map(|v| v == "pooled").unwrap_or(false);
     let mut hn = scratch::bf16(k, rows * n)?;
     if pooled {
-        // 整段：一条 10240 的 RMS，gamma 全场乘一遍（Strata 的默认分支）
+        // 整段：一条 10240 的 RMS，gamma 全场乘一遍（其默认分支）
         k.grouped_rmsnorm_bf16(rin, &w.hidden_norm, &mut hn, t as u32, hc * n, hc * n, eps)?;
     } else {
         // 逐 stream：`[T, HC*N]` 当作 `[T*HC, N]` 的行，每行单独 norm；
         // `grouped_rmsnorm` 的 gamma 按**绝对列**索引（`gamma[gi*group + i]`）⇒ 正好等于
-        // gamma 的第 gi 片 ⇒ 与 Strata 的 `native_qsa_rms_norm_grouped(N, HC, T*HC)` 同义。
+        // gamma 的第 gi 片 ⇒ 与其 `native_qsa_rms_norm_grouped(N, HC, T*HC)` 同义。
         k.grouped_rmsnorm_bf16(rin, &w.hidden_norm, &mut hn, t as u32, hc * n, n, eps)?;
     }
     let mut h2 = scratch::bf16(k, rows * n)?;

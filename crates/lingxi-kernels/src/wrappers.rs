@@ -6,7 +6,7 @@ use anyhow::Result;
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaView, CudaViewMut, DevicePtr,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr,
     DevicePtrMut, LaunchConfig,
     PushKernelArg,
 };
@@ -112,7 +112,7 @@ fn no_rec_reg() -> bool {
     *V.get_or_init(|| std::env::var("LINGXI_NO_GDN_REC_REG").map(|v| v != "0").unwrap_or(false))
 }
 
-/// 补3 `LINGXI_GDN_PREFETCH=1`：递推寄存器核的**提前一拍预载**（门/v/z 标量
+/// `LINGXI_GDN_PREFETCH=1`：递推寄存器核的**提前一拍预载**（门/v/z 标量
 /// 旋转寄存器 + q/k 行 L2 预取）。逐位等价（纯搬运/预取提示，算术一字未动）；
 /// 默认关，A/B 跑赢后翻转。读点 gdn_ops.cu::lingxi_gdn_recurrent_reg_bf16。
 fn gdn_prefetch_on() -> bool {
@@ -132,7 +132,7 @@ fn gdn_pipe_on() -> bool {
 impl Kernels {
     pub fn load(ordinal: usize) -> Result<Self> {
         let ctx = CudaContext::new(ordinal)?;
-        // ── [] `LINGXI_MEMPOOL_KEEP=1`：默认内存池 RELEASE_THRESHOLD 0 → u64::MAX ──
+        // ── `LINGXI_MEMPOOL_KEEP=1`：默认内存池 RELEASE_THRESHOLD 0 → u64::MAX ──
         // 根因（2026-10-27 判决实验）：cudarc 的 `alloc` 在 V100 上走 `cuMemAllocAsync`
         // （默认内存池），池默认阈值 0 ⇒ **每个同步点**把空闲块 cuMemUnmap 还回驱动、
         // 下次分配重新映射触页。prefill t=512 下 s 相关 scratch（xg/gu_all/o_all，
@@ -481,6 +481,12 @@ impl Kernels {
             attn2s_sparse_kvq8_bf16: attn.load_function("lingxi_attn2s_sparse_kvq8_bf16")?,
             attn3_masked_kvq8_bf16: attn.load_function("lingxi_attn3_masked_kvq8_bf16")?,
             attn5_sparse_kvq8_bf16: attn.load_function("lingxi_attn5_sparse_kvq8_bf16")?,
+            attn2_masked_kvfp8_bf16: attn.load_function("lingxi_attn2_masked_kvfp8_bf16")?,
+            attn2s_sparse_kvfp8_bf16: attn.load_function("lingxi_attn2s_sparse_kvfp8_bf16")?,
+            attn3_masked_kvfp8_bf16: attn.load_function("lingxi_attn3_masked_kvfp8_bf16")?,
+            attn5_sparse_kvfp8_bf16: attn.load_function("lingxi_attn5_sparse_kvfp8_bf16")?,
+            quant_rows_fp8g32_bf16: attn.load_function("lingxi_quant_rows_fp8g32_bf16")?,
+            quant_rows_fp8g32_res_bf16: attn.load_function("lingxi_quant_rows_fp8g32_res_bf16")?,
             quant_rows_e4m3_bf16: attn.load_function("lingxi_quant_rows_e4m3_bf16")?,
             qsa_pool_block_bf16: attn.load_function("lingxi_qsa_pool_block_bf16")?,
             qsa_pool_blocks_bf16: attn.load_function("lingxi_qsa_pool_blocks_bf16")?,
@@ -553,7 +559,7 @@ impl Kernels {
             causal_conv1d_silu_hist_bf16: gdn.load_function("lingxi_causal_conv1d_silu_hist_bf16")?,
             gdn_recurrent_bf16: {
                 let f = gdn.load_function("lingxi_gdn_recurrent_bf16")?;
-                // P15-㉘：S(hk×hv fp32，本模型 64KB) 动态 smem 驻留。
+                // S(hk×hv fp32，本模型 64KB) 动态 smem 驻留。
                 // 上限不能顶到 96KB：每 block 预算还要扣静态 smem(ssum) 与 1KB 保留，
                 // 顶满会 CUDA_ERROR_INVALID_VALUE（实测）。
                 f.set_attribute(
@@ -875,14 +881,14 @@ impl Kernels {
 
     // ───────────────────────── MoE ─────────────────────────
 
-    /// 融合 SwiGLU：`x[m, 2*inter] → y[m, inter]`，`y = silu(x[:,:inter]) * x[:, inter:]`。
+    /// 融合 SwiGLU：`x[m, 2*inter] → y[m, inter]`，`y = silu(x[:, :inter]) * x[:, inter:]`。
     pub fn swiglu_bf16(&self, x: &CudaSlice<bf16>, y: &mut CudaSlice<bf16>, m: usize, inter: usize) -> Result<()> {
         let x_v = x.slice(0..x.len());
         let mut y_v = y.slice_mut(0..y.len());
         self.swiglu_bf16_view(&x_v, &mut y_v, m, inter)
     }
 
-    /// 同 [`Self::swiglu_bf16`]，但源/目标取**视图**（㊶ hit/miss 重叠的逐段 swiglu；
+    /// 同 [`Self::swiglu_bf16`]，但源/目标取**视图**（hit/miss 重叠的逐段 swiglu；
     /// 元素级按对独立 ⇒ 切段逐位不变）。
     pub fn swiglu_bf16_view(
         &self, x: &cudarc::driver::CudaView<'_, bf16>,
@@ -1030,7 +1036,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// 就地行缩放广播：`x[row,:] *= s[row]`。
+    /// 就地行缩放广播：`x[row, :] *= s[row]`。
     pub fn row_scale_inplace_bf16(
         &self, x: &mut CudaSlice<bf16>, s: &CudaSlice<bf16>, rows: usize, cols: usize,
     ) -> Result<()> {
@@ -1075,6 +1081,34 @@ impl Kernels {
         };
         unsafe {
             self.stream.launch_builder(&self.gemv_bf16)
+                .arg(&w).arg(&x).arg(&y)
+                .arg(&(n as i32)).arg(&(k as i32))
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// `gemv_bf16_ptr` 的**指定流**版：router lookahead 预测 GEMV 专用。预测必须
+    /// 挂在 compute 流之外（stream2）——路由段末尾有一次全流同步，预测若挂
+    /// compute 流会把 ~50µs 加进每层的同步等待。同核同参，仅换发射流。
+    pub fn gemv_bf16_ptr_stream(
+        &self,
+        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        w: u64,
+        x: u64,
+        y: u64,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        let warps_per_block = (BLOCK / 32) as usize;
+        let blocks = ((n + warps_per_block - 1) / warps_per_block).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            s.launch_builder(&self.gemv_bf16)
                 .arg(&w).arg(&x).arg(&y)
                 .arg(&(n as i32)).arg(&(k as i32))
                 .launch(cfg)?;
@@ -1181,7 +1215,7 @@ impl Kernels {
             block_dim: (256, 1, 1),
             shared_mem_bytes: 8 * 1024 * 2,
         };
-        // ㊽+9 M≤8 行槽核（`LINGXI_Q4GEMM_S8=1`）：lane=(行槽,列槽) 各累加一行，
+        // M≤8 行槽核（`LINGXI_Q4GEMM_S8=1`）：lane=(行槽,列槽) 各累加一行，
         // x smem 读降到 1/6 且 int4 向量化；有损档（归约次序 ≠ 旧核）。
         static S8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_s8 = *S8.get_or_init(|| std::env::var("LINGXI_Q4GEMM_S8").map(|v| v != "0").unwrap_or(false));
@@ -1547,7 +1581,7 @@ impl Kernels {
     // 【已删除·负结果留档】稠密 Q4 GEMV 的"行循环版"（限 grid、每 warp 扫多行）——
     // 2026-10-24 实测：n=248320 时旧核 591 GB/s，行循环版按 grid 160→5120 只有
     // 278/437/420/505/518/537 GB/s。**"限 grid 省 block 调度开销"这个猜想是错的，大 grid 更好。**
-    // 核、封装、`Kernels` 字段与对拍测试全部删除；细节。
+    // 核、封装、`Kernels` 字段与对拍测试全部删除。
 
     /// mwide：小 k 大 m 瘦长 GEMM（裸指针；逐位等价于 `gemm_skinny_m8` 分块路，
     /// 见 moe_ops.cu 头注）。零 smem，x 走 L1/L2；CTA=4 输出行 × 行块 32，
@@ -1638,7 +1672,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// 合并：`expert_out[r,:] = Σ_{s: rows_of[s] == r} w[s] * o[s,:]`（f32 累加、一次 round）。
+    /// 合并：`expert_out[r, :] = Σ_{s : rows_of[s] == r} w[s] * o[s, :]`（f32 累加、一次 round）。
     pub fn moe_combine_rows_bf16(
         &self, o: &CudaSlice<bf16>, rows_of: &CudaSlice<i32>, w: &CudaSlice<f32>,
         expert_out: &mut CudaSlice<bf16>, s: usize, rows: usize, hidden: usize,
@@ -1657,7 +1691,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// 合并+残差一发融合（㊶）：`out[r,:] = bf16(f32(bf16(Σ w·o)) + f32(shared[r,:]))`，
+    /// 合并+残差一发融合：`out[r,:] = bf16(f32(bf16(Σ w·o)) + f32(shared[r,:]))`，
     /// 与 `moe_combine_rows_bf16` + `add_bf16` 两次舍入同序 ⇒ 逐位相同。
     pub fn moe_combine_add_rows_bf16(
         &self, o: &CudaSlice<bf16>, rows_of: &CudaSlice<i32>, w: &CudaSlice<f32>,
@@ -1678,7 +1712,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊾ CSR 版合并+残差：`col/row_off` 为"行 → 升序对下标"的 CSR（host 稳定计数排序）。
+    /// CSR 版合并+残差：`col/row_off` 为"行 → 升序对下标"的 CSR（host 稳定计数排序）。
     /// 每行累加次序与 [`Self::moe_combine_add_rows_bf16`] 的"升序 s 扫描"一致 ⇒ 逐位相同；
     /// 复杂度 O(rows×H×top_k)，batch 路径（S 数千）用它，旧核留给 S 小的路径。
     pub fn moe_combine_add_csr_bf16(
@@ -1746,7 +1780,7 @@ impl Kernels {
         heads: usize, kv_heads: usize, t: usize, tk: usize, head_dim: usize, scale: f32,
     ) -> Result<()> {
         if head_dim <= BLOCK as usize && tk > 0 && head_dim % 8 == 0 {
-            // ★ P15-㊳ 行块平铺（attn3）：t ≥ 8 且 head_dim==256 时一个 block 喂 8 行，
+            // ★ 行块平铺（attn3）：t ≥ 8 且 head_dim==256 时一个 block 喂 8 行，
             // K/V 流量 ÷8——prefill 的 O(chunk×T) attention 是 256K TTFT 的元凶。
             // 每行归约次序与 attn2 逐项相同（bit-safe）；`LINGXI_NO_ATTN3=1` 回退 attn2 对拍。
             const ATT3_R: usize = 4;
@@ -1799,7 +1833,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ★ P15-㊵ **跳块稀疏注意力**（QSA）：只算 keep 选中块 + 因果前缀内的点积，
+    /// ★ **跳块稀疏注意力**（QSA）：只算 keep 选中块 + 因果前缀内的点积，
     /// 未选中位置按 dense 精确语义跳过（-FLT_MAX / -inf 两档，含退化整行无可见位情形，
     /// 见 attn_ops.cu 的 state_j 注释）。对拍开关 `LINGXI_QSA_DENSE=1`（走旧掩码路径）。
     /// `vis_base` = 已缓存 token 数（state.len）；`cshift` = log2(compress)，compress 必须 2 的幂。
@@ -1846,7 +1880,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊶ KV 量化（E4M3）版跳块稀疏注意力：`k_q8/k_sc/v_q8/v_sc` 为量化 cache +
+    /// KV 量化（E4M3）版跳块稀疏注意力：`k_q8/k_sc/v_q8/v_sc` 为量化 cache +
     /// 每 (行, kv头) scale。**有损**（`LINGXI_KV_K8V4` 门控），分派结构与
     /// [`Self::attn_sparse_bf16`] 相同（t≥4 → attn5q，否则 attn2sq）。
     #[allow(clippy::too_many_arguments)]
@@ -1897,7 +1931,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊶ KV 量化（E4M3）版带掩码注意力（host_fallback / dense 回退路径用，有损、门控）。
+    /// KV 量化（E4M3）版带掩码注意力（host_fallback / dense 回退路径用，有损、门控）。
     #[allow(clippy::too_many_arguments)]
     pub fn attn_masked_kvq8_bf16(
         &self, q: &CudaSlice<bf16>, k: &CudaSlice<bf16>, v: &CudaSlice<bf16>,
@@ -1943,7 +1977,115 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊶ bf16 行组量化到 E4M3：`x[rows, heads, head_dim]` → 字节 `q`（同形）+
+    /// **FP8-G32/int8-G32** KV 版跳块稀疏注意力（`LINGXI_KV_FP8` 门控，有损）：
+    /// E4M3/int8 数据平面 + 每 32 维一组 f16 scale。分派结构与
+    /// [`Self::attn_sparse_kvq8_bf16`] 相同（t≥4 → attn5，否则 attn2s）。
+    /// `k_res`/`v_res` + `kv_sink`/`kv_qlo`/`kv_rcap` = KIVI 式残差窗
+    /// （bf16 残差平面；`kv_rcap=0` 即关，调用方传 stub）；`f8_mode` 0=E4M3 / 1=int8。
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_sparse_kvfp8_bf16(
+        &self, q: &CudaSlice<bf16>, k: &CudaSlice<bf16>, v: &CudaSlice<bf16>,
+        keep: &CudaSlice<u8>, vis_base: usize, nblocks: usize, cshift: u32,
+        out: &mut CudaSlice<bf16>,
+        heads: usize, kv_heads: usize, t: usize, tk: usize, head_dim: usize, scale: f32,
+        k_f8: &CudaSlice<u8>, k_f8s: &CudaSlice<half::f16>,
+        v_f8: &CudaSlice<u8>, v_f8s: &CudaSlice<half::f16>,
+        k_res: &CudaSlice<bf16>, v_res: &CudaSlice<bf16>,
+        kv_sink: i32, kv_qlo: i32, kv_rcap: i32, f8_mode: i32,
+    ) -> Result<()> {
+        assert!(tk > 0 && head_dim == 256, "attn_sparse_kvfp8 仅支持 head_dim=256");
+        const ATT3_R: usize = 4;
+        if t >= ATT3_R {
+            let smem = ATT3_R * 512 * 4 + 32 * 4;
+            let cfg = LaunchConfig {
+                grid_dim: (((t + ATT3_R - 1) / ATT3_R) as u32, heads as u32, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            unsafe {
+                self.stream.launch_builder(&self.attn5_sparse_kvfp8_bf16)
+                    .arg(q).arg(k).arg(v).arg(keep).arg(out)
+                    .arg(&(heads as i32)).arg(&(kv_heads as i32))
+                    .arg(&(t as i32)).arg(&(tk as i32))
+                    .arg(&(head_dim as i32)).arg(&scale)
+                    .arg(&(vis_base as i32)).arg(&(nblocks as i32)).arg(&(cshift as i32))
+                    .arg(k_f8).arg(k_f8s).arg(v_f8).arg(v_f8s)
+                    .arg(k_res).arg(v_res).arg(&kv_sink).arg(&kv_qlo).arg(&kv_rcap).arg(&f8_mode)
+                    .launch(cfg)?;
+            }
+            return Ok(());
+        }
+        let tile = tk.min(4096);
+        let cfg = LaunchConfig {
+            grid_dim: (t as u32, heads as u32, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: (tile * 4 + 32 * 4) as u32,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.attn2s_sparse_kvfp8_bf16)
+                .arg(q).arg(k).arg(v).arg(keep).arg(out)
+                .arg(&(heads as i32)).arg(&(kv_heads as i32)).arg(&(t as i32)).arg(&(tk as i32))
+                .arg(&(head_dim as i32)).arg(&scale).arg(&(tile as i32))
+                .arg(&(vis_base as i32)).arg(&(nblocks as i32)).arg(&(cshift as i32))
+                .arg(k_f8).arg(k_f8s).arg(v_f8).arg(v_f8s)
+                .arg(k_res).arg(v_res).arg(&kv_sink).arg(&kv_qlo).arg(&kv_rcap).arg(&f8_mode)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// **FP8-G32/int8-G32** KV 版带掩码注意力（host_fallback / dense 回退路径用，
+    /// 有损、门控）。残差窗参数语义同 [`Self::attn_sparse_kvfp8_bf16`]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_masked_kvfp8_bf16(
+        &self, q: &CudaSlice<bf16>, k: &CudaSlice<bf16>, v: &CudaSlice<bf16>,
+        mask: &CudaSlice<f32>, out: &mut CudaSlice<bf16>,
+        heads: usize, kv_heads: usize, t: usize, tk: usize, head_dim: usize, scale: f32,
+        k_f8: &CudaSlice<u8>, k_f8s: &CudaSlice<half::f16>,
+        v_f8: &CudaSlice<u8>, v_f8s: &CudaSlice<half::f16>,
+        k_res: &CudaSlice<bf16>, v_res: &CudaSlice<bf16>,
+        kv_sink: i32, kv_qlo: i32, kv_rcap: i32, f8_mode: i32,
+    ) -> Result<()> {
+        assert!(tk > 0 && head_dim == 256, "attn_masked_kvfp8 仅支持 head_dim=256");
+        const ATT3_R: usize = 4;
+        if t >= ATT3_R {
+            let smem = ATT3_R * 512 * 4 + 32 * 4;
+            let cfg = LaunchConfig {
+                grid_dim: (((t + ATT3_R - 1) / ATT3_R) as u32, heads as u32, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: smem as u32,
+            };
+            unsafe {
+                self.stream.launch_builder(&self.attn3_masked_kvfp8_bf16)
+                    .arg(q).arg(k).arg(v).arg(mask).arg(out)
+                    .arg(&(heads as i32)).arg(&(kv_heads as i32))
+                    .arg(&(t as i32)).arg(&(tk as i32))
+                    .arg(&(head_dim as i32)).arg(&scale)
+                    .arg(k_f8).arg(k_f8s).arg(v_f8).arg(v_f8s)
+                    .arg(k_res).arg(v_res).arg(&kv_sink).arg(&kv_qlo).arg(&kv_rcap).arg(&f8_mode)
+                    .launch(cfg)?;
+            }
+            return Ok(());
+        }
+        let tile = tk.min(4096);
+        let cfg = LaunchConfig {
+            grid_dim: (t as u32, heads as u32, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: (tile * 4 + 32 * 4) as u32,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.attn2_masked_kvfp8_bf16)
+                .arg(q).arg(k).arg(v).arg(mask).arg(out)
+                .arg(&(heads as i32)).arg(&(kv_heads as i32)).arg(&(t as i32)).arg(&(tk as i32))
+                .arg(&(head_dim as i32)).arg(&scale).arg(&(tile as i32))
+                .arg(k_f8).arg(k_f8s).arg(v_f8).arg(v_f8s)
+                .arg(k_res).arg(v_res).arg(&kv_sink).arg(&kv_qlo).arg(&kv_rcap).arg(&f8_mode)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// bf16 行组量化到 E4M3：`x[rows, heads, head_dim]` → 字节 `q`（同形）+
     /// 每 (row, head) scale `sc[rows*heads]`（= amax/448，全零行 = 1）。有损、门控。
     /// `q`/`sc` 取**视图**（调用方常传 cache 的行区间切片）。
     pub fn quant_rows_e4m3_bf16(
@@ -1960,6 +2102,59 @@ impl Kernels {
             self.stream.launch_builder(&self.quant_rows_e4m3_bf16)
                 .arg(x).arg(q).arg(sc)
                 .arg(&(rows as i32)).arg(&(heads as i32)).arg(&(head_dim as i32))
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// **FP8-G32/int8-G32** 行组量化（KV FP8 探索档 `LINGXI_KV_FP8`，有损、env 门控）：
+    /// `x[rows, heads, head_dim]` → 字节 `q`（同形，E4M3/int8 由 `mode` 定）+
+    /// 每 **32 维一组** f16 scale `sc[rows*heads*(head_dim/32)]`（E4M3 = amax/448，
+    /// int8 = amax/127，全零组 = 1）。与 [`Self::quant_rows_e4m3_bf16`] 的差别只在
+    /// scale 粒度（行级 f32 → 32 维组 f16，细粒度分组 KV 量化）——这是
+    /// K8V4 质量翻车后本档的核心改动。`q`/`sc` 取**视图**（调用方常传 cache 的行区间切片）。
+    pub fn quant_rows_fp8g32_bf16(
+        &self, x: &CudaSlice<bf16>, q: &mut cudarc::driver::CudaViewMut<'_, u8>,
+        sc: &mut cudarc::driver::CudaViewMut<'_, half::f16>,
+        rows: usize, heads: usize, head_dim: usize, mode: i32,
+    ) -> Result<()> {
+        assert!(head_dim % 32 == 0, "quant_rows_fp8g32 需要 head_dim%32==0");
+        let cfg = LaunchConfig {
+            grid_dim: ((rows * heads) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.quant_rows_fp8g32_bf16)
+                .arg(x).arg(q).arg(sc)
+                .arg(&(rows as i32)).arg(&(heads as i32)).arg(&(head_dim as i32)).arg(&mode)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// **FP8-G32/int8-G32 残差窗 flush 量化**（KIVI 式，`LINGXI_KV_FP8_RESIDUAL`）：
+    /// 把 bf16 残差平面 `[row0, row0+rows)` 行（源按残差布局寻址：sink 段线性 +
+    /// 尾窗环 `sink + (r-sink) % rcap`）量化进压缩平面的**绝对行号**位置。
+    /// 一次 launch 天然处理环回绕。`mode` 语义同 [`Self::quant_rows_fp8g32_bf16`]。
+    pub fn quant_rows_fp8g32_res_bf16(
+        &self, x: &CudaSlice<bf16>, q: &mut cudarc::driver::CudaViewMut<'_, u8>,
+        sc: &mut cudarc::driver::CudaViewMut<'_, half::f16>,
+        row0: usize, rows: usize, sink: usize, rcap: usize,
+        heads: usize, head_dim: usize, mode: i32,
+    ) -> Result<()> {
+        assert!(head_dim % 32 == 0, "quant_rows_fp8g32_res 需要 head_dim%32==0");
+        let cfg = LaunchConfig {
+            grid_dim: ((rows * heads) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.quant_rows_fp8g32_res_bf16)
+                .arg(x).arg(q).arg(sc)
+                .arg(&(row0 as i32)).arg(&(rows as i32))
+                .arg(&(sink as i32)).arg(&(rcap as i32))
+                .arg(&(heads as i32)).arg(&(head_dim as i32)).arg(&mode)
                 .launch(cfg)?;
         }
         Ok(())
@@ -2032,7 +2227,7 @@ impl Kernels {
     /// GDN 递推核心（gated delta rule + RMSNormGated），**就地**推进 `s_all` T 个 token。
     /// 与 host 参考 `recurrent_core` 逐条对应；`gate_act`：0=silu 1=sigmoid。
     #[allow(clippy::too_many_arguments)]
-    /// ★ P15-㉟ 并发批：`n_seq > 1` 时一个 batch 里 N 条序列各推 `t` 行（状态 seq-major
+    /// ★ 并发批：`n_seq > 1` 时一个 batch 里 N 条序列各推 `t` 行（状态 seq-major
     /// 连续排列，输入行按 seq 交错）。`n_seq == 1` 时与旧行为**逐位一致**。
     pub fn gdn_recurrent_bf16(
         &self, conv: &CudaSlice<bf16>, z: &CudaSlice<bf16>,
@@ -2042,16 +2237,16 @@ impl Kernels {
         t: usize, hk: usize, hv: usize, num_v_heads: usize, num_k_heads: usize,
         gate_act: i32, row_off: usize, n_seq: usize,
     ) -> Result<()> {
-        // P15-㉘：S 一次性驻留动态 smem（≤96KB 时启用；实测批量预载后全局路径 18µs 胜出）
+        // S 一次性驻留动态 smem（≤96KB 时启用；实测批量预载后全局路径 18µs 胜出）
         // ⇒ smem 默认关，仅 LINGXI_GDN_SMEM=1 时开（留档 A/B）。
         let smem = hk * hv * 4;
         let use_smem = smem <= 96 * 1024 && std::env::var("LINGXI_GDN_SMEM").is_ok();
-        // ★：hk=hv=128、单序列 ⇒ 走 **state 常驻寄存器版**（逐位相同，微基准 2.6×）。
+        // ★ hk=hv=128、单序列 ⇒ 走 **state 常驻寄存器版**（逐位相同，微基准 2.6×）。
         // 其余形状（并发批 n_seq>1、非 128 头）与 `LINGXI_GDN_SMEM=1` 的 A/B 档走旧核。
         // `LINGXI_NO_GDN_REC_REG=1` 回退（A/B 用）。
         let rec_reg = hk == 128 && hv == 128 && n_seq <= 1 && !use_smem && !no_rec_reg();
         let prefetch: i32 = if rec_reg && gdn_prefetch_on() { 1 } else { 0 };
-        //：流水版仅 reg 核承载（隐含 prefetch 语义）；旧核签名一字未动。
+        // 流水版仅 reg 核承载（隐含 prefetch 语义）；旧核签名一字未动。
         let pipe: i32 = if rec_reg && gdn_pipe_on() { 1 } else { 0 };
         let cfg = LaunchConfig {
             grid_dim: (num_v_heads as u32 * n_seq.max(1) as u32, 1, 1),
@@ -2086,10 +2281,9 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㉟+1 GDN 递推**多 warp 占用率版**（`gdn_ops.cu`）：同 [`Self::gdn_recurrent_bf16`]
+    /// GDN 递推**多 warp 占用率版**（`gdn_ops.cu`）：同 [`Self::gdn_recurrent_bf16`]
     /// 语义，但 dk 维拆到 4 组线程（block = hv×4 = 512 线程），每步三次跨 split 定序
-    /// 归约走 shared。**有损档**（跨 split 归约次序 ≠ 旧核单线程升序；PLAN_NEXT 
-    /// 判据）。只支持 `n_seq == 1`；要求 hv ≤ 128（shared 归约缓冲）。
+    /// 归约走 shared。**有损档**（跨 split 归约次序 ≠ 旧核单线程升序；有损档判据）。只支持 `n_seq == 1`；要求 hv ≤ 128（shared 归约缓冲）。
     pub fn gdn_recurrent_mw_bf16(
         &self, conv: &CudaSlice<bf16>, z: &CudaSlice<bf16>,
         a: &CudaSlice<bf16>, b: &CudaSlice<bf16>, norm_w: &CudaSlice<bf16>,
@@ -2199,7 +2393,7 @@ impl Kernels {
         )
     }
 
-    /// ㊼ Q4 专家**张量核** GEMM（Volta `mma.sync.m8n8k4`，QPN 8×32 映射）。
+    /// Q4 专家**张量核** GEMM（Volta `mma.sync.m8n8k4`，QPN 8×32 映射）。
     /// 一个 CTA 服务一个专家（`blockIdx.y`），`t` = 该专家命中行数（≤8 用 t1，9..16 用 t2）。
     /// 存储布局与 [`Self::gemv_q4g64_slotsm_rpw_bf16`] 完全相同（group64 / 32 code B / 2 scale B），
     /// 所以**不需要换权重产物**；数值是"fp16(权重×scale) 进张量核"，比 SIMT 的 f32 scale 差 ~2^-11
@@ -2258,7 +2452,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊽ Q4 专家张量核 GEMM —— **prefill 大 tile 版**（`LINGXI_MOE_TC=1` 且 rows>16 时用）。
+    /// Q4 专家张量核 GEMM —— **prefill 大 tile 版**（`LINGXI_MOE_TC=1` 且 rows>16 时用）。
     /// 与 [`Self::gemv_q4g64_slots_tc_bf16`] 同布局（group64，无需换权重产物），区别：
     /// CTA = 64 token 行 × 128 输出行（2×4 warp，每 warp QPN 32×32），M 轴按
     /// `ceil(tmax/64)` 进 grid.z，**任意大的组一次 launch 全覆盖**；x 按 k-group 进
@@ -2300,7 +2494,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊽+5 Q4G64 版大 m 摊销投影核（`q4_mlarge.cu`）：mlarge tiling + 核内
+    /// Q4G64 版大 m 摊销投影核（`q4_mlarge.cu`）：mlarge tiling + 核内
     /// 反量化（k-tile 64 = 一个 scale 组）。要求 `k % 64 == 0`。
     /// `LINGXI_NO_Q4MLARGE=1` 回退 gemm_q4_skinny。
     #[allow(clippy::too_many_arguments)]
@@ -2325,12 +2519,12 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊽+6 Q4 稠密投影 TCP MMA + 大 m 摊销核（`q4_tcp_dense.cu`）：
+    /// Q4 稠密投影 TCP MMA + 大 m 摊销核（`q4_tcp_dense.cu`）：
     /// `y[m,n] = x[m,k] · dequant(Q4G64 W[n,k])ᵀ`，CTA = 128 输出行 × 64 token 行，
     /// x 每 k-group 进 shared 一遍、权重被 64 token 行摊销，dequant 的 B 片段直接喂
     /// Volta MMA（ALU 链被摊销 —— q4_mlarge 缺的那一环）。要求 `k % 64 == 0`
     /// （调用方以 `kdim` 传 k、`wq.k_pad` 传 k_pad）。
-    /// 数值口径同 q4_tcp（有损档，判据 PLAN_NEXT）。`LINGXI_NO_Q4TCPDENSE=1` 回退。
+    /// 数值口径同 q4_tcp（有损档）。`LINGXI_NO_Q4TCPDENSE=1` 回退。
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_q4_tcp_dense_ptr(
         &self, wq: u64, x: u64, y: u64, n: usize, k: usize, k_pad: usize, m: usize,
@@ -2385,9 +2579,9 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊽+4 稠密投影大 m 摊销核（`mlarge.cu`）：`y[m,n] = x[m,k] · W[n,k]ᵀ`，
+    /// 稠密投影大 m 摊销核（`mlarge.cu`）：`y[m,n] = x[m,k] · W[n,k]ᵀ`，
     /// CTA = 8 输出行 × 64 token 行、k-tile 64 进 smem。要求 `k % 64 == 0`。
-    /// 每元素 k 升序串行累加（有损档 vs row 核，判据 PLAN_NEXT）。`LINGXI_NO_MLARGE=1` 回退。
+    /// 每元素 k 升序串行累加（有损档 vs row 核）。`LINGXI_NO_MLARGE=1` 回退。
     pub fn gemm_bf16_mlarge_ptr(
         &self, w: u64, x: u64, y: u64, n: usize, k: usize, m: usize,
         epi: i32, a: f32, b: f32,
@@ -2411,7 +2605,7 @@ impl Kernels {
     /// 稠密 bf16 投影 Volta MMA 核（`bf16_tcp.cu`）：`y[m,n] = x[m,k] · W[n,k]ᵀ`，
     /// q4_tcp_dense 骨架去反量化——CTA = 128 输出行 × 64 token 行，mma.m8n8k4，
     /// x 舞台 bf16→fp16 一次 CVT、W lane 内 8 元素 CVT 直接喂 B 片段。要求 `k % 64 == 0`。
-    /// **有损档**（fp16 乘 + fp32 累加 vs SIMT f32 FMA，判据 PLAN_NEXT），
+    /// **有损档**（fp16 乘 + fp32 累加 vs SIMT f32 FMA），
     /// `LINGXI_PROJ_TC=1` 才由 gpu.rs 分流（默认关）。epi 语义同 skinny 族。
     pub fn gemm_bf16_tcp_ptr(
         &self, w: u64, x: u64, y: u64, n: usize, k: usize, m: usize,
@@ -2433,7 +2627,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊽+3 Q3 版 prefill 大 tile 张量核（`q3_tcp.cu`）：语义与参数和
+    /// Q3 版 prefill 大 tile 张量核（`q3_tcp.cu`）：语义与参数和
     /// [`Self::gemv_q4g64_slots_tcp_bf16_view`] 完全一致，仅权重布局/反量化不同
     ///（k_pad 必须是 128 的倍数；每行每组 48 code B）。`LINGXI_MOE_TC=1` 门控。
     #[allow(clippy::too_many_arguments)]
@@ -2476,7 +2670,7 @@ impl Kernels {
     /// 乐观发射档（Q4）：与 [`Self::gemv_q4g64_slots_tcp_bf16_view`] 同参同算术，
     /// 但 `e_uniq` 是 **host 上界**（真实组数由 `group_off` 设备侧早退守卫），
     /// 行块按组大小核内循环（无 `tmax` 形参）⇒ 可在 pair 建表核完成前入队。
-    /// 调用方保证 `group_off` 尾部已清零（pair 建表核负责，）。
+    /// 调用方保证 `group_off` 尾部已清零（pair 建表核负责）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4g64_slots_tcp_bf16_dyn_view(
         &self, slots: &CudaSlice<u8>, slot_ids: &cudarc::driver::CudaView<'_, i32>,
@@ -2550,7 +2744,7 @@ impl Kernels {
     }
 
     /// 同 [`Self::gemv_q4g64_slots_rows_bf16`]，但 `slot_ids`/`x`/`y` 取**视图**——
-    /// ㊶ hit/miss 重叠按区间拆 launch 时切子段传（每对的输出区间互不相交 ⇒ 逐位不变）。
+    /// hit/miss 重叠按区间拆 launch 时切子段传（每对的输出区间互不相交 ⇒ 逐位不变）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4g64_slots_rows_bf16_view(
         &self, slots: &CudaSlice<u8>, slot_ids: &cudarc::driver::CudaView<'_, i32>,
@@ -3147,7 +3341,7 @@ impl Kernels {
         )
     }
 
-    /// Q3G128 版 `gemv_q4g64_slots_rows_bf16_view`（㊶ hit/miss 拆段切子段传）。
+    /// Q3G128 版 `gemv_q4g64_slots_rows_bf16_view`（hit/miss 拆段切子段传）。
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q3g128_slots_rows_bf16_view(
         &self, slots: &CudaSlice<u8>, slot_ids: &cudarc::driver::CudaView<'_, i32>,
@@ -3307,7 +3501,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// **Q4 t2 档 + 设备侧组数上界**。
+    /// **Q4 t2 档 + 设备侧组数上界**（A' 的地基）。
     ///
     /// 与 `gemv_q4g64_slotsm_rpw_bf16_view_gidx`（tier 档、rpw=1、xf=0）**同一个核体、逐位相同**；
     /// 区别只有：`grid.y = e_max`（上界）而不是精确的 `e_uniq`，入口按 `*ng_dev` 早退。
@@ -3338,7 +3532,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// **Q3 t2 档 + 设备侧组数上界**。
+    /// **Q3 t2 档 + 设备侧组数上界**（A' 的地基）。
     ///
     /// 与 [`Self::gemv_q3g128_slotsm_t2_view_gidx`] 同一个核体、**逐位相同**；区别只有两点：
     /// * `grid.y = e_max`（调用方给上界，如 `s = rows×top_k`），而不是精确的 `ng`；
@@ -3434,7 +3628,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// `slotsm` 的 **dp4a/int8-x** 变体（P15-㉖）：结构同
+    /// `slotsm` 的 **dp4a/int8-x** 变体：结构同
     /// [`Self::gemv_q4g64_slotsm_rpw_bf16_view`]，但 x 走 int8（`xq`，每行 scale `sx`），
     /// 内积用 `__dp4a`。**非位等价**（x 量化到 int8）⇒ 调用方必须已用判据验收
     /// （`LINGXI_MOE_DP4A` 开关，默认关）。
@@ -3745,7 +3939,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ★：**池化 + RMSNorm + RoPE + 落盘 四发合一**（与四发逐位相同）。
+    /// ★ **池化 + RMSNorm + RoPE + 落盘 四发合一**（与四发逐位相同）。
     /// grid = `nb`（一个 block 处理一个新块），block=256，动态 smem = 256×4。
     /// 输出直接落 `pooled[b0*hd ..]`（不再需要 pool_tmp/pool_tmp2）。
     pub fn qsa_pool_norm_rope_bf16(
@@ -3810,7 +4004,7 @@ impl Kernels {
     /// **gather 稀疏注意力**：只遍历每行的选中块列表（+尾部不完整块），与上下文长度解耦。
     /// 数学 = dense（未选中位贡献 exp=0 精确不参与），仅归约配对顺序不同（~1ulp）。
     /// `nh`：一个 block 合并处理同一 kv-group 的 q-head 数（1 / 2 / 4；4 ⇒ K/V 流量 ÷4）。
-    /// 第二遍默认走"按选块分组取 V"（，`LINGXI_NO_ATTN_V2=1` 回退到逐 token 老档；
+    /// 第二遍默认走"按选块分组取 V"（`LINGXI_NO_ATTN_V2=1` 回退到逐 token 老档；
     /// 两档逐位相同，`t17_attn_bits` 覆盖 nblocks=7/29/130）。
     #[allow(clippy::too_many_arguments)]
     pub fn attn_gather_bf16(
@@ -3823,7 +4017,7 @@ impl Kernels {
         let ctok = 1usize << cshift;
         let v2 = std::env::var("LINGXI_NO_ATTN_V2").map(|v| v != "1").unwrap_or(true);
         let span = stride * ctok + ctok;
-        // v3：prefill 形态（t_q≥16，块数足够摊薄；decode/verify 的小 t 走旧核
+        // gather v3：prefill 形态（t_q≥16，块数足够摊薄；decode/verify 的小 t 走旧核
         // NH=1 栅格更优）且 smem 放得下时，用重排核（逐位等价，见 attn_gather_v3.cuh）。
         // `LINGXI_NO_ATTN_GATHER_V3=1` 回退旧核路径。
         let v3 = v2
@@ -3856,7 +4050,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ★：**一次发射**完成两块 bf16 瘦长投影（同一份 x，n1 行 + n2 行）。
+    /// ★ **一次发射**完成两块 bf16 瘦长投影（同一份 x，n1 行 + n2 行）。
     /// 每块的算式/归约/写出与 `gemm_skinny_row_bf16`（grid.y=1、epi=0）逐字相同 ⇒ 逐位相同。
     /// 只要 `m ≤ 8`（grid.y 恒为 1）。
     pub fn gemm_bf16_row_pair_ptr(
@@ -3878,7 +4072,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ★：`grouped_rmsnorm_bf16` + `rope_partial_inplace_bf16` **合发**。
+    /// ★ `grouped_rmsnorm_bf16` + `rope_partial_inplace_bf16` **合发**。
     /// grid = `rows*heads`（一格一个 (row, head)），block=256，动态 smem = 256×4。
     /// 归约树/舍入/RoPE 取值都与分开两发逐字相同 ⇒ 逐位相同。
     #[allow(clippy::too_many_arguments)]
@@ -3919,9 +4113,9 @@ impl Kernels {
         let (fi, nhead) = match which {
             16 => (10usize, 1usize),
             17 => (15usize, 1usize),
-            18 => (18usize, 1usize), // v3 NH=1
-            19 => (19, 2),           // v3 NH=2
-            20 => (20, 4),           // v3 NH=4
+            18 => (18usize, 1usize), // NH=1
+            19 => (19, 2),           // NH=2
+            20 => (20, 4),           // NH=4
             11 | 13 => (which, 2usize),
             12 | 14 => (which, 1usize),
             _ => (which, 4usize),
@@ -3948,7 +4142,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ** 候选 v5 探针**（global 分数缓冲 + 满占用，逐位等价于 prod）：`which` 0/1/2 = NH 1/2/4。
+    /// **候选 v5 探针**（global 分数缓冲 + 满占用，逐位等价于 prod）：`which` 0/1/2 = NH 1/2/4。
     /// `spg` 必须 ≥ `grid.y × t_q × (stride·2^cshift + 2^cshift) × NH` 个 f32（块私有槽，无原子）。
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_v5_probe(
@@ -3988,7 +4182,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ** 候选 v6 探针**（grid 转置 `(heads/NH, t_q)`，算术与 v3 逐字相同 ⇒ 逐位等价）：
+    /// **候选 v6 探针**（grid 转置 `(heads/NH, t_q)`，算术与 v3 逐字相同 ⇒ 逐位等价）：
     /// `which` 0/1/2 = NH 1/2/4。其余参数与 [`Self::qsa_attn_probe`] 相同。
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_v6_probe(
@@ -4025,7 +4219,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ** 候选 v7 探针**（pass2 V 走 smem 生产者/消费者，消费者累加次序不变 ⇒ 逐位等价）：
+    /// **候选 v7 探针**（pass2 V 走 smem 生产者/消费者，消费者累加次序不变 ⇒ 逐位等价）：
     /// `which` 0/1/2 = NH 1/2/4。smem = 分数（span·NH f32）+ vsm 站台（16·head_dim bf16）。
     #[allow(clippy::too_many_arguments)]
     pub fn qsa_attn_v7_probe(
@@ -4063,7 +4257,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ** 候选 v9 探针**（pass1 顺手缓存 V 行号进 smem，pass2 内圈 LDS→LDG 两级 + j×2
+    /// **候选 v9 探针**（pass1 顺手缓存 V 行号进 smem，pass2 内圈 LDS→LDG 两级 + j×2
     /// 流水；数值与累加次序与 v3 逐字相同 ⇒ 逐位等价）：`which` 0/1/2 = NH 1/2/4。
     /// smem = 分数（span·NH f32）+ 行号（span i32）。
     #[allow(clippy::too_many_arguments)]
@@ -4145,7 +4339,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// ㊺ A2 设备路由：单 block 完成 softmax + 插入式 top-k + 槽位查表（数学逐位复刻
+    /// 设备路由：单 block 完成 softmax + 插入式 top-k + 槽位查表（数学逐位复刻
     /// moe.rs host 路径）。`miss_flag_dev`/`miss_ids_dev` 是**映射 host 内存的设备别名**
     /// （u64 裸指针，host 自旋事件后直读）。输出按专家升序。
     #[allow(clippy::too_many_arguments)]
@@ -4316,7 +4510,7 @@ impl Kernels {
         Ok(true)
     }
 
-    /// ㊿+ 2026-10-22 批量设备路由：grid.x = 行，每 block 逐位复刻一行 host
+    /// 2026-10-22 批量设备路由：grid.x = 行，每 block 逐位复刻一行 host
     /// softmax + 插入式 topk；输出 `ids[rows,top_k]`（专家升序）+ 对齐 `wts`。
     /// 供 moe.rs rows>1 路径替换「D2H logits + host softmax/topk」。
     ///

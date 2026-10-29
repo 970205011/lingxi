@@ -87,39 +87,40 @@ impl Sessions {
         protect: &[String],
     ) -> Result<()> {
         const MIN_CTX: usize = 1024;
-        if self.cur_sid.as_deref() == Some(sid) {
-            // 同会话：只可能 pledge 增长
-            self.budget.grow(sid_key(sid), need, MIN_CTX)
-                .map_err(|_| anyhow::anyhow!("KV 预算不足（会话 {sid} 增长到 {need}）"))?;
-            if let Some(l) = self.live.get_mut(sid) { l.at = Instant::now(); }
-            return Ok(());
+    // 记录缓存属主：Dev 检查点按 owner 判有效性（v1.5 私有工作区，切换不覆盖别家）。
+    cache.set_owner(sid);
+    if self.cur_sid.as_deref() == Some(sid) {
+        // 同会话：只可能 pledge 增长
+        self.budget.grow(sid_key(sid), need, MIN_CTX)
+            .map_err(|_| anyhow::anyhow!("KV 预算不足（会话 {sid} 增长到 {need}）"))?;
+        if let Some(l) = self.live.get_mut(sid) { l.at = Instant::now(); }
+        return Ok(());
+    }
+    // 已物化 ⇒ 切换 = 换 epoch（图集各自保留、零重录），零数据搬迁。
+    // 别家会话的 Dev 检查点**不作废**——KV 工作区是各会话私有的（v1 时代的一刀切
+    // invalidate 会让刚离开又回来的会话丢掉全部热检查点，长文档多轮实测踩过）。
+    if let Some(l) = self.live.get_mut(sid) {
+        let ep = l.epoch;
+        l.at = Instant::now();
+        lingxi_model::graph::epoch_switch(ep);
+        self.cur_sid = Some(sid.to_string());
+        self.budget.grow(sid_key(sid), need, MIN_CTX)
+            .map_err(|_| anyhow::anyhow!("KV 预算不足（会话 {sid} 增长到 {need}）"))?;
+        return Ok(());
+    }
+    // 1) 未物化：若已达多物化上限，先把最久未动的 live 会话沉掉（图 epoch 随之回收）。
+    //    `protect` = 正在生成中的会话（并发路径传入）——绝不当牺牲者。
+    if self.live.len() >= self.max_mat {
+        let victim = self
+            .live
+            .iter()
+            .filter(|(k, _)| !protect.iter().any(|p| p == *k))
+            .min_by_key(|(_, l)| l.at)
+            .map(|(k, _)| k.clone());
+        if let Some(v) = victim {
+            self.sink_live(&v, eng, cache)?;
         }
-        // 已物化 ⇒ 切换 = 换 epoch（图集各自保留、零重录），零数据搬迁
-        if let Some(l) = self.live.get_mut(sid) {
-            let ep = l.epoch;
-            l.at = Instant::now();
-            lingxi_model::graph::epoch_switch(ep);
-            self.cur_sid = Some(sid.to_string());
-            // v1：Dev 检查点按"当前会话"口径，保守作废（host/disk 条目不受影响）
-            cache.invalidate_device();
-            self.budget.grow(sid_key(sid), need, MIN_CTX)
-                .map_err(|_| anyhow::anyhow!("KV 预算不足（会话 {sid} 增长到 {need}）"))?;
-            return Ok(());
-        }
-        // 1) 未物化：若已达多物化上限，先把最久未动的 live 会话沉掉（图 epoch 随之回收）。
-        // `protect` = 正在生成中的会话（并发路径传入）——绝不当牺牲者。
-        if self.live.len() >= self.max_mat {
-            let victim = self
-                .live
-                .iter()
-                .filter(|(k, _)| !protect.iter().any(|p| p == *k))
-                .min_by_key(|(_, l)| l.at)
-                .map(|(k, _)| k.clone());
-            if let Some(v) = victim {
-                self.sink_live(&v, eng)?;
-            }
-        }
-        cache.invalidate_device();
+    }
         // 2) 沉没池超上限：按 LRU 丢弃（数据损失，响亮日志）
         while self.sunk_bytes > self.sunk_cap {
             match self.sunk.iter().max_by_key(|(_, s)| s.at).map(|(k, _)| k.clone()) {
@@ -157,8 +158,15 @@ impl Sessions {
     }
 
     /// 把一个 live 会话沉到 host（多物化超配挤占用）。其图集随 epoch 回收。
-    pub(crate) fn sink_live(&mut self, sid: &str, eng: &lingxi_driver::Engine<'_>) -> Result<()> {
+    /// 设备 KV 工作区随之释放 ⇒ 该会话的 Dev 检查点全部作废（host/disk 档自包含，保留）。
+    pub(crate) fn sink_live(
+        &mut self,
+        sid: &str,
+        eng: &lingxi_driver::Engine<'_>,
+        cache: &mut PrefillCache,
+    ) -> Result<()> {
         let Some(l) = self.live.remove(sid) else { return Ok(()) };
+        cache.invalidate_owner(sid);
         let cp = l.seq.save_host_checkpoint(eng, l.seq.ids.len())?;
         // host 字节粗算：KV bf16 ~4KB/token（双卡合并口径）+ GDN 固定态
         let bytes = cp.ids.len() * 4096 + 256 * 1024 * 1024;
@@ -192,6 +200,7 @@ impl Sessions {
         let sids: Vec<String> = self.live.keys().cloned().collect();
         for sid in sids {
             self.activate(&sid);
+            cache.set_owner(&sid);
             if let Some(seq) = self.current_mut() {
                 if let Err(e) = cache.offload_resident(eng, seq) {
                     eprintln!("[serve] 退出落盘失败（{sid}）: {e:#}");

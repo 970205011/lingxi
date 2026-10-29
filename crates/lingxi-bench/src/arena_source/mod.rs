@@ -8,14 +8,15 @@
 //! 顺序读，15+ 分钟不停会触发该盘固件假死。惰性缺页天然分块（每专家 ~2.6 MB）。
 //!
 //! **两层缓存**：
-//! 1. **设备 Q4 槽缓存**（`slot`）：热专家的 Q4 blob 常驻显存，命中即跳过 H2D——
-//! 这是 decode 的主瓶颈（每 token 480 专家 × 2.6 MB ≈ 1.25 GB 过 PCIe）；
-//! 2. host 侧 pinned arena（可选）：`LINGXI_ARENA_PIN_GIB`，源在 RAM 时注册瞬时不触发磁盘读
-//! （介质判定在 `pin`）。
+//!   1. **设备 Q4 槽缓存**（`slot`）：热专家的 Q4 blob 常驻显存，命中即跳过 H2D——
+//!      这是 decode 的主瓶颈（每 token 480 专家 × 2.6 MB ≈ 1.25 GB 过 PCIe）；
+//!   2. host 侧 pinned arena（可选）：`LINGXI_ARENA_PIN_GIB`，源在 RAM 时注册瞬时不触发磁盘读
+//!      （介质判定在 `pin`）。
 //!
 //! CODE_MAP Phase 2 刀P2-1：文件 → 目录模块（slot/pin/source），只搬家不改行为。
 
 mod pin;
+mod prefetch;
 mod slot;
 mod source;
 

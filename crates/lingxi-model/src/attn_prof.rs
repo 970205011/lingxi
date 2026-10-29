@@ -144,7 +144,7 @@ pub fn mark(k: &Kernels, idx: usize) -> Result<()> {
         let kk = kind as usize;
         // 只统计 48 层主干（`L100` 是 MTP 伪层的 attn，t/len 语义不同，单独看逐层行）。
         // （2026-10-27）：**汇总再按 t 分档**——t=1（decode）与 t≥2（prefill）混在一个
-        // 均值里会把 145µs 的 decode 层和 5.5ms 的 prefill 层搅成一锅；prefill 战役只
+        // 均值里会把 145µs 的 decode 层和 5.5ms 的 prefill 层搅成一锅；prefill 阶段只
         // 看 t≥2 档（t=1 档仍可从逐层行 `[attnL]` 读）。
         let real = (layer as usize) < 48 && g.info[0] >= 2;
         if real {

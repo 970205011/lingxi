@@ -1,9 +1,9 @@
 //! `lingxi-model` — L2 前向逻辑 + 本模型的静态描述与张量角色推导。
 //!
-//! 职责边界（见 `ARCHITECTURE.md` §3）：**只做数学编排与模型知识；不做调度、不做 IO。**
+//! 职责边界（见 `ARCHITECTURE.md`）：**只做数学编排与模型知识；不做调度、不做 IO。**
 //!
 //! 张量角色（[`TensorRole`]）是**模型知识**，由 canonical 名字在加载期推导——
-//! 产物本身不含 role，因此不需要改动 ninfer 的产物（§0.5 复用铁律）。
+//! 产物本身不含 role，因此不需要改动 ninfer 的产物（复用铁律）。
 
 use lingxi_artifact::Artifact;
 use lingxi_ids::{Dims, LayerId, LayerKind, LayerSpec, ModelId, ModelSpec, TensorCatalog, TensorInfo, TensorRole};
@@ -58,7 +58,7 @@ pub fn flag(name: &str) -> bool {
     v
 }
 
-/// **值感知**开关查询（2026-10-27 ㊿ 教训复发后引入）：未设 = `default`；设了按值判
+/// **值感知**开关查询（2026-10-27 教训复发后引入）：未设 = `default`；设了按值判
 /// （"0"/"false"/"no"/"off" = 关，其余 = 开）。`flag()` 是"存在即真"——
 /// `export LINGXI_X=0` 对它**照样是开**，值语义开关必须走这里才允许外部 `=0` 覆盖。
 pub fn flag_val(name: &str, default: bool) -> bool {

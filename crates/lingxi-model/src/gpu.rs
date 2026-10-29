@@ -141,7 +141,7 @@ pub fn proj_t1<W: DevicePtr<bf16>>(
         // ★ 2026-10-22：一发全覆盖（k≥1024 走 row 核的 grid.y 行分块；k<1024 走
         // gemm_skinny_m8 的 grid.y 行分块——两者都与旧 ≤8 行逐片循环**逐位等价**，
         // 并发块共享权重读 ⇒ DRAM 流量 ⌈t/8⌉ 遍 → ~1 遍）。
-        // ★ 2026-10-22 ㊽+4：t>64 且 k%64==0 的大 m 投影改走 `mlarge`（CTA=8 行×64
+        // ★ 2026-10-22：t>64 且 k%64==0 的大 m 投影改走 `mlarge`（CTA=8 行×64
         // token、k-tile 进 smem ⇒ x 只读一遍 vs row 核的 n/8 遍——第十六轮实测账：
         // out_proj x 重读 256 遍 = 5.2GB L2/层、3.7ms）。有损档（k 升序串行累加，
         // 判据 PLAN_NEXT；`LINGXI_NO_MLARGE=1` 回退 row 核）。
@@ -180,7 +180,7 @@ pub fn proj_t1_epi<W: DevicePtr<bf16>>(
         let (xp, _b) = x.device_ptr(&k.stream);
         let (yp, _c) = y.device_ptr_mut(&k.stream);
         // 一发全覆盖（grid.y 行分块，逐位等价）——同 proj_t1 的 2026-10-22 改动。
-        // ㊽+4：大 m 走 mlarge（同 proj_t1，含 epi 融合）。
+// 大 m 走 mlarge（同 proj_t1，含 epi 融合）。
         if t > 64 && kdim % 64 == 0 && kdim >= mlarge_min_k() && n >= mlarge_min_n() && !crate::flag("LINGXI_NO_MLARGE") {
             if use_proj_tc(t, kdim, n) {
                 // 张量核化（有损档，默认关）：同形状替换 mlarge。
@@ -345,23 +345,23 @@ pub fn proj_q4_epi(
         let (yp, _c) = y.device_ptr_mut(&k.stream);
         // 一发全覆盖（grid.y 行分块，逐位等价于旧逐片循环）——2026-10-22 改动，
         // 同 proj_t1 的论证：并发块共享 Q4 权重读，DRAM 流量 ⌈t/8⌉ 遍 → ~1 遍。
-        // ㊽+5：q4_mlarge **默认关**（`LINGXI_Q4MLARGE=1` 开启）。
+// q4_mlarge **默认关**（`LINGXI_Q4MLARGE=1` 开启）。
         // ⚠️ 2026-10-22 实测回退：开 needle 43.5→52.8s（+21%）——标量 FMA 路径的
         // 反量化 ALU 链（每 u32 ~80 ALU / 8 MAC）没像 q4_tcp 那样被 MMA 摊销，
         // 比 gemm_q4_skinny 的查表路径慢 2-3×。x 重读账是真的，但 Q4 投影的
         // 正确解法应该是"q4_tcp 式 MMA + mlarge tiling"，不是标量版。核与封装
         // 保留（opt-in）。
-        // ㊽+6：q4_tcp_dense = q4_tcp 的 MMA B 片段 + 稠密 W 布局（x 一遍、权重
+// q4_tcp_dense = q4_tcp 的 MMA B 片段 + 稠密 W 布局（x 一遍、权重
         // 摊销、dequant 喂 MMA）——Q4 投影的正解。**默认开**，
         // `LINGXI_NO_Q4TCPDENSE=1` 回退。数值有损档（同 q4_tcp 口径），
         // 判据 = 首 token 相等 + 质量抽检。
-        // ㊽+7（2026-10-22）：小 t 档（2..64）实测 gemm_q4_skinny 只有 60~83GB/s
+        // 2026-10-22：小 t 档（2..64）实测 gemm_q4_skinny 只有 60~83GB/s
         // （GDN 投影 KTS 分解：qkvz 88.8µs/7.4MB、z 55µs/3.3MB）。曾试把 tcp_dense
         // 下放到 t=2..64——**实测反而 2.4× 慢**（24.3/15.2 vs 58.9 tok/s，输出质量无损）：
         // M-tile=64 的 MMA 工作量与 m 无关，m=6 时 58 行 padding 白算，CTA 又少
         // （grid=(n/128,1)，45 块）⇒ 延迟墙更厚。正解 = purpose-built M≤8 MMA 核
-        // （strata 的 m8n8k4 填 8 行思路），不是大 tile 下放。留 opt-in 供复测。
-        // ㊽+8（2026-10-23）：**M≤8 专用 MMA 变体**（`q4_tcp_dense.cu` 的 m8 版）：
+        // （m8n8k4 填 8 行思路），不是大 tile 下放。留 opt-in 供复测。
+        // 2026-10-23：**M≤8 专用 MMA 变体**（`q4_tcp_dense.cu` 的 m8 版）：
         // 把 M 轴 tile 压到 8（mma 最小高度），权重仍只读一遍、dequant 片段照样喂 MMA。
         // ⚠️ **实测负结果，默认关别开**：61.5→55.5 tok/s（~82ms/轮）。
         // 根因不是寄存器（修 spill 后一个点不变），而是 Q4 dequant ALU 按"每 4B 权重"
@@ -549,7 +549,7 @@ pub fn read_bf16_bits(art: &Artifact, name: &str) -> Result<(Vec<u16>, usize, us
 pub fn upload_q4_named(k: &Kernels, art: &Artifact, name: &str) -> Result<crate::q4::Q4W> {
     let dir = std::env::var("LINGXI_Q4_CACHE").ok();
     if dir.is_none() {
-        // ★ P15-㉔ 教训入码：忘设缓存=每次启动重新量化（吃满启动时间还容易让人误判配置）。
+        // ★ 教训入码：忘设缓存=每次启动重新量化（吃满启动时间还容易让人误判配置）。
         static BANNER: std::sync::Once = std::sync::Once::new();
         BANNER.call_once(|| {
             eprintln!(

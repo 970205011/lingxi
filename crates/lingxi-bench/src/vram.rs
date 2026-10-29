@@ -110,7 +110,20 @@ pub fn autotune_arena_slots(
     };
     const QSA_PER_DEV: usize = 6; // 12 层 full-attn 双卡各半
     const GDN_PER_DEV: usize = 18; // 36 层 linear-attn 双卡各半
-    let kv_per_token_layer: u64 = if lingxi_model::flag("LINGXI_KV_K8V4") { 1184 } else { 2368 };
+    // KV 量化档账目（per token per 层）：
+    //   bf16 = 2 kv头 × 256 维 × 2B × 2(K,V) = 2368B
+    //   K8V4 = E4M3 字节 512×2 + 每 (行,头) f32 scale 2×2×4 = 1184B（质量判据翻车，禁止开）
+    //   FP8-G32/int8-G32 = 字节 512×2 + 每 32 维组 f16 scale (512/32)×2B×2 = 1088B
+    //             （bf16 的 45.9%；LINGXI_KV_FP8，待质量判据实测）。残差窗（KIVI 式）
+    //             的 bf16 尾窗/sink 平面是**恒定大小**（sink+recent+4+1024 行 ≈ 2.4MB/层），
+    //             不进 per-token 预算。
+    let kv_per_token_layer: u64 = if lingxi_model::flag("LINGXI_KV_K8V4") {
+        1184
+    } else if lingxi_model::flag_val("LINGXI_KV_FP8", false) {
+        1088
+    } else {
+        2368
+    };
     let kv = cap as u64 * kv_per_token_layer * QSA_PER_DEV as u64;
     let gdn = 3_220_000u64 * GDN_PER_DEV as u64; // S 3.1MB + 卷积历史双缓冲 ~3.22MB/层
     let reserve: u64 = if dev == 0 { 3 << 30 } else { 2500 << 20 }; // scratch/图/投机缓冲

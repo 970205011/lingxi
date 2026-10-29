@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use lingxi_artifact::Artifact;
 
 pub fn run(args: &[String]) -> Result<()> {
-    // 用法: serve <artifact> [port=11434] —— OpenAI 兼容 HTTP（P15-㊷）
+    // 用法: serve <artifact> [port=11434]   —— OpenAI 兼容 HTTP
     // 装配与 talk 完全同一条生产链（layer-split/arena/图门控全在），
     // 差别只在出字循环：每请求 reset 复用状态，HTTP+SSE 出字。
     let art_path = args.get(2).context("用法: lingxi-bench serve <artifact> [port]")?;
@@ -63,7 +63,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let ls_on = ls_lo > 0 && ls_lo < n_layers;
     if ls_on {
         if auto_split {
-            // ㊸：单层本地图 split 下保持开启（判据翻车则恢复 force_disable）
+            // 单层本地图 split 下保持开启（判据翻车则恢复 force_disable()）
             eprintln!("[layer-split] 双卡自动整层切分 lo={ls_lo}（单层本地图保持开启）");
         } else {
             if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
@@ -92,7 +92,7 @@ pub fn run(args: &[String]) -> Result<()> {
             ),
             _ => None,
         };
-    // ㊿-P1：Sequence 不再预建——交给 serve 的会话池按需物化（每会话一个，复用/沉没/唤醒）。
+    // Sequence 不再预建——交给 serve 的会话池按需物化（每会话一个，复用/沉没/唤醒）。
     let mut mk_seq = {
         let (kb, k1b) = (&k, ls_k1.as_ref());
         let (sh, nl, rl, lo) = (&shape, n_layers, rope_len, ls_lo);
@@ -118,7 +118,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let ap = std::env::var("LINGXI_EXPERT_ARENA").context(
             "serve 需要 LINGXI_EXPERT_ARENA=<arena 文件>（host LRU 路径慢 15-20 倍，不允许静默回退）",
         )?;
-        // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
+        // 未显式给槽数时走显存预算自动分配（env 显式值优先）。
         let slots: usize = match std::env::var("LINGXI_ARENA_SLOTS")
             .ok().and_then(|s| s.parse().ok())
         {
@@ -197,13 +197,15 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     // ── 投机（可选）：`LINGXI_SERVE_SPEC=1` + `LINGXI_MTP_ARTIFACT=<path>` ──
     // 只接在 serve 上（产品路径）；talk 仍走纯自回归。
+    // ★ 2026-10-27：接入双卡——`ls_k1` 传入 SpecRuntime ⇒ 草稿 head 行二分自动生效
+    // （草稿相位 GPU1 整段空闲，拿它算 lm_head 后半；serve 与 talk 同口径 96 tok/s 档）。
     let mut spec_rt: Option<crate::spec::SpecRuntime<'_>> =
         if std::env::var("LINGXI_SERVE_SPEC").map(|v| v == "1").unwrap_or(false) {
             let mp = crate::cli::common::mtp_artifact_path();
-            eprintln!("[serve] 投机解码启用：MTP = {mp}");
-            // serve 目前不做层切分 ⇒ 没有第二张卡，草稿 head 的行二分自动关闭。
+            eprintln!("[serve] 投机解码启用：MTP = {mp}（双卡：草稿 head 二分 {}）",
+                if ls_k1.is_some() { "开" } else { "关（无第二张卡）" });
             Some(crate::spec::SpecRuntime::load(
-                &k, None, &mp, &tables, &endpoints, &shape, rope_len,
+                &k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len,
             )?)
         } else {
             None

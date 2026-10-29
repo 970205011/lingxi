@@ -3,7 +3,7 @@
 //! 仅在给出环境变量时运行（60 GiB 文件，不进 CI）：
 //! LINGXI_EXPERT_ARENA=/models/lingxi-assets/qwen4_exp.expert-arena.q4g64.bin
 //! LINGXI_ARTIFACT=/models/qwen4_exp-artifact/qwen4_exp.ninfer
-//! 在 CT141 内：cd /models/lingxi && \
+//! 在测试机（双 V100）内：cd /models/lingxi && \
 //! LINGXI_EXPERT_ARENA=... LINGXI_ARTIFACT=... cargo test -p lingxi-artifact --test expert_arena_live -- --nocapture
 
 use lingxi_artifact::expert_arena::{decode_q4g64_f16s, BlobFormat, ExpertArena};

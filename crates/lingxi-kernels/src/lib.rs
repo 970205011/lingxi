@@ -1,9 +1,9 @@
 //! `lingxi-kernels` — L1：CUDA C++ → cubin（build.rs 调 nvcc）+ cudarc 加载/launch。
 //!
 //! 职责边界（见 `ARCHITECTURE.md`）：
-//! * 纯函数 kernel：`(指针 + 参数) → 输出`，无全局态、无隐式 stream 依赖。
-//! * `unsafe` 只允许出现在本 crate 的 launch 封装里。
-//! * 矩阵乘**复用 cuBLAS**（复用铁律）；只自研 cuBLAS 不适合的融合/稀疏/注意力算子。
+//!   * 纯函数 kernel：`(指针 + 参数) → 输出`，无全局态、无隐式 stream 依赖。
+//!   * `unsafe` 只允许出现在本 crate 的 launch 封装里。
+//!   * 矩阵乘**复用 cuBLAS**（复用铁律）；只自研 cuBLAS 不适合的融合/稀疏/注意力算子。
 
 use std::sync::Arc;
 
@@ -32,14 +32,14 @@ pub static TOPK_OPS_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/top
 pub static ROUTE_FUSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/route_fuse.cubin"));
 /// 2026-10-24 MoE router 投影的 **m ≤ 6 编译期特化**核（`LINGXI_NO_ROUTER_M6=1` 回退）。
 pub static ROUTER_M6_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/router_m6.cubin"));
-/// ㊼ Q4 专家张量核 GEMM（Volta m8n8k4）
+/// Q4 专家张量核 GEMM（Volta m8n8k4）
 pub static Q4_TC_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4_tc.cubin"));
-/// ㊽ Q4 专家张量核 GEMM —— prefill 大 tile 版（M 轴分块 + x 进 shared）
+/// Q4 专家张量核 GEMM —— prefill 大 tile 版（M 轴分块 + x 进 shared）
 pub static Q4_TCP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4_tcp.cubin"));
 pub static Q3_TCP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q3_tcp.cubin"));
 pub static MLARGE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mlarge.cubin"));
 pub static Q4_MLARGE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4_mlarge.cubin"));
-/// ㊽+6 Q4 稠密投影 TCP MMA + 大 m 摊销核（q4_tcp 的 B 片段 + 稠密 W 布局）
+/// Q4 稠密投影 TCP MMA + 大 m 摊销核（q4_tcp 的 B 片段 + 稠密 W 布局）
 pub static Q4_TCP_DENSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4_tcp_dense.cubin"));
 /// 稠密 bf16 投影 Volta MMA 核（q4_tcp_dense 骨架去反量化，`LINGXI_PROJ_TC=1` 门控）
 pub static BF16_TCP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bf16_tcp.cubin"));
@@ -231,11 +231,11 @@ pub fn pin_host_readonly(ptr: *const u8, bytes: usize) -> bool {
 
 /// 与 [`pin_host_readonly`] 同样的注册，但用 `CU_MEMHOSTREGISTER_PORTABLE`（**要求 VMA 可写**）。
 ///
-/// 为什么要多这一条：READ_ONLY 注册的语义是"**让设备去读**这块 host
+/// 为什么要多这一条（2026-10-16）：READ_ONLY 注册的语义是"**让设备去读**这块 host
 /// 内存"（zero-copy 映射），**不是"把页锁好交给 DMA"**。实测后果有两条，都致命：
 /// * 从它发起的 H2D 只有 **8.6 GB/s**；
 /// * 它**与 kernel 完全不可重叠** —— 把拷贝挪到第二条流，专家段的"每 miss 增量"一点没变
-/// （`miss=0/1/2/≥3` 的层均：0.61/0.91/1.15/2.31 ms，开关第二流前后一模一样）。
+///   （`miss=0/1/2/≥3` 的层均：0.61/0.91/1.15/2.31 ms，开关第二流前后一模一样）。
 /// 而 `DEFAULT/PORTABLE` 要求 VMA 可写（对 `PROT_READ` 映射必返回 `invalid argument`）⇒
 /// 必须先拿一份**可写**映射（`expert_arena::mmap_shared_rw`）才谈得上 DMA 注册。
 pub fn pin_host_dma(ptr: *const u8, bytes: usize) -> bool {
@@ -261,7 +261,7 @@ pub fn pin_host_dma(ptr: *const u8, bytes: usize) -> bool {
 pub struct Kernels {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
-    /// **专家段的第二条流**。
+    /// **专家段的第二条流**（`LINGXI_MOE_OVERLAP=1`）。
     ///
     /// 为什么要它：专家 miss 的 blob H2D（2.49 MB/个，每轮 ~280 MB ≈ **28 ms/轮**）现在**串在
     /// compute 流上**，而它其实只被"未命中那几个组的 GEMV"需要 —— 命中组（每层 ~95%）完全
@@ -298,7 +298,7 @@ pub struct Kernels {
     pub(crate) row_scale_inplace_bf16: CudaFunction,
     pub(crate) moe_combine_rows_bf16: CudaFunction,
     pub(crate) moe_combine_add_rows_bf16: CudaFunction,
-    /// ㊾ CSR 版合并+残差（batch 路径，O(rows×H×top_k) 取代旧核 O(rows×H×S)）
+    /// CSR 版合并+残差（batch 路径，O(rows×H×top_k) 取代旧核 O(rows×H×S)）
     pub(crate) moe_combine_add_csr_bf16: CudaFunction,
     /// A 方案 t>1：批量设备路由的 pair/CSR 构建核（`moe_ops.cu`）
     pub(crate) route_pairs_bf16: CudaFunction,
@@ -312,10 +312,10 @@ pub struct Kernels {
     pub(crate) gemv_bf16_epi: CudaFunction,
     pub(crate) gemv_bf16_block_epi: CudaFunction,
     pub(crate) gemv_bf16_row8_epi: CudaFunction,
-    /// ㊼ Q4 专家张量核 GEMM（T≤8 / T=9..16），`LINGXI_MOE_TC=1` 才用
+    /// Q4 专家张量核 GEMM（T≤8 / T=9..16），`LINGXI_MOE_TC=1` 才用
     pub(crate) q4_tc_t1: CudaFunction,
     pub(crate) q4_tc_t2: CudaFunction,
-    /// ㊽ prefill 大 tile 版（任意组大小一次 launch），`LINGXI_MOE_TC=1` 门控
+    /// prefill 大 tile 版（任意组大小一次 launch），`LINGXI_MOE_TC=1` 门控
     pub(crate) q4_tcp: CudaFunction,
     pub(crate) q3_tcp: CudaFunction,
     /// 乐观发射档（BIG 路径）：组数网格按 host 上界发、行块核内循环，
@@ -324,7 +324,7 @@ pub struct Kernels {
     pub(crate) q3_tcp_dyn: CudaFunction,
     pub(crate) mlarge: CudaFunction,
     pub(crate) q4_mlarge: CudaFunction,
-    /// ㊽+6 Q4 稠密投影 TCP MMA + 大 m 摊销核（`q4_tcp_dense.cu`）
+    /// Q4 稠密投影 TCP MMA + 大 m 摊销核（`q4_tcp_dense.cu`）
     pub(crate) q4_tcp_dense: CudaFunction,
     /// M≤8 变体（verify 批 t=6 专用，M 轴 tile = 8）
     pub(crate) q4_tcp_dense_m8: CudaFunction,
@@ -375,12 +375,22 @@ pub struct Kernels {
     pub(crate) attn2s_sparse_kvq8_bf16: CudaFunction,
     pub(crate) attn3_masked_kvq8_bf16: CudaFunction,
     pub(crate) attn5_sparse_kvq8_bf16: CudaFunction,
+    /// FP8-G32/int8-G32 KV 探索档（`LINGXI_KV_FP8`）：每 32 维一组 f16 scale 的
+    /// E4M3/int8 注意力（+ KIVI 式残差窗）
+    pub(crate) attn2_masked_kvfp8_bf16: CudaFunction,
+    pub(crate) attn2s_sparse_kvfp8_bf16: CudaFunction,
+    pub(crate) attn3_masked_kvfp8_bf16: CudaFunction,
+    pub(crate) attn5_sparse_kvfp8_bf16: CudaFunction,
+    /// FP8-G32/int8-G32 行组量化：bf16 → 字节 + 每 32 维一组 f16 scale
+    pub(crate) quant_rows_fp8g32_bf16: CudaFunction,
+    /// FP8-G32/int8-G32 残差窗 flush 量化（源 = bf16 残差平面，sink 段 + 尾窗环）
+    pub(crate) quant_rows_fp8g32_res_bf16: CudaFunction,
     pub(crate) quant_rows_e4m3_bf16: CudaFunction,
     pub(crate) qsa_pool_block_bf16: CudaFunction,
     pub(crate) qsa_pool_blocks_bf16: CudaFunction,
-    /// ★：池化 + RMSNorm + RoPE + 落盘 四发合一（与四发逐位相同）
+    /// ★ 池化 + RMSNorm + RoPE + 落盘 四发合一（与四发逐位相同）
     pub(crate) qsa_pool_norm_rope_bf16: CudaFunction,
-    /// ★：`nblocks ≤ topk` 时 keep 全 1（省掉打分 + 名次两发）
+    /// ★ `nblocks ≤ topk` 时 keep 全 1（省掉打分 + 名次两发）
     pub(crate) qsa_keep_all_bf16: CudaFunction,
     pub(crate) rope_partial_stride_bf16: CudaFunction,
     pub(crate) qsa_indexer_scores_bf16: CudaFunction,
@@ -400,7 +410,7 @@ pub struct Kernels {
     pub(crate) attn_gather2_bf16: CudaFunction,
     pub(crate) attn_gather_v1_bf16: CudaFunction,
     pub(crate) attn_gather4_v1_bf16: CudaFunction,
-    /// v3 生产核（prefill 形态重排，逐位等价；`LINGXI_NO_ATTN_GATHER_V3=1` 回退）
+    /// gather v3 生产核（prefill 形态重排，逐位等价；`LINGXI_NO_ATTN_GATHER_V3=1` 回退）
     pub(crate) attn_gather_v3_2_bf16: CudaFunction,
     pub(crate) attn_gather_v3_4_bf16: CudaFunction,
     pub(crate) qsa_mask_fill_f32: CudaFunction,
@@ -415,7 +425,7 @@ pub struct Kernels {
     pub(crate) gemv_q4g64_slotsm_r2_bf16: CudaFunction,
     pub(crate) gemv_q4g64_slotsm_r4_bf16: CudaFunction,
     /// `LINGXI_MOE_GEMV_TIER=1` 的可选档：与 `slotsm_bf16` **逐位相同**，只改取数结构
-    /// （两个独立 load + 移位对解包；见 dequant_ops.cu 该核头注与）。
+    /// （两个独立 load + 移位对解包；见 dequant_ops.cu 该核头注）。
     pub(crate) gemv_q4g64_slotsm_t2_bf16: CudaFunction,
     /// Q4 的**设备侧组数上界**档（A' 的地基）：与 `..._t2_bf16` 同一核体，
     /// 入口多一道 `e >= *ng_dev` 早退 ⇒ 主机可发静态网格。
@@ -472,7 +482,7 @@ pub struct Kernels {
     pub(crate) gdn_recurrent_bf16: CudaFunction,
     /// ★ GDN 递推 **state 常驻寄存器版**（`gdn_ops.cu`，hk=hv=128 特化，逐位相同）
     pub(crate) gdn_recurrent_reg_bf16: CudaFunction,
-    /// ㉟+1 GDN 递推多 warp 占用率版（`gdn_ops.cu`，M5 便宜形态，`LINGXI_GDN_MW` 门控）
+    /// GDN 递推多 warp 占用率版（`gdn_ops.cu`，M5 便宜形态，`LINGXI_GDN_MW` 门控）
     pub(crate) gdn_recurrent_mw_bf16: CudaFunction,
     pub(crate) argmax_rows_part_bf16: CudaFunction,
     pub(crate) argmax_rows_fin: CudaFunction,

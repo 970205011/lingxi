@@ -122,7 +122,7 @@ pub fn run(args: &[String]) -> Result<()> {
         std::env::set_var("LINGXI_NO_GRAPHS", "1");
         lingxi_model::graph::force_disable();
     }
-    // ★ P15-㉜：双卡默认自动 split（同 mtp-accept 分支的口径）。EP 模式下必须关掉。
+    // ★ 双卡默认自动 split（同 mtp-accept 分支的口径）。EP 模式下必须关掉。
     let ls_env: Option<u32> = if ep_on {
         Some(0)
     } else {
@@ -139,7 +139,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let twopass_on = lingxi_model::flag_val("LINGXI_PREFILL_TWOPASS", false);
     if ls_on {
         if auto_split {
-            // ㊸：单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
+            // 单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
             // 跨卡拷贝在层循环外不进图）。判据翻车则恢复 force_disable()。
             eprintln!(
                 "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%；\
@@ -148,12 +148,12 @@ pub fn run(args: &[String]) -> Result<()> {
         } else {
             if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
                 eprintln!(
-                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS；㊸ 起单层本地图 split 下可用，\
+                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS；单层本地图 split 下可用，\
                      数值异常先设它对拍。"
                 );
             }
         }
-        // ★ P15-㉞：池已 device-aware，不再需要禁池（见 mtp-accept 分支同款注释）。
+        // ★ 池已 device-aware，不再需要禁池（见 mtp-accept 分支同款注释）。
     }
     let ls_k1: Option<lingxi_kernels::Kernels> =
         if ls_on || ep_on { Some(lingxi_kernels::Kernels::load(1)?) } else { None };
@@ -161,7 +161,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(kk) => Some(crate::cli::common::load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
         None => None,
     };
-    // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
+    // 未显式给槽数时走显存预算自动分配（env 显式值优先）。
     // ★ EP：两卡各装**全部** 48 层稠密权重，显存比 layer-split 更紧 ⇒ 每卡槽数默认
     //   8000（`LINGXI_EP_SLOTS` 可覆盖），不走 autotune（那是按半场层数算的）。
     let ep_slots: usize = std::env::var("LINGXI_EP_SLOTS")
@@ -194,7 +194,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         base
     }
-    };  // ★㊲ 工作集≥槽位判决(375/卡层)
+    };  // ★工作集≥槽位判决(375/卡层)
     let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
         match (ls_k1.as_ref(), ls_arena_path.as_deref()) {
             (Some(kk), Some(ap)) => {
@@ -274,7 +274,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let inter = meta["inter"].as_u64().unwrap() as usize;
         let hidden = meta["hidden"].as_u64().unwrap() as usize;
         if let Ok(ap) = std::env::var("LINGXI_EXPERT_ARENA") {
-            // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
+            // 未显式给槽数时走显存预算自动分配（env 显式值优先）。
             let slots: usize = if ep_on {
                 ep_slots
             } else {
@@ -312,7 +312,7 @@ pub fn run(args: &[String]) -> Result<()> {
         } else {
             // ⚠️ **不允许静默回退**：这条 host LRU ↔ device LRU 的路实测
             // decode **488~714 ms/token**（比 arena 慢 15~20 倍），而且以前毫无提示。
-            // 历史上"忘了设 LINGXI_EXPERT_ARENA"就掉进来，被误判成代码回归。
+            // 历史上"忘了设 LINGXI_EXPERT_ARENA"就掉进来，被误判成代码回归）。
             // 要用它必须显式开 `LINGXI_ALLOW_MMAP_FALLBACK=1`。
             if std::env::var("LINGXI_ALLOW_MMAP_FALLBACK").is_err() {
                 anyhow::bail!(
@@ -574,7 +574,7 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     // `LINGXI_TALK_SPEC=1`：把 serve 的 MTP 投机环路接到 talk 上，让权威尺子
-    // （talk/bench.sh）直接量到投机吞吐。默认关 = 纯自回归不变。
+    // （talk/bench.sh）直接量到投机吞吐（speedup-audit）。默认关 = 纯自回归不变。
     let talk_spec = std::env::var("LINGXI_TALK_SPEC").map(|v| v == "1").unwrap_or(false);
     let (first, hyper_first) = if talk_spec {
         // 投机要整段 prompt 的 hyper 行（MTP prime 用），走 prefill_with_hyper。
@@ -631,11 +631,14 @@ pub fn run(args: &[String]) -> Result<()> {
         );
 
         let mp = crate::cli::common::mtp_artifact_path();
-        // 两份 SpecRuntime（各持一套 MTP 权重/Q4 专家/KV 状态 —— mst 是每会话状态，不能共享）。
+        // 两份（各持一套 MTP 权重/Q4 专家——双线程**真并发**跑，SpecRuntime 的可变
+        // 部分 hb 头缓冲不能跨线程共享）；每会话草稿状态 SpecState 随之各一份。
         let mut rt_a =
             crate::spec::SpecRuntime::load(&k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len)?;
         let mut rt_b =
             crate::spec::SpecRuntime::load(&k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len)?;
+        let mut st_a = crate::spec::SpecState::new(&k, &shape, rope_len + 8, rt_a.kd())?;
+        let mut st_b = crate::spec::SpecState::new(&k, &shape, rope_len + 8, rt_b.kd())?;
         let kd = rt_a.kd();
         let mut sb_a = seq.spec_prepare(&eng, provider, kd + 1)?;
         let mut sb_b = seq_b.spec_prepare(&eng, provider, kd + 1)?;
@@ -649,7 +652,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // ★ 反相位 PLL（`LINGXI_TALK_SPEC_PHASE=<Δ_ms>`，默认 36；0 = 关）：
         // A 自由跑（master），B（slave）的每轮锚在 **A 的实际轮起点 + Δ** —— A 快 B 跟、
         // A 慢 B 等，相位锁不滑。固定网格（v1）实测会滑出同步（轮长 40~90ms 不均，
-        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据：
+        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据（复扫判决）：
         // k0 是瓶颈卡（2×38.7ms/轮对），A 的 verify.hi（23.4ms 纯 k1）应与 B 的
         // 草稿+lo（33.4ms 纯 k0）对齐 ⇒ Δ ≈ A 的 pre-hi 段长。
         let offset_ns = std::env::var("LINGXI_TALK_SPEC_PHASE")
@@ -670,14 +673,14 @@ pub fn run(args: &[String]) -> Result<()> {
             let sig_a = std::sync::Arc::clone(&a_sig);
             let ta = scp.spawn(move || {
                 spec_dual_session(
-                    "A", &mut seq, &mut rt_a, &mut sb_a, h_a, eng_ref, layer_cache, eos, max_new,
+                    "A", &mut seq, &mut rt_a, &mut st_a, &mut sb_a, h_a, eng_ref, layer_cache, eos, max_new,
                     first, anchor, Some((&sig_a, 0)),
                  )
             });
             let sig_b = std::sync::Arc::clone(&a_sig);
             let tb = scp.spawn(move || {
                 spec_dual_session(
-                    "B", &mut seq_b, &mut rt_b, &mut sb_b, &hyper_b, eng_ref, layer_cache, eos,
+                    "B", &mut seq_b, &mut rt_b, &mut st_b, &mut sb_b, &hyper_b, eng_ref, layer_cache, eos,
                     max_new, first_b, anchor,
                     Some((&sig_b, offset_ns)),
                 )
@@ -770,6 +773,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // 关闸逻辑同 serve：连续 3 轮"产出/验证行 < 0.5"切回本函数的自回归循环。
         let mut spec_state: Option<(
             crate::spec::SpecRuntime<'_>,
+            crate::spec::SpecState,
             lingxi_driver::SpecBuffers,
             cudarc::driver::CudaSlice<half::bf16>,
             std::collections::VecDeque<i64>,
@@ -782,15 +786,17 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut rt = crate::spec::SpecRuntime::load(
                 &k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len,
             )?;
+            let mut st = crate::spec::SpecState::new(&k, &shape, rope_len + 8, rt.kd())?;
             let mut queue: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
             let mut ok = true;
             let prime_res = (|| -> anyhow::Result<()> {
-                rt.reset();
+                rt.reset(&mut st);
                 let emb_p = rt.prompt_emb(&seq.ids)?;
                 let _ = rt.prime(
                     hyper_first.as_ref().expect("talk_spec 必有 hyper"),
                     &seq.ids,
                     emb_p,
+                    &mut st,
                 )?;
                 Ok(())
             })();
@@ -819,7 +825,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     Ok((sb, h_last, toks, ar_ms)) => {
                         eprintln!("[talk-spec] AR 基准 {ar_ms:.1} ms/tok（第二步实测；投机每产出 tok 必须低于它）");
                         queue.extend(toks);
-                        spec_state = Some((rt, sb, h_last, queue, ar_ms));
+                        spec_state = Some((rt, st, sb, h_last, queue, ar_ms));
                     }
                     Err(e) => {
                         eprintln!("[talk-spec] 投机初始化失败，回退纯自回归: {e:#}");
@@ -827,9 +833,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
             }
         }
-        if let Some((mut rt, mut sb, mut h_last, mut queue, ar_ms)) = spec_state {
+        if let Some((mut rt, mut st, mut sb, mut h_last, mut queue, ar_ms)) = spec_state {
             // 专家槽统计：`去重` = 本请求**装入过**的不同 (层, 专家) 数（设备快路只上报 miss，
-            // 所以它是"装入去重"，不是"路由去重"）。
+            // 所以它是"装入去重"，不是"路由去重"——双卡镜像验收已实测）。
             // 判据：它一旦接近该卡槽位总数，就会进入淘汰螺旋，专家段会从 ~0.4 ms/层 涨到 3+ ms/层。
             crate::arena_source::expert_track_reset();
             let mut accepted = 0usize;
@@ -871,7 +877,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     }
                 }
                 let tr = std::time::Instant::now();
-                let r = rt.round(&mut seq, &eng, provider, &mut sb, &mut h_last)?;
+                let r = rt.round(&mut seq, &eng, provider, &mut sb, &mut h_last, &mut st)?;
                 let ms = tr.elapsed().as_secs_f64() * 1e3;
                 rounds += 1;
                 accepted += r.accepted;
@@ -956,11 +962,11 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     eprintln!("-- 生成 {} tokens，解码文本 --", gen_ids.len());
     println!("{}", tok.decode(&gen_ids)?);
-    // ㊸：decode 后再 dump 一次 ⇒ 逐段数字 = **最后一个 decode token** 的真 GPU 分解
+    // decode 后再 dump 一次 ⇒ 逐段数字 = **最后一个 decode token** 的真 GPU 分解
     if let Some(p) = k.evprof.as_ref() {
         p.dump(eng.n_layers);
     }
-    // ㊸：GPU1 的账单独打（split 下 wall = max(两卡) + 跨卡手递手，只看 GPU0 会误判瓶颈侧）
+    // GPU1 的账单独打（split 下 wall = max(两卡) + 跨卡手递手，只看 GPU0 会误判瓶颈侧）
     if let Some(kk) = ls_k1.as_ref() {
         if let Some(p) = kk.evprof.as_ref() {
             p.dump(eng.n_layers);
@@ -987,6 +993,7 @@ fn spec_dual_session(
     label: &str,
     seq: &mut lingxi_driver::Sequence,
     rt: &mut crate::spec::SpecRuntime<'_>,
+    st: &mut crate::spec::SpecState,
     sb: &mut lingxi_driver::SpecBuffers,
     hyper: &cudarc::driver::CudaSlice<half::bf16>,
     eng: &lingxi_driver::Engine<'_>,
@@ -1000,9 +1007,9 @@ fn spec_dual_session(
     let mut provider = crate::cli::common::PeekProvider { cache };
     let mut queue: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
     let mut gen: Vec<i64> = Vec::new();
-    rt.reset();
+    rt.reset(st);
     let emb_p = rt.prompt_emb(&seq.ids)?;
-    let _ = rt.prime(hyper, &seq.ids, emb_p)?;
+    let _ = rt.prime(hyper, &seq.ids, emb_p, st)?;
     // AR 基准：取第二步 decode（第一步含一次性冷成本，同 serve 口径）。
     let (tok2, _h2) = seq.decode_token_with_hyper(eng, &mut provider)?;
     let t_ar = std::time::Instant::now();
@@ -1056,7 +1063,7 @@ fn spec_dual_session(
                 }
             }
         }
-        let r = rt.round(seq, eng, &mut provider, sb, &mut h_last)?;
+        let r = rt.round(seq, eng, &mut provider, sb, &mut h_last, st)?;
         rounds += 1;
         accepted += r.accepted;
         verified += r.verified;

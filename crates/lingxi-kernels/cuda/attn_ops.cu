@@ -1,16 +1,17 @@
 // L1 QSA（稀疏全注意力）相关算子。
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <math.h>
 
 using bf16 = __nv_bfloat16;
 
 #include "attn_gather_v3.cuh"
 
-// ── E4M3(FP8) 编解码（P15-㊶ KV 压缩 `LINGXI_KV_K8V4`，有损、env 门控）────────
+// ── E4M3(FP8) 编解码（KV 压缩 `LINGXI_KV_K8V4`，有损、env 门控）────────
 // sm_70 没有 cvt 指令 ⇒ 手写 satfinite + RNE。码本与 PLE 表同一 E4M3（±448、
 // denorm 步长 2^-9）。encode 以"值/scale"量化（scale = amax/448，按 (行, kv头) 存 f32）。
-// 位运算版（免 exp2f SFU——发射率受限下 SFU 比 ALU 贵 4×，㊶ 实测教训）：
+// 位运算版（免 exp2f SFU——发射率受限下 SFU 比 ALU 贵 4×，实测教训）：
 // normal(e≥1): (1+m/8)·2^(e-7) ⇒ 阶码域 e+120、尾数 m<<20（3 int op）；
 // denorm(e=0): m·2^-9，(float)m 精确（I2F+mul）；符号用 -0.0 加法折叠。
 __device__ __forceinline__ float e4m3_to_f32(unsigned char b) {
@@ -20,7 +21,10 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned char b) {
     const unsigned int nbits = (m << 20) | ((e + 120u) << 23);
     const float df = (float)m * 0.001953125f;
     const float val = (e == 0) ? df : __uint_as_float(nbits);
-    return __uint_as_float(s) + val;
+    // 符号必须**位或**进幅度位——旧实现 `__uint_as_float(s) + val` 把符号当成
+    // 浮点 -0.0 去加，负值全部解码成正数（K8V4 翻车的隐藏共犯之一；
+    // FP8 档 e4m3 注意力因此算出非有限 logits，2026-10-28 判据实测抓获）。
+    return __uint_as_float(s | __float_as_uint(val));
 }
 
 __device__ __forceinline__ unsigned char f32_to_e4m3(float x) {
@@ -97,6 +101,111 @@ extern "C" __global__ void lingxi_quant_rows_e4m3_bf16(const bf16* __restrict__ 
     }
 }
 
+// ── FP8-G32 行组量化（KV FP8 探索档 `LINGXI_KV_FP8`，有损、env 门控）────────────
+// 与 K8V4 的核心区别：**细粒度 scale**——K/V 各按每 32 维一组配一个 f16 scale
+// （细粒度分组 KV 量化，每 32 维一组 scale），而不是每 (行, kv头) 一个 f32。
+// K8V4 质量判据翻车的归因之一就是行级 scale 太粗；本档是独立的新实现。
+// 布局：数据平面 E4M3/int8 字节 [rows, heads, head_dim]（token-major 行主序，行宽 =
+// kv_heads*head_dim 字节——与 QSA 分页的 4-token 块/块表间接寻址同一行几何，
+// 分页 gather 未来可直接按槽号×行宽寻址）；scale 平面 f16
+// [rows*heads*(head_dim/32)]（组号 = (kh*head_dim + d)/32，逐头内顺序）。
+// 每 warp 负责一个 32 维组（lane 一维）：amax 用 xor-shuffle 归约（无 shared），
+// 全零组 scale=1（避免除零）。
+//
+// ── int8-G32 子档（`LINGXI_KV_FP8_MODE=int8`，安全档，默认）───────────────────
+// 对称量化：scale = amax/127、q = round(x/scale) ∈ [-127,127]；解码 x̂ = q·scale。
+// 与 E4M3 共用同一字节平面（1B/元素）与 f16 scale 平面，仅编解码不同。
+// 相对误差 ≤ 1/254（RNE，≈0.39% 均匀码距）——文献口径 4-bit per-channel 量化即
+// 近无损（KIVI/KVQuant），int8 g32 按理应过最严判据（KL<0.005 且首 token 一致）。
+__device__ __forceinline__ unsigned char f32_to_int8g(float x, float inv_s) {
+    int qv = __float2int_rn(x * inv_s);
+    qv = max(-127, min(127, qv));
+    return (unsigned char)(signed char)qv;
+}
+
+// mode：0 = E4M3（scale=amax/448），1 = int8（scale=amax/127）。返回组 scale。
+__device__ __forceinline__ float fp8g_scale(float av, int mode) {
+    return av > 0.0f ? (av / (mode == 1 ? 127.0f : 448.0f)) : 1.0f;
+}
+
+__device__ __forceinline__ unsigned char fp8g_encode(float x, float s, int mode) {
+    return mode == 1 ? f32_to_int8g(x, 1.0f / s) : f32_to_e4m3(x * (1.0f / s));
+}
+
+// 量化主循环（源/目的行偏移由调用方给）。每 warp 一组、lane 一维。
+__device__ __forceinline__ void fp8g_quant_row(const bf16* __restrict__ src,
+                                               unsigned char* __restrict__ dst,
+                                               __half* __restrict__ srow,
+                                               int ng, int lane, int warp, int nwarp, int mode) {
+    for (int g = warp; g < ng; g += nwarp) {
+        const int d = (g << 5) + lane;   // 每 lane 恰一组内一维
+        const float xv = __bfloat162float(src[d]);
+        float av = fabsf(xv);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            av = fmaxf(av, fabsf(__shfl_xor_sync(0xffffffffu, xv, off)));
+        }
+        const float s = fp8g_scale(av, mode);
+        if (lane == 0) {
+            srow[g] = __float2half(s);
+        }
+        dst[d] = fp8g_encode(xv, s, mode);
+    }
+}
+
+extern "C" __global__ void lingxi_quant_rows_fp8g32_bf16(const bf16* __restrict__ x,
+                                                         unsigned char* __restrict__ q,
+                                                         __half* __restrict__ sc,
+                                                         int rows,
+                                                         int heads,
+                                                         int head_dim,
+                                                         int mode) {
+    (void)rows;
+    const int rh = blockIdx.x;
+    const int lane = (int)(threadIdx.x & 31);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int nwarp = (int)(blockDim.x >> 5);
+    const int ng = head_dim >> 5;   // 每头 32 维组数（要求 head_dim%32==0，调用方保证）
+    fp8g_quant_row(x + ((size_t)rh) * head_dim, q + ((size_t)rh) * head_dim,
+                   sc + ((size_t)rh) * ng, ng, lane, warp, nwarp, mode);
+    (void)heads;
+}
+
+// ── FP8-G32 残差窗 flush 量化（KIVI 式，两档共用；`LINGXI_KV_FP8_RESIDUAL`）────
+// 平面布局（详见 docs/kv-fp8-design.md）：bf16 残差平面 res 共 sink+rcap 行——
+// 头 sink 段（r < sink）线性存放、**永不量化**（KVSink：sink 像 Key bias，量化首
+// token 直接坏首 token 输出）；尾窗段（r ≥ sink）成环，槽位 = sink+(r-sink)%rcap
+// （rcap = recent + 4 + DRAFT_PAD，4 对齐）。flush：尾窗滑出 [q_lo, q_lo_new) 的
+// 4-token 页从环读出、量化进压缩平面（KIVI residual flush，追加零成本——bf16 直拷，
+// 量化延迟到页出窗）。水位 q_lo 只随 flush 前进；rewind 按
+// max(sink, align_down(new_len-recent, 4)) 回退，环槽不被草稿覆写的前提是回卷量
+// ≤ DRAFT_PAD（core_.rs 的 rewind 有 debug_assert）。
+// 网格 = rows*heads（dst 按绝对行号落压缩平面；src 按残差布局寻址，天然处理环回绕）。
+extern "C" __global__ void lingxi_quant_rows_fp8g32_res_bf16(const bf16* __restrict__ x,
+                                                             unsigned char* __restrict__ q,
+                                                             __half* __restrict__ sc,
+                                                             int row0,
+                                                             int rows,
+                                                             int sink,
+                                                             int rcap,
+                                                             int heads,
+                                                             int head_dim,
+                                                             int mode) {
+    const int flat = blockIdx.x;
+    const int head = flat % heads;
+    const int rl = flat / heads;
+    const int r = row0 + rl;   // 绝对行号（必 ≥ sink）
+    const size_t src_row = (size_t)(r < sink ? r : sink + (r - sink) % rcap);
+    const int lane = (int)(threadIdx.x & 31);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int nwarp = (int)(blockDim.x >> 5);
+    const int ng = head_dim >> 5;
+    fp8g_quant_row(x + (src_row * heads + head) * head_dim,
+                   q + (((size_t)r * heads + head) * head_dim),
+                   sc + ((size_t)r * heads + head) * ng,
+                   ng, lane, warp, nwarp, mode);
+}
+
 // 部分 RoPE（NEOX 配对，就地）：x[rows, heads, head_dim]，只旋转前 rot_dim 维。
 // cos/sin 是覆盖全序列的表（BF16）；第 row 行对应**绝对位置** row+pos_offset
 // （整段前向 pos_offset=0；增量 decode 时 = 已缓存 token 数）。
@@ -159,13 +268,13 @@ extern "C" __global__ void lingxi_rope_partial_stride_bf16(bf16* __restrict__ x,
 }
 
 // 带加性掩码的多头注意力（GQA，token-major 布局，batch=1）：
-// q[T, H, D], k/v[Tk, KVH, D], mask[1, T, Tk]（float 加性），scale
+//   q[T, H, D], k/v[Tk, KVH, D], mask[1, T, Tk]（float 加性），scale
 // 布局按 token-major 是为了直接消费投影结果，避免额外转置。
 // ─────────── 稀疏注意力（重写版，2026-10-15）───────────
 //
 // ⚠️ **上一版是个 O(head_dim²·Tk) 的算法事故**：它的第三段（加权求和）写成
-// `for (d = tid; d < head_dim; d += blockDim) { for (j = 0; j < Tk; ++j) { s = Σ_dd q·k; ← 重算点积
-// acc += exp(s)·v[j][d]; } }`
+//   `for (d = tid; d < head_dim; d += blockDim) { for (j = 0; j < Tk; ++j) { s = Σ_dd q·k;  ← 重算点积
+//      acc += exp(s)·v[j][d]; } }`
 // 也就是**每个输出维度都把所有 key 的 QK 点积重算一遍**。head_dim=256 时，
 // 每个 (head, token) 要做 `Tk·head_dim² = 192·65536 ≈ 12.6 M` 次 FMA，而正确量是 `Tk·head_dim = 49 K`
 // ——**256 倍**。实测 `tk=192` 时单核 **1240 µs**（tk=4096 时 32.6 ms），
@@ -175,9 +284,38 @@ extern "C" __global__ void lingxi_rope_partial_stride_bf16(bf16* __restrict__ x,
 // 点积只算两次（一遍求 max，一遍出 exp 并顺便做加权和），exp 值落在 shared。
 // tile 循环保证任意 Tk 都能跑（不受 shared 容量限制）；`head_dim ≤ blockDim` 由调用方保证
 // （不满足时回退旧核，见 `lingxi_attn_masked_bf16`）。
-// P15-㊵：attn2 同样模板化，SPARSE=true 为 decode(t<4) 的跳块变体（attn2s）。
+// attn2 同样模板化，SPARSE=true 为 decode(t<4) 的跳块变体（attn2s）。
 // 三态语义与 attn3_body 完全一致（见 state_j 注释）。
-template <bool SPARSE>
+// F8KV=true：`LINGXI_KV_FP8` 档（FP8-G32/int8-G32，`LINGXI_KV_FP8_MODE`）——数据
+// 平面复用 k_q8/v_q8 形参（同为每维 1 字节的行主序），scale 为每 32 维一组的 f16
+// 平面 k_f8s/v_f8s；f8_mode 0=E4M3 / 1=int8 仅改编解码。
+// ── 残差窗（KIVI 式，两档共用，`LINGXI_KV_FP8_RESIDUAL`）─────────────────────
+// kv_rcap != 0 即启用：k_res/v_res 为 bf16 残差平面（sink+rcap 行）。行分流——
+//   pos < kv_sink            → sink 段 bf16（永不量化，KVSink）
+//   pos ≥ kv_qlo             → 尾窗环 bf16（最近 kv_recent token，KIVI residual）
+//   kv_sink ≤ pos < kv_qlo   → 压缩平面（E4M3/int8 + 32 维组 f16 scale）
+// 分支开销分析：每 key 行 2 次整数比较（pos<sink、pos≥q_lo）。整条 warp 处理同一
+// key ⇒ 分支 warp 级一致、无 lane 分叉；长上下文 ≥99% 的行落在中间压缩分支（完全
+// 可预测），残差行 ≤ sink+recent+3 ≈ 147 行。尾窗槽位用 qlo_slot 增量式寻址
+// （一次 cmp+sub 处理环回绕，**无整除**）。开销 ≈ 每 key 2 cmp，相对每 key
+// head_dim=256 次 FMA 可忽略；两路 bf16 读都保持 16B 对齐向量 load。
+__device__ __forceinline__ bool kvres_is_bf16(int pos, int kv_sink, int kv_qlo, int kv_rcap) {
+    return kv_rcap != 0 && (pos < kv_sink || pos >= kv_qlo);
+}
+
+// 残差平面行槽（pos 必属 sink 段 [0,sink) 或尾窗段 [q_lo, ·)）。
+__device__ __forceinline__ int kvres_slot(int pos, int kv_sink, int qlo_slot, int kv_qlo, int kv_rcap) {
+    if (pos < kv_sink) {
+        return pos;
+    }
+    int sl = qlo_slot + (pos - kv_qlo);
+    if (sl >= kv_sink + kv_rcap) {
+        sl -= kv_rcap;   // 尾窗跨度 < rcap ⇒ 至多回绕一次
+    }
+    return sl;
+}
+
+template <bool SPARSE, bool F8KV = false>
 __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
                                            const bf16* __restrict__ k,
                                            const bf16* __restrict__ v,
@@ -194,11 +332,23 @@ __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
                                            int vis_base,
                                            int nblocks,
                                            int cshift,
-                                           // ㊶ KV 量化（非空即启用；K/V 必须同时给）：
+                                           // KV 量化（非空即启用；K/V 必须同时给）：
                                            const unsigned char* __restrict__ k_q8 = nullptr,
                                            const float* __restrict__ k_sc = nullptr,
                                            const unsigned char* __restrict__ v_q8 = nullptr,
-                                           const float* __restrict__ v_sc = nullptr) {
+                                           const float* __restrict__ v_sc = nullptr,
+                                           // FP8-G32：每 32 维一组的 f16 scale 平面
+                                           const __half* __restrict__ k_f8s = nullptr,
+                                           const __half* __restrict__ v_f8s = nullptr,
+                                           // FP8 残差窗（kv_rcap != 0 即启用；k_res/v_res
+                                           // 为 sink+kv_rcap 行 bf16 平面，禁用时应
+                                           // 传 stub 且 kv_rcap=0）：
+                                           const bf16* __restrict__ k_res = nullptr,
+                                           const bf16* __restrict__ v_res = nullptr,
+                                           int kv_sink = 0,
+                                           int kv_qlo = 0,
+                                           int kv_rcap = 0,
+                                           int f8_mode = 0) {
     extern __shared__ float smem[];
     float* sp = smem;          // [tile]：本 tile 的 exp 值
     float* sred = smem + tile; // [32]：跨 warp 归约
@@ -213,6 +363,10 @@ __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
     const int nwarp = (int)(blockDim.x >> 5);
     const int kh = h / (heads / kv_heads);
     const bool q8 = (k_q8 != nullptr);
+    // FP8 残差窗：尾窗环在 q_lo 处的槽位（块级常量，环寻址免整除的前提）。
+    const int qlo_slot = (kv_rcap > 0 && kv_qlo > kv_sink)
+        ? kv_sink + ((kv_qlo - kv_sink) % kv_rcap)
+        : kv_sink;
     const bf16* qv = q + ((size_t)i * heads + h) * head_dim;
     const float* mrow = mask + (size_t)i * Tk;
 
@@ -236,8 +390,58 @@ __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
             const int st = SPARSE ? state_j(j0 + j) : 0;
             float s = 0.0f;
             if (st == 0) {
-                if (q8) {
-                    // ㊶ 量化 K：8 字节 load + 解码；scale 提到点积外（有损路径，无需保序）
+                if (F8KV) {
+                    const int pos = j0 + j;
+                    if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                        // 残差窗 bf16 读（sink 段 / 尾窗环）：与 bf16 档同构的
+                        // 128 位 load，仅基址换成残差平面槽位（分支开销见函数头注释）。
+                        const int sl = kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap);
+                        const bf16* kbp = k_res + ((size_t)sl * kv_heads + kh) * head_dim;
+                        float sd = 0.0f;
+                        for (int d0 = lane * 8; d0 < head_dim; d0 += 256) {
+                            const int4 qv4 = *reinterpret_cast<const int4*>(qv + d0);
+                            const int4 kv4 = *reinterpret_cast<const int4*>(kbp + d0);
+                            const bf16* qp = reinterpret_cast<const bf16*>(&qv4);
+                            const bf16* kp = reinterpret_cast<const bf16*>(&kv4);
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                sd += __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
+                            }
+                        }
+                        s += sd;
+                    } else {
+                    // FP8-G32：数据经 k_q8 形参（同字节布局），scale 为每 32 维一组 f16。
+                    // lane 的 8 维（d0=lane*8）必落在同一 32 组（组号 = d0>>5）⇒
+                    // 组 scale 提出 8 元点积外（有损路径，无需保序；head_dim=256 时
+                    // 循环只有一轮，与逐维乘 scale 恒等）。f8_mode=1 时解码走 int8
+                    // （(float)(int8)b × 组 scale，对称量化 amax/127）。
+                    const unsigned char* kqp = k_q8 + ((size_t)pos * kv_heads + kh) * head_dim;
+                    const __half* ksrow = k_f8s + ((size_t)pos * kv_heads + kh) * (head_dim >> 5);
+                    float sd = 0.0f;
+                    for (int d0 = lane * 8; d0 < head_dim; d0 += 256) {
+                        const float gsc = __half2float(ksrow[d0 >> 5]);
+                        const int4 qv4 = *reinterpret_cast<const int4*>(qv + d0);
+                        const uint2 kv2 = *reinterpret_cast<const uint2*>(kqp + d0);
+                        const bf16* qp = reinterpret_cast<const bf16*>(&qv4);
+                        const unsigned char* kp = reinterpret_cast<const unsigned char*>(&kv2);
+                        float part = 0.0f;
+                        if (f8_mode == 1) {
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                part += __bfloat162float(qp[z]) * (float)(signed char)kp[z];
+                            }
+                        } else {
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                part += __bfloat162float(qp[z]) * e4m3_to_f32(kp[z]);
+                            }
+                        }
+                        sd += part * gsc;
+                    }
+                    s += sd;
+                    }
+                } else if (q8) {
+                    // 量化 K：8 字节 load + 解码；scale 提到点积外（有损路径，无需保序）
                     const unsigned char* kqp = k_q8 + ((size_t)(j0 + j) * kv_heads + kh) * head_dim;
                     const float ksc = k_sc[(size_t)(j0 + j) * kv_heads + kh];
                     float sd = 0.0f;
@@ -314,7 +518,52 @@ __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
             const int st = SPARSE ? state_j(j0 + j) : 0;
             float s = 0.0f;
             if (st == 0) {
-                if (q8) {
+                if (F8KV) {
+                    const int pos = j0 + j;
+                    if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                        // 残差窗 bf16 读（sink 段 / 尾窗环，第 1 遍同构）
+                        const int sl = kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap);
+                        const bf16* kbp = k_res + ((size_t)sl * kv_heads + kh) * head_dim;
+                        float sd = 0.0f;
+                        for (int d0 = lane * 8; d0 < head_dim; d0 += 256) {
+                            const int4 qv4 = *reinterpret_cast<const int4*>(qv + d0);
+                            const int4 kv4 = *reinterpret_cast<const int4*>(kbp + d0);
+                            const bf16* qp = reinterpret_cast<const bf16*>(&qv4);
+                            const bf16* kp = reinterpret_cast<const bf16*>(&kv4);
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                sd += __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
+                            }
+                        }
+                        s += sd;
+                    } else {
+                    // FP8-G32：scale 为每 32 维一组 f16（第 1 遍同构，见上文注释）
+                    const unsigned char* kqp = k_q8 + ((size_t)pos * kv_heads + kh) * head_dim;
+                    const __half* ksrow = k_f8s + ((size_t)pos * kv_heads + kh) * (head_dim >> 5);
+                    float sd = 0.0f;
+                    for (int d0 = lane * 8; d0 < head_dim; d0 += 256) {
+                        const float gsc = __half2float(ksrow[d0 >> 5]);
+                        const int4 qv4 = *reinterpret_cast<const int4*>(qv + d0);
+                        const uint2 kv2 = *reinterpret_cast<const uint2*>(kqp + d0);
+                        const bf16* qp = reinterpret_cast<const bf16*>(&qv4);
+                        const unsigned char* kp = reinterpret_cast<const unsigned char*>(&kv2);
+                        float part = 0.0f;
+                        if (f8_mode == 1) {
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                part += __bfloat162float(qp[z]) * (float)(signed char)kp[z];
+                            }
+                        } else {
+#pragma unroll
+                            for (int z = 0; z < 8; ++z) {
+                                part += __bfloat162float(qp[z]) * e4m3_to_f32(kp[z]);
+                            }
+                        }
+                        sd += part * gsc;
+                    }
+                    s += sd;
+                    }
+                } else if (q8) {
                     const unsigned char* kqp = k_q8 + ((size_t)(j0 + j) * kv_heads + kh) * head_dim;
                     const float ksc = k_sc[(size_t)(j0 + j) * kv_heads + kh];
                     float sd = 0.0f;
@@ -386,10 +635,28 @@ __device__ __forceinline__ void attn2_body(const bf16* __restrict__ q,
             for (int j = 0; j < jn; ++j) {
                 // V 读取跳过（bit-safe 论据同 attn3_body）
                 if (!SPARSE || sp[j] != 0.0f) {
-                    const float vv = q8
-                        ? e4m3_to_f32(vqp[(size_t)(j0 + j) * kv_heads * head_dim]) *
-                          v_sc[(size_t)(j0 + j) * kv_heads + kh]
-                        : __bfloat162float(vbase[(size_t)(j0 + j) * kv_heads * head_dim]);
+                    float vv;
+                    if (F8KV) {
+                        const int pos = j0 + j;
+                        if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                            // 残差窗 bf16 读（sink 段 / 尾窗环）
+                            const int sl = kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap);
+                            vv = __bfloat162float(v_res[((size_t)sl * kv_heads + kh) * head_dim + tid]);
+                        } else {
+                            // FP8-G32：scale 为每 32 维一组 f16（组号 = tid>>5）；
+                            // f8_mode=1 时 int8 解码（(float)(int8)b × 组 scale）
+                            vv = (f8_mode == 1
+                                ? (float)(signed char)vqp[(size_t)pos * kv_heads * head_dim] *
+                                  __half2float(v_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (tid >> 5)])
+                                : e4m3_to_f32(vqp[(size_t)pos * kv_heads * head_dim]) *
+                                  __half2float(v_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (tid >> 5)]));
+                        }
+                    } else {
+                        vv = q8
+                            ? e4m3_to_f32(vqp[(size_t)(j0 + j) * kv_heads * head_dim]) *
+                              v_sc[(size_t)(j0 + j) * kv_heads + kh]
+                            : __bfloat162float(vbase[(size_t)(j0 + j) * kv_heads * head_dim]);
+                    }
                     a += sp[j] * vv;
                 }
             }
@@ -418,7 +685,7 @@ extern "C" __global__ void lingxi_attn2_masked_bf16(const bf16* __restrict__ q,
     attn2_body<false>(q, k, v, mask, nullptr, out, heads, kv_heads, T, Tk, head_dim, scale, tile, 0, 0, 0);
 }
 
-// 跳块稀疏 decode 版入口（P15-㊵）：语义见 attn5 入口注释
+// 跳块稀疏 decode 版入口：语义见 attn5 入口注释
 extern "C" __global__ void lingxi_attn2s_sparse_bf16(const bf16* __restrict__ q,
                                                      const bf16* __restrict__ k,
                                                      const bf16* __restrict__ v,
@@ -438,7 +705,7 @@ extern "C" __global__ void lingxi_attn2s_sparse_bf16(const bf16* __restrict__ q,
                      vis_base, nblocks, cshift);
 }
 
-// ㊶ KV 量化（E4M3）入口：k_q8/k_sc/v_q8/v_sc 非空即启用；k/v 形参仅在 bf16 路径读。
+// KV 量化（E4M3）入口：k_q8/k_sc/v_q8/v_sc 非空即启用；k/v 形参仅在 bf16 路径读。
 extern "C" __global__ void lingxi_attn2_masked_kvq8_bf16(const bf16* __restrict__ q,
                                                          const bf16* __restrict__ k,
                                                          const bf16* __restrict__ v,
@@ -482,7 +749,68 @@ extern "C" __global__ void lingxi_attn2s_sparse_kvq8_bf16(const bf16* __restrict
                      vis_base, nblocks, cshift, k_q8, k_sc, v_q8, v_sc);
 }
 
-// ─────────── 行块平铺版（attn3，2026-10-17，P15-㊳）───────────
+// FP8-G32 KV 入口（`LINGXI_KV_FP8`）：数据平面走 k_q8/v_q8 形参（同为每维 1 字节
+// 行主序），k_f8s/v_f8s 为每 32 维一组的 f16 scale 平面。分派结构与 kvq8 相同。
+// k_res/v_res + kv_sink/kv_qlo/kv_rcap = KIVI 式残差窗（kv_rcap=0 即关，传 stub）；
+// f8_mode 0=E4M3 / 1=int8（`LINGXI_KV_FP8_MODE`）。
+extern "C" __global__ void lingxi_attn2_masked_kvfp8_bf16(const bf16* __restrict__ q,
+                                                          const bf16* __restrict__ k,
+                                                          const bf16* __restrict__ v,
+                                                          const float* __restrict__ mask,
+                                                          bf16* __restrict__ out,
+                                                          int heads,
+                                                          int kv_heads,
+                                                          int T,
+                                                          int Tk,
+                                                          int head_dim,
+                                                          float scale,
+                                                          int tile,
+                                                          const unsigned char* __restrict__ k_f8,
+                                                          const __half* __restrict__ k_f8s,
+                                                          const unsigned char* __restrict__ v_f8,
+                                                          const __half* __restrict__ v_f8s,
+                                                          const bf16* __restrict__ k_res,
+                                                          const bf16* __restrict__ v_res,
+                                                          int kv_sink,
+                                                          int kv_qlo,
+                                                          int kv_rcap,
+                                                          int f8_mode) {
+    attn2_body<false, true>(q, k, v, mask, nullptr, out, heads, kv_heads, T, Tk, head_dim, scale,
+                            tile, 0, 0, 0, k_f8, nullptr, v_f8, nullptr, k_f8s, v_f8s,
+                            k_res, v_res, kv_sink, kv_qlo, kv_rcap, f8_mode);
+}
+
+extern "C" __global__ void lingxi_attn2s_sparse_kvfp8_bf16(const bf16* __restrict__ q,
+                                                           const bf16* __restrict__ k,
+                                                           const bf16* __restrict__ v,
+                                                           const unsigned char* __restrict__ keep,
+                                                           bf16* __restrict__ out,
+                                                           int heads,
+                                                           int kv_heads,
+                                                           int T,
+                                                           int Tk,
+                                                           int head_dim,
+                                                           float scale,
+                                                           int tile,
+                                                           int vis_base,
+                                                           int nblocks,
+                                                           int cshift,
+                                                           const unsigned char* __restrict__ k_f8,
+                                                           const __half* __restrict__ k_f8s,
+                                                           const unsigned char* __restrict__ v_f8,
+                                                           const __half* __restrict__ v_f8s,
+                                                           const bf16* __restrict__ k_res,
+                                                           const bf16* __restrict__ v_res,
+                                                           int kv_sink,
+                                                           int kv_qlo,
+                                                           int kv_rcap,
+                                                           int f8_mode) {
+    attn2_body<true, true>(q, k, v, nullptr, keep, out, heads, kv_heads, T, Tk, head_dim, scale,
+                           tile, vis_base, nblocks, cshift, k_f8, nullptr, v_f8, nullptr, k_f8s, v_f8s,
+                           k_res, v_res, kv_sink, kv_qlo, kv_rcap, f8_mode);
+}
+
+// ─────────── 行块平铺版（attn3，2026-10-17）───────────
 //
 // 动机（实测，17K 上下文 prefill）：attn2 的 grid=(T, heads)，**每个 (行,头) 块独自
 // 流式扫全量 K（两遍）+V**，per-chunk attention 流量 = O(chunk×T)。17K 语料实测
@@ -491,10 +819,10 @@ extern "C" __global__ void lingxi_attn2s_sparse_kvq8_bf16(const bf16* __restrict
 //
 // 改法：一个 block 负责 R 行 × 1 头，K/V 只流一遍喂 R 行 ⇒ 流量 ÷R。
 // **bit-safe 论证**：每行内部的全部归约次序与 attn2 逐项相同——
-// ① 点积：lane 沿 d0=lane*8 的 8 元 FMA 链 + 同一 shuffle 树（R 行只是复用同一
-// 次 kv load 各算各的，互不干扰）；
-// ② max：fmax 无舍入，同集合任意次序结果逐位相同；
-// ③ exp/lsum/acc：sp 值相同，求和循环（strided-by-blockDim / 顺序 j）原样保留。
+//   ① 点积：lane 沿 d0=lane*8 的 8 元 FMA 链 + 同一 shuffle 树（R 行只是复用同一
+//      次 kv load 各算各的，互不干扰）；
+//   ② max：fmax 无舍入，同集合任意次序结果逐位相同；
+//   ③ exp/lsum/acc：sp 值相同，求和循环（strided-by-blockDim / 顺序 j）原样保留。
 // 只改"哪些行共享 K 读"，不改任何一行的数学。
 //
 // 约束：head_dim == 256 == blockDim（调用方保证，否则回退 attn2）；T 任意（尾部行守卫）。
@@ -502,12 +830,12 @@ extern "C" __global__ void lingxi_attn2s_sparse_kvq8_bf16(const bf16* __restrict
 #define LINGXI_ATTN3_TILE 512
 #define LINGXI_ATTN3_KPF 4
 
-// P15-㊵ 跳块稀疏变体（SPARSE=true）：按 keep[]+因果谓词**跳过未选中位置的点积**。
+// 跳块稀疏变体（SPARSE=true）：按 keep[]+因果谓词**跳过未选中位置的点积**。
 // bit-safe 论证：被跳位置在密集版里的贡献恰为 0——mask=f32::MIN(+s 被吸附) ⇒ exp≡0；
 // lsum/acc 的加 0 精确不变（x+±0=x，唯一例外是 acc 恰停于 ∓0 的测零概率边角，判据回归覆盖）；
 // lsum/acc 循环保持全扫 ⇒ 求和分区与次序与密集版逐项相同。参考实现（ninfer-dev
 // qsa_attend_volta 的 kv_gather 方案）同思路，我们选"原地跳"省掉 gather 拷贝。
-template <bool SPARSE>
+template <bool SPARSE, bool F8KV = false>
 __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                                            const bf16* __restrict__ k,
                                            const bf16* __restrict__ v,
@@ -523,11 +851,22 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                                            int vis_base,
                                            int nblocks,
                                            int cshift,
-                                           // ㊶ KV 量化（非空即启用；K/V 必须同时给）
+                                           // KV 量化（非空即启用；K/V 必须同时给）
                                            const unsigned char* __restrict__ k_q8 = nullptr,
                                            const float* __restrict__ k_sc = nullptr,
                                            const unsigned char* __restrict__ v_q8 = nullptr,
-                                           const float* __restrict__ v_sc = nullptr) {
+                                           const float* __restrict__ v_sc = nullptr,
+                                           // FP8-G32：每 32 维一组的 f16 scale 平面
+                                           const __half* __restrict__ k_f8s = nullptr,
+                                           const __half* __restrict__ v_f8s = nullptr,
+                                           // FP8 残差窗（kv_rcap != 0 即启用；行分流
+                                           // 与分支开销分析见 attn2_body 头注释）：
+                                           const bf16* __restrict__ k_res = nullptr,
+                                           const bf16* __restrict__ v_res = nullptr,
+                                           int kv_sink = 0,
+                                           int kv_qlo = 0,
+                                           int kv_rcap = 0,
+                                           int f8_mode = 0) {
     constexpr int R = LINGXI_ATTN3_R;
     constexpr int TILE = LINGXI_ATTN3_TILE;
     constexpr int KPF = LINGXI_ATTN3_KPF;
@@ -540,16 +879,20 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const bool q8 = (k_q8 != nullptr);
+    // FP8 残差窗：尾窗环在 q_lo 处的槽位（块级常量）。
+    const int qlo_slot = (kv_rcap > 0 && kv_qlo > kv_sink)
+        ? kv_sink + ((kv_qlo - kv_sink) % kv_rcap)
+        : kv_sink;
     const int nwarp = (int)(blockDim.x >> 5);
     const int kh = h / (heads / kv_heads);
     // 本块实际行数（尾部块可能不足 R）
     int nr = T - i0; if (nr > R) nr = R;
 
     // 跳块状态（仅 SPARSE 使用）：对绝对位置 pos、行 i0+r 返回
-    // 0 = 计算点积（pos < vis 且 [尾区 ∨ keep 选中]）
-    // 1 = 跳过、mask 值 -FLT_MAX（dense 的 s*scale 被吸附后的精确等价：可见未选中 /
-    // 超 vis 但选中 —— 两者的 dense mask 都是恰 -FLT_MAX）
-    // 2 = 跳过、mask 值 -inf（超 vis 且未选中）
+    //   0 = 计算点积（pos < vis 且 [尾区 ∨ keep 选中]）
+    //   1 = 跳过、mask 值 -FLT_MAX（dense 的 s*scale 被吸附后的精确等价：可见未选中 /
+    //       超 vis 但选中 —— 两者的 dense mask 都是恰 -FLT_MAX）
+    //   2 = 跳过、mask 值 -inf（超 vis 且未选中）
     // dense 版对跳过位置 sp1=mask 值（吸附）、sp2=__expf(mask-mx)——非退化 mx 有限 ⇒ 0，
     // 退化（整行无可见位，mx=-FLT_MAX）⇒ (1)=1 / (2)=0，本写法逐位复刻（含退化）。
     auto state_j = [&](int r, int pos) -> int {
@@ -591,14 +934,18 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
         const int jn = (Tk - j0) < TILE ? (Tk - j0) : TILE;
         for (int jb = warp * KPF; jb < jn; jb += nwarp * KPF) {
             int4 kv4[KPF];
-            uint2 kv2[KPF];   // ㊶ 量化 K 的 8 字节槽位（q8 时用）
-            float ksc[KPF];   // ㊶ 每 (pos, kv头) 的 K scale
+            uint2 kv2[KPF];   // 量化 K 的 8 字节槽位（q8/FP8 时用）
+            float ksc[KPF];   // 每 (pos, kv头) 的 K scale
+            __half kscf[KPF]; // FP8-G32：每 (pos, 32维组) 的 f16 K scale
+                              //（lane 的 8 维必同组：组号 = (lane*8)>>5 = lane>>2）
+            bool resb[KPF];   // FP8 残差窗：本 key 走 bf16 残差读（kv4[u] 有效）
             int st[KPF][R];      // 三态：0 算 / 1 跳(-FLT_MAX) / 2 跳(-inf)
             bool any_on[KPF];
 #pragma unroll
             for (int u = 0; u < KPF; ++u) {
                 const int j = jb + u;
                 any_on[u] = false;
+                resb[u] = false;
                 if (j < jn) {
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
@@ -606,7 +953,22 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                         any_on[u] |= (st[u][r] == 0);
                     }
                     if (any_on[u]) {
-                        if (q8) {
+                        if (F8KV) {
+                            const int pos = j0 + j;
+                            if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                                // FP8 残差窗 bf16 读（sink 段 / 尾窗环）
+                                resb[u] = true;
+                                kv4[u] = *reinterpret_cast<const int4*>(
+                                    k_res + ((size_t)kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap)
+                                             * kv_heads + kh) * head_dim + lane * 8);
+                            } else {
+                            // FP8-G32：数据平面经 k_q8 形参（同为每维 1 字节行主序），
+                            // scale 为每 32 维一组 f16（lane 的 8 维同组 ⇒ 组号 lane>>2）
+                            kv2[u] = *reinterpret_cast<const uint2*>(
+                                k_q8 + ((size_t)pos * kv_heads + kh) * head_dim + lane * 8);
+                            kscf[u] = k_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (lane >> 2)];
+                            }
+                        } else if (q8) {
                             kv2[u] = *reinterpret_cast<const uint2*>(
                                 k_q8 + ((size_t)(j0 + j) * kv_heads + kh) * head_dim + lane * 8);
                             ksc[u] = k_sc[(size_t)(j0 + j) * kv_heads + kh];
@@ -629,14 +991,26 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                         const bf16* qp = reinterpret_cast<const bf16*>(&qreg[r]);
                         s[u][r] = 0.0f;
                         if (st[u][r] == 0) {
+                            if (F8KV && resb[u]) {
+                                // FP8 残差窗：bf16 原值点积（无 scale）
+#pragma unroll
+                                for (int z = 0; z < 8; ++z) {
+                                    s[u][r] += __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
+                                }
+                            } else {
 #pragma unroll
                             for (int z = 0; z < 8; ++z) {
                                 s[u][r] += q8
-                                    ? __bfloat162float(qp[z]) * e4m3_to_f32(kqp[z])
+                                    ? __bfloat162float(qp[z]) * (F8KV && f8_mode == 1
+                                        ? (float)(signed char)kqp[z]
+                                        : e4m3_to_f32(kqp[z]))
                                     : __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
                             }
-                            if (q8) {
+                            if (F8KV) {
+                                s[u][r] *= __half2float(kscf[u]);
+                            } else if (q8) {
                                 s[u][r] *= ksc[u];
+                            }
                             }
                         }
                     }
@@ -710,14 +1084,18 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
         const int jn = (Tk - j0) < TILE ? (Tk - j0) : TILE;
         for (int jb = warp * KPF; jb < jn; jb += nwarp * KPF) {
             int4 kv4[KPF];
-            uint2 kv2[KPF];   // ㊶ 量化 K 的 8 字节槽位（q8 时用）
-            float ksc[KPF];   // ㊶ 每 (pos, kv头) 的 K scale
+            uint2 kv2[KPF];   // 量化 K 的 8 字节槽位（q8/FP8 时用）
+            float ksc[KPF];   // 每 (pos, kv头) 的 K scale
+            __half kscf[KPF]; // FP8-G32：每 (pos, 32维组) 的 f16 K scale
+                              //（lane 的 8 维必同组：组号 = (lane*8)>>5 = lane>>2）
+            bool resb[KPF];   // FP8 残差窗：本 key 走 bf16 残差读（kv4[u] 有效）
             int st[KPF][R];
             bool any_on[KPF];
 #pragma unroll
             for (int u = 0; u < KPF; ++u) {
                 const int j = jb + u;
                 any_on[u] = false;
+                resb[u] = false;
                 if (j < jn) {
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
@@ -725,7 +1103,22 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                         any_on[u] |= (st[u][r] == 0);
                     }
                     if (any_on[u]) {
-                        if (q8) {
+                        if (F8KV) {
+                            const int pos = j0 + j;
+                            if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                                // FP8 残差窗 bf16 读（sink 段 / 尾窗环）
+                                resb[u] = true;
+                                kv4[u] = *reinterpret_cast<const int4*>(
+                                    k_res + ((size_t)kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap)
+                                             * kv_heads + kh) * head_dim + lane * 8);
+                            } else {
+                            // FP8-G32：数据平面经 k_q8 形参（同为每维 1 字节行主序），
+                            // scale 为每 32 维一组 f16（lane 的 8 维同组 ⇒ 组号 lane>>2）
+                            kv2[u] = *reinterpret_cast<const uint2*>(
+                                k_q8 + ((size_t)pos * kv_heads + kh) * head_dim + lane * 8);
+                            kscf[u] = k_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (lane >> 2)];
+                            }
+                        } else if (q8) {
                             kv2[u] = *reinterpret_cast<const uint2*>(
                                 k_q8 + ((size_t)(j0 + j) * kv_heads + kh) * head_dim + lane * 8);
                             ksc[u] = k_sc[(size_t)(j0 + j) * kv_heads + kh];
@@ -748,14 +1141,26 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
                         const bf16* qp = reinterpret_cast<const bf16*>(&qreg[r]);
                         s[u][r] = 0.0f;
                         if (st[u][r] == 0) {
+                            if (F8KV && resb[u]) {
+                                // FP8 残差窗：bf16 原值点积（无 scale）
+#pragma unroll
+                                for (int z = 0; z < 8; ++z) {
+                                    s[u][r] += __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
+                                }
+                            } else {
 #pragma unroll
                             for (int z = 0; z < 8; ++z) {
                                 s[u][r] += q8
-                                    ? __bfloat162float(qp[z]) * e4m3_to_f32(kqp[z])
+                                    ? __bfloat162float(qp[z]) * (F8KV && f8_mode == 1
+                                        ? (float)(signed char)kqp[z]
+                                        : e4m3_to_f32(kqp[z]))
                                     : __bfloat162float(qp[z]) * __bfloat162float(kp[z]);
                             }
-                            if (q8) {
+                            if (F8KV) {
+                                s[u][r] *= __half2float(kscf[u]);
+                            } else if (q8) {
                                 s[u][r] *= ksc[u];
+                            }
                             }
                         }
                     }
@@ -823,7 +1228,7 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
             __syncthreads();
         }
         // 加权 V 求和：V 每 j 只读一次，喂 R 行（acc 次序：每行仍是顺序 j 累加 ⇒ 与 attn2 相同）。
-        // ★ P15-㊵续 V 读取跳过（bit-safe，同 K 点积论据）：sp==0 的位跳过 vv 读取与乘加——
+        // ★ V 读取跳过（bit-safe，同 K 点积论据）：sp==0 的位跳过 vv 读取与乘加——
         // 被跳项是 +0×v = ±0，加不进 acc（唯一例外 acc 恰为 ∓0 的测零概率边角）；
         // 退化情形（mx=-FLT_MAX）masked 位 sp∈{1,0}，非零位照常读 V ⇒ 逐位一致。
         if (tid < head_dim) {
@@ -837,10 +1242,28 @@ __device__ __forceinline__ void attn3_body(const bf16* __restrict__ q,
 #pragma unroll
                 for (int r = 0; r < R; ++r) { any |= (sp[r * TILE + j] != 0.0f); }
                 if (any) {
-                    const float vv = q8
-                        ? e4m3_to_f32(vqp[(size_t)(j0 + j) * kv_heads * head_dim]) *
-                          v_sc[(size_t)(j0 + j) * kv_heads + kh]
-                        : __bfloat162float(vbase[(size_t)(j0 + j) * kv_heads * head_dim]);
+                    float vv;
+                    if (F8KV) {
+                        const int pos = j0 + j;
+                        if (kvres_is_bf16(pos, kv_sink, kv_qlo, kv_rcap)) {
+                            // FP8 残差窗 bf16 读（sink 段 / 尾窗环）
+                            const int sl = kvres_slot(pos, kv_sink, qlo_slot, kv_qlo, kv_rcap);
+                            vv = __bfloat162float(v_res[((size_t)sl * kv_heads + kh) * head_dim + tid]);
+                        } else {
+                            // FP8-G32：scale 为每 32 维一组 f16（组号 = tid>>5）；
+                            // f8_mode=1 时 int8 解码
+                            vv = (f8_mode == 1
+                                ? (float)(signed char)vqp[(size_t)pos * kv_heads * head_dim] *
+                                  __half2float(v_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (tid >> 5)])
+                                : e4m3_to_f32(vqp[(size_t)pos * kv_heads * head_dim]) *
+                                  __half2float(v_f8s[((size_t)pos * kv_heads + kh) * (head_dim >> 5) + (tid >> 5)]));
+                        }
+                    } else {
+                        vv = q8
+                            ? e4m3_to_f32(vqp[(size_t)(j0 + j) * kv_heads * head_dim]) *
+                              v_sc[(size_t)(j0 + j) * kv_heads + kh]
+                            : __bfloat162float(vbase[(size_t)(j0 + j) * kv_heads * head_dim]);
+                    }
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
                         const float s = sp[r * TILE + j];
@@ -881,7 +1304,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn3_masked_bf16(co
     attn3_body<false>(q, k, v, mask, nullptr, out, heads, kv_heads, T, Tk, head_dim, scale, 0, 0, 0);
 }
 
-// 跳块稀疏版入口（P15-㊵）：keep=[行×块] 选中表，vis_base=已缓存 token 数，
+// 跳块稀疏版入口：keep=[行×块] 选中表，vis_base=已缓存 token 数，
 // nblocks/cshift 描述池化几何（tail = nblocks<<cshift）。不读 mask。
 extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn5_sparse_bf16(const bf16* __restrict__ q,
                                                     const bf16* __restrict__ k,
@@ -901,7 +1324,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn5_sparse_bf16(co
                      vis_base, nblocks, cshift);
 }
 
-// ㊶ KV 量化（E4M3）入口：k_q8/k_sc/v_q8/v_sc 非空即启用；k/v 形参仅在 bf16 路径读。
+// KV 量化（E4M3）入口：k_q8/k_sc/v_q8/v_sc 非空即启用；k/v 形参仅在 bf16 路径读。
 extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn3_masked_kvq8_bf16(const bf16* __restrict__ q,
                                                     const bf16* __restrict__ k,
                                                     const bf16* __restrict__ v,
@@ -941,6 +1364,65 @@ extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn5_sparse_kvq8_bf
                                                     const float* __restrict__ v_sc) {
     attn3_body<true>(q, k, v, nullptr, keep, out, heads, kv_heads, T, Tk, head_dim, scale,
                      vis_base, nblocks, cshift, k_q8, k_sc, v_q8, v_sc);
+}
+
+// FP8-G32 KV 入口（`LINGXI_KV_FP8`）：数据平面走 k_q8/v_q8 形参（同为每维 1 字节
+// 行主序），k_f8s/v_f8s 为每 32 维一组的 f16 scale 平面。分派结构与 kvq8 相同。
+// k_res/v_res + kv_sink/kv_qlo/kv_rcap = KIVI 式残差窗（kv_rcap=0 即关，传 stub）；
+// f8_mode 0=E4M3 / 1=int8（`LINGXI_KV_FP8_MODE`）。
+extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn3_masked_kvfp8_bf16(const bf16* __restrict__ q,
+                                                    const bf16* __restrict__ k,
+                                                    const bf16* __restrict__ v,
+                                                    const float* __restrict__ mask,
+                                                    bf16* __restrict__ out,
+                                                    int heads,
+                                                    int kv_heads,
+                                                    int T,
+                                                    int Tk,
+                                                    int head_dim,
+                                                    float scale,
+                                                    const unsigned char* __restrict__ k_f8,
+                                                    const __half* __restrict__ k_f8s,
+                                                    const unsigned char* __restrict__ v_f8,
+                                                    const __half* __restrict__ v_f8s,
+                                                    const bf16* __restrict__ k_res,
+                                                    const bf16* __restrict__ v_res,
+                                                    int kv_sink,
+                                                    int kv_qlo,
+                                                    int kv_rcap,
+                                                    int f8_mode) {
+    attn3_body<false, true>(q, k, v, mask, nullptr, out, heads, kv_heads, T, Tk, head_dim, scale,
+                            0, 0, 0, k_f8, nullptr, v_f8, nullptr, k_f8s, v_f8s,
+                            k_res, v_res, kv_sink, kv_qlo, kv_rcap, f8_mode);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) lingxi_attn5_sparse_kvfp8_bf16(const bf16* __restrict__ q,
+                                                    const bf16* __restrict__ k,
+                                                    const bf16* __restrict__ v,
+                                                    const unsigned char* __restrict__ keep,
+                                                    bf16* __restrict__ out,
+                                                    int heads,
+                                                    int kv_heads,
+                                                    int T,
+                                                    int Tk,
+                                                    int head_dim,
+                                                    float scale,
+                                                    int vis_base,
+                                                    int nblocks,
+                                                    int cshift,
+                                                    const unsigned char* __restrict__ k_f8,
+                                                    const __half* __restrict__ k_f8s,
+                                                    const unsigned char* __restrict__ v_f8,
+                                                    const __half* __restrict__ v_f8s,
+                                                    const bf16* __restrict__ k_res,
+                                                    const bf16* __restrict__ v_res,
+                                                    int kv_sink,
+                                                    int kv_qlo,
+                                                    int kv_rcap,
+                                                    int f8_mode) {
+    attn3_body<true, true>(q, k, v, nullptr, keep, out, heads, kv_heads, T, Tk, head_dim, scale,
+                           vis_base, nblocks, cshift, k_f8, nullptr, v_f8, nullptr, k_f8s, v_f8s,
+                           k_res, v_res, kv_sink, kv_qlo, kv_rcap, f8_mode);
 }
 
 // 旧实现（O(head_dim²·Tk)，仅作 `head_dim > blockDim` 的兜底；正常路径不要用）
@@ -1032,7 +1514,7 @@ extern "C" __global__ void lingxi_attn_masked_bf16(const bf16* __restrict__ q,
 // ───────────────────── QSA indexer 选块（GPU 版，替换 host 路径） ─────────────────────
 //
 // 与 host 参考 `lingxi-model/src/qsa.rs::build_indexer_mask` 逐条对应：
-// 池化(mean→bf16) → RMSNorm → RoPE(块起点位置) → 打分 Σ_h relu(q·p)/√hd → top-k 块 → 掩码。
+//   池化(mean→bf16) → RMSNorm → RoPE(块起点位置) → 打分 Σ_h relu(q·p)/√hd → top-k 块 → 掩码。
 // 四步各一个 kernel，全在同一 stream 上，无 D2H 同步。
 
 // 1) 把一个压缩块的 raw key 求均值并 round 到 bf16：pooled[d] = bf16(Σ_j rk[row0+j][d] / compress)
@@ -1051,7 +1533,7 @@ extern "C" __global__ void lingxi_qsa_pool_block_bf16(const bf16* __restrict__ r
 }
 
 // 1b) **批量池化**：一次 launch 处理 nb 个新块（原来每块一条链 4 个 launch ⇒ 128 块
-// = 512 次 launch/层/chunk，256K 下光 launch 就要 ~10 分钟）。数学与逐块版逐项相同。
+//     = 512 次 launch/层/chunk，256K 下光 launch 就要 ~10 分钟）。数学与逐块版逐项相同。
 extern "C" __global__ void lingxi_qsa_pool_blocks_bf16(const bf16* __restrict__ rk,
                                                        bf16* __restrict__ out,   // [nb, hd] 临时缓冲
                                                        int b0, int nb, int compress, int hd) {
@@ -1070,14 +1552,14 @@ extern "C" __global__ void lingxi_qsa_pool_blocks_bf16(const bf16* __restrict__ 
     out[(size_t)lb * hd + d] = __float2bfloat16(acc / (float)compress);
 }
 
-// 1c) **池化 + RMSNorm + RoPE + 落盘 四发合一**（，2026-10-24）。
-// 分母：线上每个新块要发 4 个 launch（pool / rmsnorm / rope_stride / memcpy），
-// 微基准 23.5 µs，而 work 只有 1 个块 × 128 个元素 ⇒ **全是发射地板**（每发 ~5.9 µs）。
-// 逐位：三步的算式与 `lingxi_qsa_pool_blocks_bf16`（j 升序累加 + `bf16(acc/compress)`）、
-// `lingxi_grouped_rmsnorm_bf16`（256 槽 shared 归约树、`rsqrtf(ss/hd+eps)`、
-// `bf16(f32(x)*rms*f32(gamma))`）、`lingxi_rope_partial_stride_bf16`（pos = b*compress）
-// **逐字相同**；中间结果按同一个 bf16 舍入后留在 shared（原路径是写 global 再读回）。
-// 最后一发原来是把 pool_tmp2 memcpy 到 pooled 的对应段，这里直接写到 `pooled + lb*hd`。
+// 1c) **池化 + RMSNorm + RoPE + 落盘 四发合一**（2026-10-24）。
+//     分母：线上每个新块要发 4 个 launch（pool / rmsnorm / rope_stride / memcpy），
+//     微基准 23.5 µs，而 work 只有 1 个块 × 128 个元素 ⇒ **全是发射地板**（每发 ~5.9 µs）。
+//     逐位：三步的算式与 `lingxi_qsa_pool_blocks_bf16`（j 升序累加 + `bf16(acc/compress)`）、
+//     `lingxi_grouped_rmsnorm_bf16`（256 槽 shared 归约树、`rsqrtf(ss/hd+eps)`、
+//     `bf16(f32(x)*rms*f32(gamma))`）、`lingxi_rope_partial_stride_bf16`（pos = b*compress）
+//     **逐字相同**；中间结果按同一个 bf16 舍入后留在 shared（原路径是写 global 再读回）。
+//     最后一发原来是把 pool_tmp2 memcpy 到 pooled 的对应段，这里直接写到 `pooled + lb*hd`。
 extern "C" __global__ void lingxi_qsa_pool_norm_rope_bf16(const bf16* __restrict__ rk,
                                                           bf16* __restrict__ pooled,
                                                           const bf16* __restrict__ gamma,
@@ -1129,7 +1611,7 @@ extern "C" __global__ void lingxi_qsa_pool_norm_rope_bf16(const bf16* __restrict
 }
 
 // 2) 每个 (query 行, 块) 一个线程：scores[row][b] = (Σ_h max(Σ_d q[row,h,d]·p[b,d], 0)) / √hd
-// grid = (nblocks 方向, t_q)；`q` 是 [t_q, heads, hd]
+//    grid = (nblocks 方向, t_q)；`q` 是 [t_q, heads, hd]
 extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict__ q,
                                                           const bf16* __restrict__ pooled,
                                                           float* __restrict__ scores,
@@ -1144,17 +1626,17 @@ extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict
     const bf16* p = pooled + (size_t)b * hd;
     float s = 0.0f;
     // ★ 2026-10-23：8 宽向量读（int4）**实测是负结果，默认关**（`LINGXI_IDX_SCORES_VEC=1`
-    // 才走）：nblocks=130 时 54.5→42.1 µs（−23%），但 nblocks=29（线上短上下文）
-    // **20.0→34.2 µs（+71%）**——活跃线程只有 174 个，64 次 int4 load 的展开把
-    // 延迟隐藏变成了调度开销。累加次序仍是 d 升序、表达式不变 ⇒ 两条路逐位一致。
+    //   才走）：nblocks=130 时 54.5→42.1 µs（−23%），但 nblocks=29（线上短上下文）
+    //   **20.0→34.2 µs（+71%）**——活跃线程只有 174 个，64 次 int4 load 的展开把
+    //   延迟隐藏变成了调度开销。累加次序仍是 d 升序、表达式不变 ⇒ 两条路逐位一致。
     const bool vec = fast && ((hd & 7) == 0)
                      && ((reinterpret_cast<size_t>(p) & 15u) == 0u)
                      && ((reinterpret_cast<size_t>(q) & 15u) == 0u);
     // ★ 2026-10-24：`heads == 4`（本模型）时把 4 个 head 的点积**展开成 4 条独立累加链**。
-    // 原来 `for h` 是运行期循环 ⇒ 只有一条 512 MAC 的依赖链，每元素 2 次 cvt + FMA、
-    // 延迟全额暴露（微基准 `t17_qsa_bw` 19.6 µs，而同形纯读也是 19.4 ⇒ 纯延迟受限）。
-    // 4 条链交错发射后 **11.0 µs**（−44%）。逐位：每个 head 内部仍是 d 升序、
-    // `max` 与 `s +=` 仍按 h 升序、`/sqrt_hd` 一字未改（`t17_idxsel_bits` 0 位不同）。
+    //   原来 `for h` 是运行期循环 ⇒ 只有一条 512 MAC 的依赖链，每元素 2 次 cvt + FMA、
+    //   延迟全额暴露（微基准 `t17_qsa_bw` 19.6 µs，而同形纯读也是 19.4 ⇒ 纯延迟受限）。
+    //   4 条链交错发射后 **11.0 µs**（−44%）。逐位：每个 head 内部仍是 d 升序、
+    //   `max` 与 `s +=` 仍按 h 升序、`/sqrt_hd` 一字未改（`t17_idxsel_bits` 0 位不同）。
     if (heads == 4) {
         const bf16* q0 = qr;
         const bf16* q1 = qr + hd;
@@ -1236,8 +1718,8 @@ extern "C" __global__ void lingxi_qsa_indexer_scores_bf16(const bf16* __restrict
     scores[(size_t)row * nblocks + b] = s / sqrt_hd;
 }
 
-// 3) 名次：rank(row,b) = #{b': score[row][b'] > score[row][b] 或 (相等且 b' < b)}；rank < topk 则保留
-// grid = (nblocks 方向, t_q)
+// 3) 名次：rank(row,b) = #{b' : score[row][b'] > score[row][b] 或 (相等且 b' < b)}；rank < topk 则保留
+//    grid = (nblocks 方向, t_q)
 extern "C" __global__ void lingxi_qsa_indexer_rank_f32(const float* __restrict__ scores,
                                                        unsigned char* __restrict__ keep,
                                                        int t_q, int nblocks, int topk) {
@@ -1264,9 +1746,9 @@ extern "C" __global__ void lingxi_qsa_indexer_rank_f32(const float* __restrict__
 // 扫完 nblocks 条分数 ⇒ 单 chunk O(t·nblocks²)，跨 chunk 累加 ≈ O(S³)。256K 下 nblocks=65536，
 // 这一项单独就要几十分钟；同时 `scores` 要 t×nblocks×4B（2048×65536=537MB/层×12 层 ≈ 6.4GB）
 // 把显存顶爆。本实现把"选块"做成**每行一个 block 的流式基数选择**：
-// - 分数只算不存（5 遍：3 遍直方图定位阈值 + 2 遍填 keep），零 scores 缓冲；
-// - 分数恒 ≥ 0 ⇒ IEEE-754 正浮点位型与数值同序，可直接对 u32 位型做 11+11+10 位基数选择；
-// - 并列语义与旧 rank 完全一致：同分按块下标升序取前 (topk - cnt_gt) 个。
+//   - 分数只算不存（5 遍：3 遍直方图定位阈值 + 2 遍填 keep），零 scores 缓冲；
+//   - 分数恒 ≥ 0 ⇒ IEEE-754 正浮点位型与数值同序，可直接对 u32 位型做 11+11+10 位基数选择；
+//   - 并列语义与旧 rank 完全一致：同分按块下标升序取前 (topk - cnt_gt) 个。
 // 开关 `LINGXI_QSA_KEEP_RADIX`（默认开；=0 回旧 scores+rank 路径做 A/B）。
 
 __device__ __forceinline__ float qsa_score1(const bf16* __restrict__ qr,
@@ -1866,9 +2348,9 @@ extern "C" __global__ void lingxi_qsa_keep_fill_scores(const float* __restrict__
 // 语义：列表里只放 keep=1 的块；因果可见性与尾部不完整块由注意力核按 `vis` 过滤/补扫。
 
 // 3a) 每行一个 block：把 keep=1 的块号按升序压进 `sel[row*stride + j]`，个数写 `sel_cnt[row]`。
-// `all_kept`：`nblocks ≤ stride` 时 `rank(b) ≤ nblocks-1 < topk` ⇒ keep 恒全 1
-// （与 `keep_select` / `keep_from_scores` 里同样的早退条件），此时列表恒为 `[0..nblocks)`，
-// 一次把 keep / sel / sel_cnt 全写掉 —— 省掉打分 + 名次两发，结果逐位相同。
+//     `all_kept`：`nblocks ≤ stride` 时 `rank(b) ≤ nblocks-1 < topk` ⇒ keep 恒全 1
+//     （与 `keep_select` / `keep_from_scores` 里同样的早退条件），此时列表恒为 `[0..nblocks)`，
+//     一次把 keep / sel / sel_cnt 全写掉 —— 省掉打分 + 名次两发，结果逐位相同。
 extern "C" __global__ void lingxi_qsa_sel_build(unsigned char* __restrict__ keep,
                                                 int* __restrict__ sel,
                                                 int* __restrict__ sel_cnt,
@@ -1897,10 +2379,10 @@ extern "C" __global__ void lingxi_qsa_sel_build(unsigned char* __restrict__ keep
     cnt[tid] = c;
     __syncthreads();
     // ★ 2026-10-23：原来这里是 `if (tid==0)` 的 **1024 次串行累加**（依赖链 ≈ 20 µs，
-    // 比整个选块段还贵；`t6_attn_shape_bw` 实测 sel_build 27.5 µs）。改成 shared 上的
-    // Hillis-Steele 前缀和：**整数加法**，与旧串行累加同一个交换律运算 ⇒ `off[]` /
-    // `sel_cnt[]` **逐位相同**（列表次序因此也不变）。
-    // `fast==0`（`LINGXI_NO_SELBUILD_FAST=1`）回退到旧串行实现做 A/B。
+    //   比整个选块段还贵；`t6_attn_shape_bw` 实测 sel_build 27.5 µs）。改成 shared 上的
+    //   Hillis-Steele 前缀和：**整数加法**，与旧串行累加同一个交换律运算 ⇒ `off[]` /
+    //   `sel_cnt[]` **逐位相同**（列表次序因此也不变）。
+    //   `fast==0`（`LINGXI_NO_SELBUILD_FAST=1`）回退到旧串行实现做 A/B。
     if (fast) {
         for (int step = 1; step < nthr; step <<= 1) {
             const int v = (tid >= step) ? cnt[tid - step] : 0;
@@ -1932,16 +2414,16 @@ extern "C" __global__ void lingxi_qsa_keep_all_bf16(unsigned char* __restrict__ 
 }
 
 // 3b) gather 注意力：每个 (row, head) 一个 block（256 线程 = head_dim）。
-// 第 1 遍按列表算点积并把分数留在 shared（不重读 K）；第 2 遍只读 V 做加权和。
-// `vis = vis_base + row + 1`；列表里超出 vis 的块跳过；尾部不完整块（pos ≥ nblocks<<cshift）
-// 恒可见，放在列表之后补扫。
+//     第 1 遍按列表算点积并把分数留在 shared（不重读 K）；第 2 遍只读 V 做加权和。
+//     `vis = vis_base + row + 1`；列表里超出 vis 的块跳过；尾部不完整块（pos ≥ nblocks<<cshift）
+//     恒可见，放在列表之后补扫。
 //
 // ★ 2026-10-18：**NH 个 q-head 合并进一个 block**。本模型 heads=24 / kv_heads=2 ⇒
-// 12 个 q-head 共用同一份 K/V；旧版每个 (row, head) 各读一遍 K/V（实测 gather 60ms/层，
-// 49GB/层 ≈ 816GB/s 正好打满 HBM）⇒ **12× 冗余搬运**。现在一个 block 处理同一 kv-group
-// 内的 NH 个 head：K/V 只读一次、喂 NH 个点积/累加（NH=4 ⇒ K/V 流量 ÷4）。
-// **逐位一致**：每个 head 的点积仍是 lane 内 z=0..7 顺序累加 + 同一 warp shuffle；
-// softmax 的 max/分母/加权和仍按 idx 升序、每个 head 独立。
+//   12 个 q-head 共用同一份 K/V；旧版每个 (row, head) 各读一遍 K/V（实测 gather 60ms/层，
+//   49GB/层 ≈ 816GB/s 正好打满 HBM）⇒ **12× 冗余搬运**。现在一个 block 处理同一 kv-group
+//   内的 NH 个 head：K/V 只读一次、喂 NH 个点积/累加（NH=4 ⇒ K/V 流量 ÷4）。
+//   **逐位一致**：每个 head 的点积仍是 lane 内 z=0..7 顺序累加 + 同一 warp shuffle；
+//   softmax 的 max/分母/加权和仍按 idx 升序、每个 head 独立。
 // P2 Stage 1（2026-10-20）：KV 块表间接寻址——`blk_tab[逻辑块号] = 物理槽号`。
 // Stage 1 表恒等映射（槽号==逻辑块号，零行为变化），为 Stage 2 host 分页铺路；
 // 间接粒度 = indexer 块（ctok = 1<<cshift，与 sel 单位 1:1）。
@@ -2069,13 +2551,13 @@ __device__ __forceinline__ void attn_gather_body(const bf16* __restrict__ q,
 #pragma unroll
         for (int g = 0; g < NH; ++g) acc[g] = 0.0f;
         // 每个线程固定一个 d，按 idx 升序累加；V 只读一次、NH 个 head 共用。
-        // ★ 2026-10-24（，`LINGXI_NO_ATTN_V2=1` 回退）：原来按 `pos_of(idx)` 逐个 token
-        // 取 V —— 每 token 一次 `blk_tab` load + 一次 2 B load，且**全串行**（每线程 120 次）。
-        // 实测（`t17_qsa_bw`，len118/nblocks29）第二遍单独要 44 µs，而"只读 V"同形是 22 µs、
-        // 第一遍（K 走 warp 并行 int4）只 10 µs ⇒ 瓶颈是**第二遍的串行取数**，不是带宽。
-        // 改成"按选块分组、块内 4 token 一起发 load"：`blk_tab` 每 4 token 只读一次，
-        // 4 个 V 地址先取齐再累加。**逐位不变**：acc 的累加次序仍是 idx 升序、
-        // `sp[idx]*vx` 的表达式一字未改，不可见 token 也照样乘 0 分累加（同旧版）。
+        // ★ 2026-10-24（`LINGXI_NO_ATTN_V2=1` 回退）：原来按 `pos_of(idx)` 逐个 token
+        //   取 V —— 每 token 一次 `blk_tab` load + 一次 2 B load，且**全串行**（每线程 120 次）。
+        //   实测（`t17_qsa_bw`，len118/nblocks29）第二遍单独要 44 µs，而"只读 V"同形是 22 µs、
+        //   第一遍（K 走 warp 并行 int4）只 10 µs ⇒ 瓶颈是**第二遍的串行取数**，不是带宽。
+        //   改成"按选块分组、块内 4 token 一起发 load"：`blk_tab` 每 4 token 只读一次，
+        //   4 个 V 地址先取齐再累加。**逐位不变**：acc 的累加次序仍是 idx 升序、
+        //   `sp[idx]*vx` 的表达式一字未改，不可见 token 也照样乘 0 分累加（同旧版）。
         const size_t vstride = (size_t)kv_heads * head_dim;
         int idx = 0;
         if (V2) {
@@ -2226,10 +2708,10 @@ extern "C" __global__ void lingxi_attn_gather2_bf16(const bf16* __restrict__ q,
                            scale, vis_base, nblocks, cshift, stride);
 }
 
-// ── v3 生产核（2026-10-26）：prefill 形态（t≥16）gather 重排 ──
+// ── gather v3 生产核（2026-10-26）：prefill 形态（t≥16）gather 重排 ──
 // 与 `attn_gather_body` 逐位等价、调用契约相同（grid=(t_q, heads/NH)、256 线程、
 // smem = (stride·2^cshift + 2^cshift)·NH·4B）。判决实验链与逐位论证见
-// `attn_gather_v3.cuh` 头注与。`LINGXI_NO_ATTN_GATHER_V3=1` 回退旧核。
+// 详见 `attn_gather_v3.cuh` 头注。`LINGXI_NO_ATTN_GATHER_V3=1` 回退旧核。
 extern "C" __global__ void lingxi_attn_gather_v3_2_bf16(const bf16* __restrict__ q,
                                                         const bf16* __restrict__ k,
                                                         const bf16* __restrict__ v,
@@ -2269,7 +2751,7 @@ extern "C" __global__ void lingxi_attn_gather_v3_4_bf16(const bf16* __restrict__
 }
 
 // 4) 掩码填充：可见 = 因果前缀 ∧ (选中块 ∨ 尾部不完整块)；未选中再叠加 min
-// grid = (t_kv 方向, t_q)；`vis = len + row + 1`
+//    grid = (t_kv 方向, t_q)；`vis = len + row + 1`
 extern "C" __global__ void lingxi_qsa_mask_fill_f32(const unsigned char* __restrict__ keep,
                                                     float* __restrict__ mask,
                                                     int t_q, int t_kv, int nblocks, int compress,
@@ -2289,20 +2771,20 @@ extern "C" __global__ void lingxi_qsa_mask_fill_f32(const unsigned char* __restr
     mask[(size_t)row * t_kv + j] = v;
 }
 
-// ═════════════════ QSA 小发射合并（，2026-10-24） ═════════════════
+// ═════════════════ QSA 小发射合并（2026-10-24） ═════════════════
 //
 // 分母（`t17_qsa_bw`，len118/t=6）：idxprep 整段 29.7 µs 里，两发 bf16 投影占 26.0
 // （640 行 15.9 + 128 行 10.1，而同形纯读只有 5.4 ⇒ **128 行那一发几乎全是发射地板**），
 // `norm+rope` 两发占 11.1 µs（work 只有 24×128 个元素）。⇒ 合并发射是本段的唯一杠杆。
 //
 // 1) `lingxi_gemm_bf16_row_pair`：同一份 x、两块不同权重（n1 / n2 行）合成**一发**。
-// 每块的算式/线程 k 划分/归约树/epi 与 `lingxi_gemm_skinny_row_bf16`（grid.y=1、
-// epi=0 档）**逐字相同**，只是按 blockIdx.x 落到各自的 w/y ⇒ 逐位相同。
+//    每块的算式/线程 k 划分/归约树/epi 与 `lingxi_gemm_skinny_row_bf16`（grid.y=1、
+//    epi=0 档）**逐字相同**，只是按 blockIdx.x 落到各自的 w/y ⇒ 逐位相同。
 // 2) `lingxi_rmsnorm_rope_bf16`：分组 RMSNorm（group=head_dim）+ partial RoPE 合成一发。
-// RMSNorm 的 256 槽 shared 归约树、`rsqrtf(ss/group+eps)`、`bf16(f32(x)*rms*f32(gamma))`
-// 与 `gr_ops.cu::lingxi_grouped_rmsnorm_bf16` 逐字相同；RoPE 的 cos/sin 取值与
-// `lingxi_rope_partial_inplace_bf16` 逐字相同，中间结果按**同一个 bf16 舍入**落在
-// shared（原路径是写 global 再读回）⇒ 逐位相同。
+//    RMSNorm 的 256 槽 shared 归约树、`rsqrtf(ss/group+eps)`、`bf16(f32(x)*rms*f32(gamma))`
+//    与 `gr_ops.cu::lingxi_grouped_rmsnorm_bf16` 逐字相同；RoPE 的 cos/sin 取值与
+//    `lingxi_rope_partial_inplace_bf16` 逐字相同，中间结果按**同一个 bf16 舍入**落在
+//    shared（原路径是写 global 再读回）⇒ 逐位相同。
 extern "C" __global__ void lingxi_gemm_bf16_row_pair(const bf16* __restrict__ w1,
                                                      bf16* __restrict__ y1, int n1,
                                                      const bf16* __restrict__ w2,

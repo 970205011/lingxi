@@ -42,7 +42,7 @@ pub fn attention_step(
     let scale = 1.0f32 / (c.head_dim as f32).sqrt();
     let len = state.len;
     let t_kv = len + t;
-    // ㊿-P1 弹性 KV：容量不足先几何增长（冷路径；对数学逐位无影响），不再硬性 assert。
+    // 弹性 KV：容量不足先几何增长（冷路径；对数学逐位无影响），不再硬性 assert。
     if t_kv > state.cap {
         state.ensure_cap(k, t_kv)?;
     }
@@ -71,7 +71,7 @@ pub fn attention_step(
     let mut gate = scratch::bf16(k, t * q_dim)?;
     let mut v = scratch::bf16(k, t * kv_dim)?;
     // four 段在同一块矩阵里连续：q | k | gate | v，用 row_off 直接切，避免拆成 4 个张量。
-    // ⚠️ `slice` 必须在非 W4 分支里做：W4 模式下 bf16 字段只是 1 元素占位，切了会 panic。
+    // ⚠️ `slice()` 必须在非 W4 分支里做：W4 模式下 bf16 字段只是 1 元素占位，切了会 panic。
     if let Some(wq) = &w.query_key_gate_value_q4 {
         // ★ 2026-10-24：q|k|gate|v **四发合一行**（默认开）。四段是同一块 `[13312, H]` 的
         // 连续行区间，合发核按全局行号落回各自缓冲 ⇒ 逐位等价；t>1 时省 ~39 µs/层
@@ -99,8 +99,8 @@ pub fn attention_step(
 
     // 2) 每头 RMSNorm + partial RoPE（用新 token 的绝对位置）
     // ★ 2026-10-24：`norm` 与 `rope` 原来各一发（微基准各 ~5.5 µs，全在发射地板上；
-    // 实测两发合计 11.1 µs 而 work 只有 24×128 个元素）⇒ 合成一发
-    // （`LINGXI_NO_NRM_ROPE_FUSE=1` 回退）。归约树/舍入/RoPE 取值一字未改 ⇒ 逐位相同。
+    //   实测两发合计 11.1 µs 而 work 只有 24×128 个元素）⇒ 合成一发
+    //   （`LINGXI_NO_NRM_ROPE_FUSE=1` 回退）。归约树/舍入/RoPE 取值一字未改 ⇒ 逐位相同。
     let fuse_nr = !crate::flag("LINGXI_NO_NRM_ROPE_FUSE");
     let mut qn = scratch::bf16(k, t * q_dim)?;
     if fuse_nr && c.rot_dim > 0 {
@@ -134,13 +134,29 @@ pub fn attention_step(
     crate::attn_prof::mark(k, 1)?;
     // P2 分页：写前把 [len, t_kv) 覆盖的块物化出 GPU 槽（本步写入 + gather 尾部读它）。
     state.kv_materialize_write(k, len, t)?;
-    // 3) 追加进 cache（bf16 直拷，或 ㊶ E4M3 量化后写字节缓冲 + scale）
+    // 3) 追加进 cache（bf16 直拷 / K8V4 E4M3 量化 / FP8-G32 量化）
     if state.kn.is_some() {
         if state.paged {
             state.kv_append_paged(k, &kn_new, &v, len, t)?;
         } else {
             k.stream.memcpy_dtod(&kn_new, &mut state.kn.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim))?;
             k.stream.memcpy_dtod(&v, &mut state.v.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim))?;
+        }
+    } else if state.kn_f8.is_some() {
+        let mode = super::core_::kv_fp8_mode();
+        if state.kn_res.is_some() {
+            // FP8 残差档（KIVI 式）：bf16 直拷进残差平面 + 滑出尾窗的 4-token 页
+            // 惰性量化进压缩平面（flush 在注意力读之前完成，水位即本步的 q_lo）。
+            fp8_res_kv_append(k, state, &kn_new, &v, len, t, kv_dim, c, mode)?;
+        } else {
+            // 无残差消融档（`LINGXI_KV_FP8_RESIDUAL=0`）：追加即全行量化。
+            let nsc = kv_dim / 32;   // 每行 scale 组数（= kv_heads * head_dim/32）
+            let mut kqv = state.kn_f8.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim);
+            let mut ksc = state.kn_f8s.as_mut().unwrap().slice_mut(len * nsc..t_kv * nsc);
+            k.quant_rows_fp8g32_bf16(&kn_new, &mut kqv, &mut ksc, t, c.kv_heads, c.head_dim, mode)?;
+            let mut vqv = state.v_f8.as_mut().unwrap().slice_mut(len * kv_dim..t_kv * kv_dim);
+            let mut vsc = state.v_f8s.as_mut().unwrap().slice_mut(len * nsc..t_kv * nsc);
+            k.quant_rows_fp8g32_bf16(&v, &mut vqv, &mut vsc, t, c.kv_heads, c.head_dim, mode)?;
         }
     } else {
         let nkh = c.kv_heads;
@@ -165,8 +181,8 @@ pub fn attention_step(
     let mut rk_new = scratch::bf16(k, t * ci.head_dim)?;
     // ★ P15-⑨：t>1 时 x 预转 fp32，indexer 两个 bf16 投影共用一份（主投影已走 Q4 不受影响）
     // ★ 2026-10-24：默认档（x 仍是 bf16、走 `gemm_skinny_row`）把**两个投影合成一发**
-    // （`LINGXI_NO_PROJ_PAIR=1` 回退）：实测 640 行 15.9 + 128 行 10.1 = 26.0 µs，
-    // 而 128 行那一发的同形纯读只要 5.4 ⇒ 合并后省 ~10 µs/层。算式/归约/写出逐字相同。
+    //   （`LINGXI_NO_PROJ_PAIR=1` 回退）：实测 640 行 15.9 + 128 行 10.1 = 26.0 µs，
+    //   而 128 行那一发的同形纯读只要 5.4 ⇒ 合并后省 ~10 µs/层。算式/归约/写出逐字相同。
     let pair_ok = t <= 8
         && t > 0
         && h >= 1024
@@ -212,25 +228,25 @@ pub fn attention_step(
     // 段 3 结束：indexer qk 投影+norm+rope
     crate::attn_prof::mark(k, 3)?;
     // 4) indexer 选块：GPU 路径（增量池化 + 打分 + 名次 + 掩码，全同流无同步）；
-    // `LINGXI_QSA_HOST=1` 回退 host 参考对拍。
+    //    `LINGXI_QSA_HOST=1` 回退 host 参考对拍。
     let host_fallback = crate::flag("LINGXI_QSA_HOST");
     // nblocks_new / keep 提升到分支外：sparse 注意力在分支后也要用
     let nblocks_new = t_kv / ci.compress;
-    // ㊸ 持久复用（grow-only）：不再每 token `alloc_zeros`。两个核都全量覆写 ⇒ 无需清零。
+    // 持久复用（grow-only）：不再每 token `alloc_zeros`。两个核都全量覆写 ⇒ 无需清零。
     //
     // ★ 选块实现按 t 分派（2026-10-18 实测）：
-    // t≥16（prefill chunk）走 radix（O(nblocks)/行、零 scores 缓冲，256K 省 537MB/层）；
-    // 1<t<16 走旧 rank。
-    // t==1（decode）走**并行直方图**
-    // （先并行打分落盘，再网格并行做 3 遍直方图 + 1 遍填 keep）：t=1 时 radix 只有 1 个
-    // block 在跑（8K 97ms/token、30K 254ms/token），rank 又是 O(nblocks²)（256K 外推 22s/token）。
+    //   t≥16（prefill chunk）走 radix（O(nblocks)/行、零 scores 缓冲，256K 省 537MB/层）；
+    //   1<t<16 走旧 rank。
+    //   t==1（decode）走**并行直方图**
+    //   （先并行打分落盘，再网格并行做 3 遍直方图 + 1 遍填 keep）：t=1 时 radix 只有 1 个
+    //   block 在跑（8K 97ms/token、30K 254ms/token），rank 又是 O(nblocks²)（256K 外推 22s/token）。
     // ★ 2026-10-18：prefill 的选块统一走**并行直方图**：
-    // ① 分数用 `qsa_indexer_scores_bf16` 一次算完（grid 并行 over (行, 块)，全 SM 打满）；
-    // ② 分数落一次性 scratch（t×nblocks×4B，池化复用，峰值一块）；
-    // ③ `qsa_keep_from_scores_bf16` 每行一个 block 做 3 遍直方图 + 填 keep（只读 4B/块）。
-    // 32K 实测 select+fill **41ms/层**，比 radix 的 293~335ms 快 7~8×，也比 shared 融合核
-    // （68ms，每行串行扫全部块）更快。256K（nblocks=65536）同样适用 ⇒ 不再有 49K 边界。
-    // `LINGXI_QSA_FUSED_MAX=<n>` 可回退到 shared 融合核做 A/B（默认 0 = 不用它）。
+    //   ① 分数用 `qsa_indexer_scores_bf16` 一次算完（grid 并行 over (行, 块)，全 SM 打满）；
+    //   ② 分数落一次性 scratch（t×nblocks×4B，池化复用，峰值一块）；
+    //   ③ `qsa_keep_from_scores_bf16` 每行一个 block 做 3 遍直方图 + 填 keep（只读 4B/块）。
+    //   32K 实测 select+fill **41ms/层**，比 radix 的 293~335ms 快 7~8×，也比 shared 融合核
+    //   （68ms，每行串行扫全部块）更快。256K（nblocks=65536）同样适用 ⇒ 不再有 49K 边界。
+    //   `LINGXI_QSA_FUSED_MAX=<n>` 可回退到 shared 融合核做 A/B（默认 0 = 不用它）。
     let fused_max: usize = std::env::var("LINGXI_QSA_FUSED_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -240,18 +256,18 @@ pub fn attention_step(
         && nblocks_new > fused_max
         && std::env::var("LINGXI_QSA_BIGPAR").map(|v| v != "0").unwrap_or(true);
     // ★ 2026-10-22 实测判决：decode（t==1）的并行直方图路径 = 1 遍打分 + **3 次 D2H 同步**
-    // （3 段 bin_finalize 后各回读一次阈值），12 个 QSA 层 ⇒ 每 token 36 次流水线排空。
-    // 短上下文（bench 实测 200×3）p10 30.8ms ⇒ `LINGXI_QSA_KEEP_RADIX=0`（旧 rank 路，
-    // 2 launch 零同步）p10 24.7ms，**差 6.1ms/token（+24%）**——sync 开销是常数，
-    // 与 nblocks 无关；而 rank 路的 GPU 时间 ~O(nblocks²)（256K 外推 22s/token）。
-    // ⇒ decode 按 nblocks 分派：小块走 rank（零同步），大块走直方图（免平方爆炸）。
-    // 两条路选块结果逐位一致（原 radix 上线时的对拍门 + 稀疏≡密集门）。
-    // `LINGXI_QSA_DEC_RANK_MAX=<块数>` 可调；=0 恒走直方图。
-    // ★ 2026-10-24：默认 512 → **2048**。直方图那条路每 token 要 **3 次 D2H 同步**，
-    // 在长上下文草稿里是白付的：5011 token 实测（nblocks=1253，`tests/t19`）
-    // attn 段 935~1100 → 632~692 µs（−35%）、草稿步 1.46~1.59 → 1.18~1.21 ms（−22%）、
-    // `SPEC_PROF draft` 12.3~14.2 → 10.7~12.5 ms，**md5 与接受率不变**。
-    // rank 路是 O(nblocks²) 的整数比较（2048 块 ≈ 4M/token，可忽略），超过该值仍走直方图。
+    //   （3 段 bin_finalize 后各回读一次阈值），12 个 QSA 层 ⇒ 每 token 36 次流水线排空。
+    //   短上下文（bench 实测 200×3）p10 30.8ms ⇒ `LINGXI_QSA_KEEP_RADIX=0`（旧 rank 路，
+    //   2 launch 零同步）p10 24.7ms，**差 6.1ms/token（+24%）**——sync 开销是常数，
+    //   与 nblocks 无关；而 rank 路的 GPU 时间 ~O(nblocks²)（256K 外推 22s/token）。
+    //   ⇒ decode 按 nblocks 分派：小块走 rank（零同步），大块走直方图（免平方爆炸）。
+    //   两条路选块结果逐位一致（原 radix 上线时的对拍门 + 稀疏≡密集门）。
+    //   `LINGXI_QSA_DEC_RANK_MAX=<块数>` 可调；=0 恒走直方图。
+    //   ★ 2026-10-24：默认 512 → **2048**。直方图那条路每 token 要 **3 次 D2H 同步**，
+    //     在长上下文草稿里是白付的：5011 token 实测（nblocks=1253，`tests/t19`）
+    //     attn 段 935~1100 → 632~692 µs（−35%）、草稿步 1.46~1.59 → 1.18~1.21 ms（−22%）、
+    //     `SPEC_PROF draft` 12.3~14.2 → 10.7~12.5 ms，**md5 与接受率不变**。
+    //     rank 路是 O(nblocks²) 的整数比较（2048 块 ≈ 4M/token，可忽略），超过该值仍走直方图。
     let dec_rank_max: usize = std::env::var("LINGXI_QSA_DEC_RANK_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -291,14 +307,14 @@ pub fn attention_step(
         dmark!("idx_rk");
         // 增量池化新完成的块：mean → RMSNorm → RoPE（块起点绝对位置）。
         // ★ 批量版（2026-10-18）：一次 launch 处理全部新块。原来每块 4 个 launch，
-        // 256K 下 65K 块 × 4 × 12 层 ≈ 300 万次 launch ≈ 10 分钟纯 driver 开销。
+        //    256K 下 65K 块 × 4 × 12 层 ≈ 300 万次 launch ≈ 10 分钟纯 driver 开销。
         let b0 = state.nblocks;
         let nb = nblocks_new.saturating_sub(b0);
         if nb > 0 {
             let need = nb * ci.head_dim;
             // ★ 2026-10-24：pool + norm + rope + 落盘 **四发合一**（`LINGXI_NO_POOL_FUSE=1`
-            // 回退）：微基准 4 发 23.5 µs（work 只有 nb×128 个元素）⇒ 全是发射地板，
-            // 合成一发后 ~6 µs。三步算式与四发逐字相同（含中间的 bf16 舍入）⇒ 逐位相同。
+            //   回退）：微基准 4 发 23.5 µs（work 只有 nb×128 个元素）⇒ 全是发射地板，
+            //   合成一发后 ~6 µs。三步算式与四发逐字相同（含中间的 bf16 舍入）⇒ 逐位相同。
             let fuse_pool = ci.rot_dim > 0
                 && ci.head_dim <= 256
                 && !crate::flag("LINGXI_NO_POOL_FUSE");
@@ -354,10 +370,10 @@ pub fn attention_step(
             let topk = ci.budget / ci.compress;
             let sqrt_hd = (ci.head_dim as f32).sqrt();
             // ★ 2026-10-24：**nblocks ≤ topk ⇒ 全部块都保留**。
-            // rank(b) ≤ nblocks-1 < topk 恒成立（与 `keep_select` / `keep_from_scores`
-            // 里早已存在的早退条件完全相同）⇒ 打分与名次都是恒等变换。短上下文
-            // （≤ budget token = 2048）下直接由 sel_build 的 all 模式一发写 keep+sel，
-            // 省掉 scores(19.6µs) + rank(4.7µs)。`LINGXI_NO_KEEP_ALL=1` 回退做 A/B。
+            //   rank(b) ≤ nblocks-1 < topk 恒成立（与 `keep_select` / `keep_from_scores`
+            //   里早已存在的早退条件完全相同）⇒ 打分与名次都是恒等变换。短上下文
+            //   （≤ budget token = 2048）下直接由 sel_build 的 all 模式一发写 keep+sel，
+            //   省掉 scores(19.6µs) + rank(4.7µs)。`LINGXI_NO_KEEP_ALL=1` 回退做 A/B。
             all_kept = nblocks_new <= topk && !crate::flag("LINGXI_NO_KEEP_ALL");
             if all_kept {
                 // keep/sel 由后面 sel_build 的 all 模式（gather 路）或 `qsa_keep_all` 写。
@@ -411,8 +427,8 @@ pub fn attention_step(
                 crate::scratch::put_f32(s);
             } else if use_radix {
                 // ★ 2026-10-18：nblocks 不大时走**融合选块**（一次打分 + shared 直方图），
-                // 把旧路径的 4 遍打分（3 遍直方图 + 1 遍填 keep）压成 1 遍。
-                // 32K（nblocks≈8184）实测 select+fill 300ms → R。
+                //   把旧路径的 4 遍打分（3 遍直方图 + 1 遍填 keep）压成 1 遍。
+                //   32K（nblocks≈8184）实测 select+fill 300ms → 见 docs/BACKLOG。
                 if nblocks_new <= fused_max {
                     k.qsa_keep_fused_bf16(
                         &iqn, &state.pooled, &mut state.keep_buf,
@@ -484,6 +500,8 @@ pub fn attention_step(
 
     // 5) 注意力：T_q = t、T_kv = t_kv（cache 行主序连续，直接传整块 + tk 限定行数）
     let mut attn = scratch::bf16(k, t * q_dim)?;
+    // FP8 档子模式（0=int8 默认 / 1=e4m3），KV FP8 分派的三个分支共用
+    let f8_mode = super::core_::kv_fp8_mode();
     // ★ 跳块稀疏：keep 非空且 compress 为 2 的幂时走 attn_sparse（免 t×t_kv 掩码
     // 分配+填充，未选中块按 dense 精确语义跳过）——对拍开关 LINGXI_QSA_DENSE=1 回旧路径。
     let sparse = !host_fallback
@@ -493,14 +511,14 @@ pub fn attention_step(
     if sparse && gather_ok {
         let topk = ci.budget / ci.compress;
         // ★ 2026-10-18：同一 kv-group 的 4 个 q-head 合并进一个 block（K/V 流量 ÷4）。
-        // 本模型 heads=24 / kv_heads=2 ⇒ 12 个 q-head 共用一份 K/V，旧版按 (row,head)
-        // 各读一遍（实测 49GB/层 ≈ 816GB/s 打满 HBM）。逐位一致（每 head 的归约次序不变）。
+        //   本模型 heads=24 / kv_heads=2 ⇒ 12 个 q-head 共用一份 K/V，旧版按 (row,head)
+        //   各读一遍（实测 49GB/层 ≈ 816GB/s 打满 HBM）。逐位一致（每 head 的归约次序不变）。
         let ctok = 1usize << ci.compress.trailing_zeros();
         let span = topk * ctok + ctok;
         // `LINGXI_ATTN_GATHER_H`：一个 block 合并几个同 kv-group 的 q-head（1/2/4）。
         // ★ 2026-10-24：decode 小 t 形状（块数少）实测 NH=1 栅格最优（37.7 µs）。
         // ★ 2026-10-26：prefill t≥16 块数充足，默认 NH=4（K/V 流量 ÷4，配合
-        // wrapper 的 v3 重排核）；显式设 H=1/2/4 覆盖两档。逐位等价（t25 对拍）。
+        //   wrapper 的 v3 重排核）；显式设 H=1/2/4 覆盖两档。逐位等价（t25 对拍）。
         let nh_req = match std::env::var("LINGXI_ATTN_GATHER_H") {
             Ok(v) if v.trim() == "1" => 1usize,
             Ok(v) if v.trim() == "2" => 2usize,
@@ -561,8 +579,21 @@ pub fn attention_step(
                     c.head_dim, scale,
                 )?;
             }
+            _ if state.kn_f8.is_some() => {
+                // FP8-G32/int8-G32 档：bf16 形参传 1 元素占位，KV 按"行在哪个平面"
+                // 分流（残差窗：sink/尾窗 bf16，中间压缩；无残差：全压缩）
+                let (kres, vres, ksink, kqlo, krcap) = fp8_res_args(state);
+                k.attn_sparse_kvfp8_bf16(
+                    &qn, &state.stub_kn, &state.stub_v, &state.keep_buf, len, nblocks_new,
+                    ci.compress.trailing_zeros(), &mut attn, c.heads, c.kv_heads, t, t_kv,
+                    c.head_dim, scale,
+                    state.kn_f8.as_ref().unwrap(), state.kn_f8s.as_ref().unwrap(),
+                    state.v_f8.as_ref().unwrap(), state.v_f8s.as_ref().unwrap(),
+                    kres, vres, ksink, kqlo, krcap, f8_mode,
+                )?;
+            }
             _ => {
-                // ㊶ 量化档：bf16 形参传 1 元素占位（内核 q8 分支从不读），KV 读字节缓冲
+                // K8V4 量化档：bf16 形参传 1 元素占位（内核 q8 分支从不读），KV 读字节缓冲
                 k.attn_sparse_kvq8_bf16(
                     &qn, &state.stub_kn, &state.stub_v, &state.keep_buf, len, nblocks_new,
                     ci.compress.trailing_zeros(), &mut attn, c.heads, c.kv_heads, t, t_kv,
@@ -579,6 +610,16 @@ pub fn attention_step(
             (Some(kn), Some(v)) => {
                 k.attn_masked_bf16(&qn, kn, v, mask, &mut attn, c.heads, c.kv_heads, t, t_kv, c.head_dim, scale)?;
             }
+            _ if state.kn_f8.is_some() => {
+                let (kres, vres, ksink, kqlo, krcap) = fp8_res_args(state);
+                k.attn_masked_kvfp8_bf16(
+                    &qn, &state.stub_kn, &state.stub_v, mask, &mut attn, c.heads, c.kv_heads,
+                    t, t_kv, c.head_dim, scale,
+                    state.kn_f8.as_ref().unwrap(), state.kn_f8s.as_ref().unwrap(),
+                    state.v_f8.as_ref().unwrap(), state.v_f8s.as_ref().unwrap(),
+                    kres, vres, ksink, kqlo, krcap, f8_mode,
+                )?;
+            }
             _ => {
                 k.attn_masked_kvq8_bf16(
                     &qn, &state.stub_kn, &state.stub_v, mask, &mut attn, c.heads, c.kv_heads,
@@ -594,6 +635,16 @@ pub fn attention_step(
         match (&state.kn, &state.v) {
             (Some(kn), Some(v)) => {
                 k.attn_masked_bf16(&qn, kn, v, &m, &mut attn, c.heads, c.kv_heads, t, t_kv, c.head_dim, scale)?;
+            }
+            _ if state.kn_f8.is_some() => {
+                let (kres, vres, ksink, kqlo, krcap) = fp8_res_args(state);
+                k.attn_masked_kvfp8_bf16(
+                    &qn, &state.stub_kn, &state.stub_v, &m, &mut attn, c.heads, c.kv_heads,
+                    t, t_kv, c.head_dim, scale,
+                    state.kn_f8.as_ref().unwrap(), state.kn_f8s.as_ref().unwrap(),
+                    state.v_f8.as_ref().unwrap(), state.v_f8s.as_ref().unwrap(),
+                    kres, vres, ksink, kqlo, krcap, f8_mode,
+                )?;
             }
             _ => {
                 k.attn_masked_kvq8_bf16(
@@ -685,4 +736,77 @@ pub fn attention_step(
 
     state.len = t_kv;
     Ok(out)
+}
+
+/// 把 `src` 的 `[from, from+n)` 行拷进 bf16 残差平面：行 < sink 线性落位（头 sink
+/// 段）；行 ≥ sink 落尾窗环槽 `sink + (r-sink) % rcap`。连续行映到连续槽位（环至多
+/// 回绕一次、sink 边界切一刀）⇒ 每段一次 dtod memcpy，整段 ≤ 3 发。
+fn res_plane_copy(
+    k: &Kernels, src: &CudaSlice<bf16>, dst: &mut CudaSlice<bf16>,
+    from: usize, n: usize, row_elems: usize, sink: usize, rcap: usize,
+) -> Result<()> {
+    let end = from + n;
+    let mut cur = from;
+    while cur < end {
+        let seg = if cur < sink {
+            (sink - cur).min(end - cur)                 // sink 段线性（至多跨一次边界）
+        } else {
+            (rcap - (cur - sink) % rcap).min(end - cur) // 环内连续段（至多回绕一次）
+        };
+        let slot = if cur < sink { cur } else { sink + (cur - sink) % rcap };
+        k.stream.memcpy_dtod(
+            &src.slice((cur - from) * row_elems..(cur - from + seg) * row_elems),
+            &mut dst.slice_mut(slot * row_elems..(slot + seg) * row_elems),
+        )?;
+        cur += seg;
+    }
+    Ok(())
+}
+
+/// FP8 残差档（KIVI 式）的 KV 追加 + flush：
+/// ① K/V bf16 直拷进残差平面（追加零成本）；② 滑出尾窗的 `[kv_qlo, q_lo)` 4-token
+/// 页从环量化进压缩平面（`q_lo = max(sink, align_down(t_kv-recent, 4))`，水位只进
+/// 不退——rewind 时按新尾窗回退，见 `QsaState::rewind`）。
+#[allow(clippy::too_many_arguments)]
+fn fp8_res_kv_append(
+    k: &Kernels, state: &mut QsaState,
+    kn_new: &CudaSlice<bf16>, v: &CudaSlice<bf16>,
+    from: usize, t: usize, kv_dim: usize, c: &AttnCfg, mode: i32,
+) -> Result<()> {
+    let sink = state.kv_sink;
+    let rcap = state.kv_rcap;
+    res_plane_copy(k, kn_new, state.kn_res.as_mut().unwrap(), from, t, kv_dim, sink, rcap)?;
+    res_plane_copy(k, v, state.v_res.as_mut().unwrap(), from, t, kv_dim, sink, rcap)?;
+    let t_kv = from + t;
+    let q_lo = (t_kv.saturating_sub(state.kv_recent) / 4 * 4).max(sink);
+    if q_lo <= state.kv_qlo {
+        return Ok(());
+    }
+    let n = q_lo - state.kv_qlo;
+    let nsc = kv_dim / 32;
+    let mut kqv = state.kn_f8.as_mut().unwrap().slice_mut(state.kv_qlo * kv_dim..q_lo * kv_dim);
+    let mut ksc = state.kn_f8s.as_mut().unwrap().slice_mut(state.kv_qlo * nsc..q_lo * nsc);
+    k.quant_rows_fp8g32_res_bf16(
+        state.kn_res.as_ref().unwrap(), &mut kqv, &mut ksc,
+        state.kv_qlo, n, sink, rcap, c.kv_heads, c.head_dim, mode,
+    )?;
+    let mut vqv = state.v_f8.as_mut().unwrap().slice_mut(state.kv_qlo * kv_dim..q_lo * kv_dim);
+    let mut vsc = state.v_f8s.as_mut().unwrap().slice_mut(state.kv_qlo * nsc..q_lo * nsc);
+    k.quant_rows_fp8g32_res_bf16(
+        state.v_res.as_ref().unwrap(), &mut vqv, &mut vsc,
+        state.kv_qlo, n, sink, rcap, c.kv_heads, c.head_dim, mode,
+    )?;
+    state.kv_qlo = q_lo;
+    Ok(())
+}
+
+/// FP8 残差窗内核参数：残差开 → 残差平面 + 几何；关 → stub + kv_rcap=0（内核走
+/// 纯压缩读，分支不激活）。
+fn fp8_res_args(state: &QsaState) -> (&CudaSlice<bf16>, &CudaSlice<bf16>, i32, i32, i32) {
+    match (&state.kn_res, &state.v_res) {
+        (Some(a), Some(b)) => (
+            a, b, state.kv_sink as i32, state.kv_qlo as i32, state.kv_rcap as i32,
+        ),
+        _ => (&state.stub_kn, &state.stub_v, 0, 0, 0),
+    }
 }

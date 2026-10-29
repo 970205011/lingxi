@@ -59,7 +59,7 @@ fn run() -> Result<()> {
     }
     match args.get(1).map(|s| s.as_str()) {
         Some("attn-bench") => {
-            // ★ P15-㊳ attention 微基准：attn2（每行一块）vs attn3（8 行共享 K/V 读）。
+            // ★ attention 微基准：attn2（每行一块）vs attn3（8 行共享 K/V 读）。
             // 冷启动单发口径：每 trial 前先写 48MB 脏缓冲驱逐 L2，单次 launch 计时，取 5 trial 的 min。
             let dev: usize = std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
@@ -1713,7 +1713,7 @@ fn run() -> Result<()> {
                     )
                 })?;
                 eprintln!("  [f slotsm rpw=1]   s=217 e=31 → **{g:7.1} GB/s**（xf32）");
-                // (l)(m) ★ P15-㉖ dp4a/int8-x 版（同权重同网格，x 流量 ÷4）：(e)/(i) 的对照新尺子。
+                // (l)(m) ★ dp4a/int8-x 版（同权重同网格，x 流量 ÷4）：(e)/(i) 的对照新尺子。
                 {
                     let mut xq7 = k.stream.alloc_zeros::<u8>(2560)?;
                     let mut sx7 = k.stream.alloc_zeros::<f32>(1)?;
@@ -1882,7 +1882,7 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|_| "/models/pocenv/bin/python".to_string());
             let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/golden/decode_oracle.py");
             let out = Command::new(py)
-                .env("PYTHONPATH", "/data14t/ninfer-dev")
+                .env("PYTHONPATH", std::env::var("LINGXI_NINFER_PY").unwrap_or_default())
                 .arg(script)
                 .arg(path)
                 .arg(name)
@@ -2967,7 +2967,7 @@ fn run() -> Result<()> {
 /// 固化的 Qwen3.8-Flash-Next 全模型超参（值与 golden meta.json 同源，来自 HF
 /// `text_config`）。talk/server 不依赖 golden 目录即可构造 `LayerShape` 与 PLE 配置。
 /// 未来第二个模型出现时，此函数上移为 lingxi-model 的强类型 `ModelSpec` 数据。
-/// ㊿-P0 显存预算自动分配（M3 弹性 KV 的第一块砖）：
+/// 显存预算自动分配（M3 弹性 KV 的第一块砖）：
 /// 从 catalog 逐张量算**每卡权重字节**（角色排除法：`MoeRouted*` 走 arena 不上卡；
 /// `text/layers/{i}/` 按层号归卡，无层号的 embedding/head 归 GPU0），减去
 /// KV(serve_ctx)/GDN/rope/预留/边距，余量全部给专家槽。

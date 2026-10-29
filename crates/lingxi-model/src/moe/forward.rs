@@ -114,7 +114,7 @@ pub fn sparse_moe_forward(
             };
             chk("enter")?;
             // ── 两块跨卡缓冲的分配 ──
-            // 池键自 P15-㉞ 起为 (设备号, 长度)（scratch.rs 头部说明），两张卡各用各的
+            // 池键自 device-aware 改造起为 (设备号, 长度)（scratch.rs 头部说明），两张卡各用各的
             // 桶 ⇒ 这里**池化**分配是跨卡安全的（旧注释"键无设备"已过时；without_pool
             // 会让每次远程调用都退化成 cudaMalloc/free 风暴）。用完显式 put 回池复用。
             let mut x1 = crate::scratch::bf16(rm.k, x.len())?;
@@ -238,7 +238,7 @@ pub fn sparse_moe_forward(
     let t_shared = t_start.elapsed();
     super::s3::mark(k, layer, 1)?;
 
-    // ㊺ A2 设备路由：rows==1 时把「router GEMV → 同步 → host softmax/topk → host 查槽 →
+    // 设备路由：rows==1 时把「router GEMV → 同步 → host softmax/topk → host 查槽 →
     // staging」整条 host 决策链压成一个 GPU 核 + 一次事件自旋。命中全中 → 直接出结果；
     // 任一选中专家未入槽（miss）→ None，落回 legacy 全路径（本函数写过的设备缓冲无副作用）。
     // `LINGXI_ROUTE_DEV=1` 开启；判据未过前默认关。
@@ -360,6 +360,14 @@ pub fn sparse_moe_forward(
         std::fs::write(d.join(format!("moe{call_id:03}_x.f32")), bytes)?;
     }
     let router_w = w.router_shared_gate.slice(0..num_experts * hidden);
+    // ★ router lookahead（router_logits 信号）：在 router GEMV 入队后、首个同步**之前**，
+    // 把本层 router W 的设备地址登记进 ExpertSource 并异步发起"层 L+1 router × 本层
+    // 输入 h"的预测 GEMV（独立流，不延长本层同步；消费点 = 本层 load_hits 的 pf_issue）。
+    // 默认空实现 ⇒ 非 arena 源 / topk_set 信号档零开销。
+    if let Some(s) = src {
+        let (wpf, _gpf) = router_w.device_ptr(&k.stream);
+        s.pf_predict_enqueue(layer, x, wpf)?;
+    }
     let need = rows * num_experts;
     let t_rg = std::time::Instant::now();
     // ── 取回 host：**零拷贝**路径（所有 rows）──
@@ -368,7 +376,7 @@ pub fn sparse_moe_forward(
     // 就让同步多等 ~0.8 ms/层**（见 docs/decode-speed-profile.md 的 [d2h] 拆解），
     // 48 层累积 ~38 ms/token。`LINGXI_ROUTER_NODMAP=1` 可回退。
     // 【本轮修正】原来这里是 `rows == 1 && ...` —— 于是 **t>1 又跌回 D2H 老路**，
-    // 而 §3.42 用「剥块后看 Δ(t=2−t=1) 是否塌缩」实测：**t=2 悬崖 +35.8 ms 里有 +23.4 ms 在 MoE**，
+    // 而「剥块后看 Δ(t=2−t=1) 是否塌缩」实测：**t=2 悬崖 +35.8 ms 里有 +23.4 ms 在 MoE**，
     // 正是这条 0.8 ms/层 × 48。
     // ★ 2026-10-22 二次修正：rows>1 **收回映射路径**。35f4246 放开时只测了 t=2（1 发切片）；
     // 长 prompt（t=512 ⇒ 64 发 ≤8 行切片）每发直写映射 host 内存 = PCIe write-through，
@@ -377,7 +385,7 @@ pub fn sparse_moe_forward(
     // 锚点安全），只把输出去向从映射 host 内存换成设备缓冲 + 一次锁页 D2H。
     let no_dmap = crate::flag("LINGXI_ROUTER_NODMAP");
     let use_map = !no_dmap && rows == 1;
-    // ★ 2026-10-22 ㊿+ 批量设备路由（**默认关**，`LINGXI_ROUTE_DEV=1` 开启）：
+    // ★ 2026-10-22 批量设备路由（**默认关**，`LINGXI_ROUTE_DEV=1` 开启）：
     // softmax+插入式 topk 可整体搬上 GPU（`route_topk_rows_bf16` 逐位复刻 host 数学——
     // glibc-expf 复刻 / 升序串行 sum / IEEE 除法 / 同全序选择 / 同序 norm，首 token
     // 332/97149 实锤位级一致），D2H 从 512KB logits 缩到 41KB 选中表。
@@ -675,7 +683,7 @@ pub fn sparse_moe_forward(
     } else {
         // ★ 2026-10-27：host topk+softmax 逐行并行化。t=512 时该循环 ~3.8ms/层是
         // 纯 host CPU（512 行互相独立，实测占层 wall 的 ~15%）。两阶段、**逐位等价**：
-        //   A（rayon 全局池，起免每 call spawn）：每行复刻旧循环的
+        //   A（rayon 全局池，免每 call spawn）：每行复刻旧循环的
         //     max/exp/sum/归一/topk/renorm 算术（每线程独立 scratch，同值同序），
         //     产出 (专家升序, p/norm) 平铺表；
         //   B（串行）：按行升序合并进 per_expert/sel_rows —— 与旧循环的 push 次序
@@ -871,7 +879,7 @@ pub fn sparse_moe_forward(
     }
     // **唯一专家**（升序）+ 每个唯一专家在"对"列表里的区间 `[group_off[i], group_off[i+1])`。
     // `pair_experts` 本来就是按专家升序拼出来的，所以区间天然连续。
-    // 批量路径靠它把"同一个专家的权重读 t 遍"变成"读一遍、被 t 个 token 共用"（§3.21 根因 3）。
+    // 批量路径靠它把"同一个专家的权重读 t 遍"变成"读一遍、被 t 个 token 共用"（根因 3）。
     let mut uniq_experts: Vec<u32> = Vec::new();
     let mut group_off: Vec<i32> = Vec::new();
     {
@@ -898,7 +906,7 @@ pub fn sparse_moe_forward(
     let q4_hits;
     let q4_alt_hits;
     let bits_sel;
-    // ★ **专家段 hit/miss 重叠**（`LINGXI_MOE_OVERLAP`，§P4；㊶ 起 **rows==1 也生效**）：
+    // ★ **专家段 hit/miss 重叠**（`LINGXI_MOE_OVERLAP`；**rows==1 也生效**）：
     //   rows>1 时 slot_ids[i] 与唯一专家 i 一一对应；rows==1 时对列表==专家列表，
     //   同样一一对应 ⇒ 两种行数都能按"槽条目"切 hit/miss（arena_source 按 overlap 参数
     //   把 miss 的 blob H2D 挪去 stream2，见 arena_source.rs）。
@@ -912,7 +920,7 @@ pub fn sparse_moe_forward(
         p.set_info(layer, 1, uniq_experts.len() as u32);
         p.set_info(layer, 2, rows as u32);
     }
-    // ㊽ 段 4 六事件剖面链（`LINGXI_MOE_PROF=1`）：A=段起点 B=run(gu) 前 C=gu 后
+    // 段 4 六事件剖面链（`LINGXI_MOE_PROF=1`）：A=段起点 B=run(gu) 前 C=gu 后
     // D=swiglu+xf 后 E=run(dn) 后 F=combine 后。A→B 兜住 upload/gather/load_hits/xf，
     // E→F 兜住 combine+收尾。事件只记不同步。
     let prof4 = crate::flag("LINGXI_MOE_PROF");
@@ -940,7 +948,7 @@ pub fn sparse_moe_forward(
         let s = pair_experts.len();
         let d_rows = scratch::upload_i32(k, &pair_rows)?;
         let d_wts = scratch::upload_f32(k, &pair_wts)?;
-        // ㊾ 行 CSR（稳定计数排序，O(s+rows)）：`col[row_off[r]..row_off[r+1])` = 该行所有
+        // 行 CSR（稳定计数排序，O(s+rows)）：`col[row_off[r]..row_off[r+1])` = 该行所有
         // 对的原下标 s 且**升序** ⇒ CSR combine 核的累加次序与旧核"升序 s 扫描"逐位相同。
         // rows==1 时 S 小（旧核扫描便宜），不上传 CSR，combine 走旧核。
         let (d_col, d_roff) = if rows > 1 {
@@ -1080,7 +1088,7 @@ pub fn sparse_moe_forward(
     } else {
         k.stream.alloc_zeros::<bf16>(rows * hidden)?
     };
-    // 诊断字段开关（原在函数尾，㊶提前）：开着时专家段保持"combine 写 expert_out +
+    // 诊断字段开关（原在函数尾，后提前）：开着时专家段保持"combine 写 expert_out +
     // add 写 out"老两步（诊断要读 expert_out）；关时两条快路径用**融合核**一发直写 out。
     let dbg_routes = std::env::var("LINGXI_MOE_DEBUG").is_ok() || dump_dir.is_some();
     // 快路径融合核直写的 `out`（Some = 函数尾不再 add_bf16）。
@@ -1173,12 +1181,12 @@ pub fn sparse_moe_forward(
         }
         // `rows == 1`：每个专家恰好一个对 → 沿用"逐对"旧核（零额外上传）。
         // `rows > 1`：走"按唯一专家分组"的新核 —— 权重行只 load 一次、被该专家命中的
-        // 所有 token 共用。t=8 时专家段流量因此从 ~3.3× 降到 ~1.2×（§3.21 根因 3）。
+        // 所有 token 共用。t=8 时专家段流量因此从 ~3.3× 降到 ~1.2×（根因 3）。
         if rows == 1 {
             let rpw = slots_rpw();
             if dual_q4 {
                 // 混档：按格式段循环（每段用对应 cache 视图；段间对区间互不相交，
-                // 与 ㊶ 拆 launch 同一论据——有损的是 Q3 档本身，不是拆分）。
+                // 与拆 launch 同一论据——有损的是 Q3 档本身，不是拆分）。
                 if std::env::var("LINGXI_MIX_DEBUG").is_ok() {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static ND: AtomicU32 = AtomicU32::new(0);
@@ -1291,7 +1299,7 @@ pub fn sparse_moe_forward(
                 }
             }
             // ① 无重叠：整批一次（老行为，逐位基准）。
-            // ② **hit/miss 重叠**（㊶，t=1 启用）：命中条目 gu→swiglu→dn 一口气推进
+            // ② **hit/miss 重叠**（t=1 启用）：命中条目 gu→swiglu→dn 一口气推进
             //    （与 stream2 上飞的 miss H2D 并行），dn 算完再 `wait(ev_mo_miss)`，
             //    最后补未命中条目。bit-safe 论据与 slotsm 拆 launch 相同：每个对的
             //    输出区间互不相交、点积/元素级算式不变，发射边界不影响任何对的数值；
@@ -1400,7 +1408,7 @@ pub fn sparse_moe_forward(
             // gu 用 xs 的副本；dn 用 act_all（swiglu 输出）的副本，在 swiglu 后转换。
             // 逐位等价：bf16→f32 精确、GEMV 内 z 次序与累加次序不变；省每 (word,token) 8 条 CVT。
             // `LINGXI_MOE_NO_XF32=1` 回退 bf16 现转（同二进制 A/B 用）。
-            // ★ P15-㉖：`LINGXI_MOE_DP4A=1` 时改走 **int8 行量化 + dp4a 内积**（x 流量 ÷4，
+            // ★ `LINGXI_MOE_DP4A=1` 时改走 **int8 行量化 + dp4a 内积**（x 流量 ÷4，
             // 判据见 PLAN；非位等价 ⇒ 默认关，与 xf32 互斥）。
             // ⚠️ dp4a 核（`slotsm_dp4a_body`）与修复前的 bf16 版一样只覆盖每组前 8 个对
             //   （`acc[8]` 且无分批循环，2026-10-18 审计发现）⇒ **任一组 m>8 时强制退回 bf16**，
@@ -1412,9 +1420,9 @@ pub fn sparse_moe_forward(
                 && group_off.windows(2).all(|w| (w[1] - w[0]) <= 8)
                 && !q3_on
                 && !dual_q4;
-            // ㊽ prefill 大 tile 张量核（LINGXI_MOE_TC 复用同一开关）：rows>16 的批量路径，
+            // prefill 大 tile 张量核（LINGXI_MOE_TC 复用同一开关）：rows>16 的批量路径，
             // gu/dn 的 k（hidden/inter）都是 64 的倍数。有损档（~2^-11），判据 = 首 token
-            // 相等 + 质量抽检（PLAN_NEXT §3 拍板）。开着时不需要 xf/dp4a 预转。
+            // 相等 + 质量抽检（2026-10-19 拍板）。开着时不需要 xf/dp4a 预转。
             // ★ 2026-10-22（moe-gemm-bench 隔离判决 12 档全过：×3.3~×33，zipf ×15.7）：
             // 取消 `!dual_q4` 门控 —— 混档时 Q4 视图（runs4）照样可以走 TCP，Q3 视图由
             // run() 内按位宽退回 SIMT。这是 prefill 混档默认提速的最后一块拼图。
@@ -1457,7 +1465,7 @@ pub fn sparse_moe_forward(
                 // 单格式：qv==q，shadow 后行为与以前完全一致。
                 let q = qv;
                 let q3_on = q.bits == 3;
-                // Q4 视图（含混档 runs4）走 Q4 TCP；Q3 视图走 ㊽+3 新 Q3 TCP 大 tile 核
+                // Q4 视图（含混档 runs4）走 Q4 TCP；Q3 视图走新 Q3 TCP 大 tile 核
                 //（有损档，判据同 q4_tcp：首 token 相等 + 质量抽检；`LINGXI_NO_Q3TCP=1` 回退 SIMT）。
                 let tcp_on = (tcp_on && !q3_on)
                     || (q3_on
@@ -1477,7 +1485,7 @@ pub fn sparse_moe_forward(
                     let q3_all_m1 = (a as usize..b as usize)
                         .all(|g| group_off[g + 1] - group_off[g] == 1);
                     if gu {
-                        // ㊽ prefill 大 tile 张量核档：一次 launch 覆盖整个专家区间，
+                        // prefill 大 tile 张量核档：一次 launch 覆盖整个专家区间，
                         // M 轴在 grid.z 里分块（tmax = 区间最大组行数）。
                         if tcp_on {
                             let tmax = (a as usize..b as usize)
@@ -1499,7 +1507,7 @@ pub fn sparse_moe_forward(
                             )?;
                             }
                         } else {
-                        // ㊼ 张量核档（`LINGXI_MOE_TC=1`）：gu 的 k=hidden 是 64 的整数倍，
+                        // 张量核档（`LINGXI_MOE_TC=1`）：gu 的 k=hidden 是 64 的整数倍，
                         // 布局与 SIMT 完全相同（group64），只把内积搬到 m8n8k4。
                         // ⚠️ 张量核核只覆盖每组 ≤16 行（kTiles≤2）；prefill 的长 prompt 会出现
                         //    t 上百的行组 ⇒ 逐组判定，超限的组仍走 SIMT（否则会**静默丢掉行**）。
@@ -1582,7 +1590,7 @@ pub fn sparse_moe_forward(
                         }
                         }
                     } else {
-                        // ㊽ dn 同样走大 tile 张量核（k=inter 是 64 的倍数）。
+                        // dn 同样走大 tile 张量核（k=inter 是 64 的倍数）。
                         if tcp_on {
                             let tmax = (a as usize..b as usize)
                                 .map(|g| (group_off[g + 1] - group_off[g]) as usize)
@@ -1823,7 +1831,7 @@ pub fn sparse_moe_forward(
                 );
             }
         } else {
-            // ㊶：诊断关时 combine+残差一发融合（两次舍入同序 ⇒ 逐位相同），省一次 launch/层。
+            // 诊断关时 combine+残差一发融合（两次舍入同序 ⇒ 逐位相同），省一次 launch/层。
             if dbg_routes {
                 k.moe_combine_rows_bf16(&o_all, &d_rows, &d_wts, &mut expert_out, s, rows, hidden)?;
             } else if rows == 1 {
@@ -1834,7 +1842,7 @@ pub fn sparse_moe_forward(
                 )?;
                 out_fused = Some(fo);
             } else {
-                // ㊾ batch 路径走 CSR combine（O(H×top_k)/行）：rows=887 实测 19ms → <1ms。
+                // batch 路径走 CSR combine（O(H×top_k)/行）：rows=887 实测 19ms → <1ms。
                 let mut fo = scratch::bf16(k, rows * hidden)?;
                 k.moe_combine_add_csr_bf16(
                     &o_all, &d_col, &d_roff, &d_wts, &shared, &mut fo, rows, hidden,
@@ -1973,7 +1981,7 @@ pub fn sparse_moe_forward(
             body()?;
         }
         // combine 图外：o_all 从固定槽取出（重放时它正是图写的块），dst 是 scratch expert_out。
-        // ㊶：非诊断时融合核直写 out（combine 的 round + add 的 round 同序，逐位相同）。
+        // 非诊断时融合核直写 out（combine 的 round + add 的 round 同序，逐位相同）。
         let o_fix = crate::graph::take_fixed(k, gkey, 2, s * hidden)?;
         if dbg_routes {
             k.moe_combine_rows_bf16(&o_fix, &d_rows, &d_wts, &mut expert_out, s, rows, hidden)?;
@@ -2072,7 +2080,7 @@ pub fn sparse_moe_forward(
         p.end(layer, 4, &k.stream);
     }
     // ───── out = expert_out + shared ─────
-    // ㊶：两条快路径已用融合核直写 out；其余路径（逐专家 scatter 等）照旧两步。
+    // 两条快路径已用融合核直写 out；其余路径（逐专家 scatter 等）照旧两步。
     let out = match out_fused {
         Some(fo) => fo,
         None => {

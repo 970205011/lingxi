@@ -60,13 +60,74 @@ pub struct IndexerCfg {
 }
 
 
-/// ㊶ KV E4M3 量化开关（`LINGXI_KV_K8V4`，有损：K/V 各按 (行, kv头) 量到 FP8，
+/// KV E4M3 量化开关（`LINGXI_KV_K8V4`，有损：K/V 各按 (行, kv头) 量到 FP8，
 /// 每 token 每 QSA 层 KV 读流量 ÷2；256K 上下文 12 层 6.3GB → 3.15GB）。
 /// 开关必须在**任何 QsaState 创建之前**决定（决定分配哪套缓冲）。
 pub fn kv_q8_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::flag("LINGXI_KV_K8V4"))
 }
+
+/// **KV FP8-G32 探索档**（`LINGXI_KV_FP8`，值感知 flag_val：`=0` 显式关，默认关）：
+/// K/V 都存 1B/元素，**每 32 维一组配一个 f16 scale**（细粒度分组 KV 量化，
+/// 每 32 维一组 scale）——与翻车的 K8V4（每 (行,头) 一个 scale）完全独立的
+/// 新实现。每 token 每 QSA 层 1088B（bf16 2368B 的 45.9%）。有损，未经质量判据
+/// （tools/kvfp8_quality.py）实测前禁止进生产。开关同样必须在任何 QsaState 创建前决定。
+pub fn kv_fp8_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::flag_val("LINGXI_KV_FP8", false))
+}
+
+/// KV FP8 档子模式（`LINGXI_KV_FP8_MODE`，值感知，默认 `int8`）：
+/// `int8` = 每 32 维一组 amax/127 的对称 int8（**安全档**：均匀码距，相对误差
+/// ≤1/254 ≈ 0.39%）；`e4m3` = 每 32 维一组 amax/448 的 E4M3。两档共用同一字节
+/// 平面与 f16 scale 平面，仅编解码不同（内核 `f8_mode` 0=E4M3 / 1=int8）。
+pub fn kv_fp8_mode() -> i32 {
+    static M: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("LINGXI_KV_FP8_MODE") {
+        Ok(v) if v.trim() == "e4m3" => 1,
+        _ => 0,   // int8（默认，含未设置/拼错——安全档宁可高估精度)
+    })
+}
+
+/// KV FP8 残差窗（KIVI 式，两档共用）开关（`LINGXI_KV_FP8_RESIDUAL`，默认开）：
+/// 头 sink 段 + 最近 recent token 的 K/V 常驻 bf16，尾窗滑出的 4-token 页才量化。
+/// `=0` 关残差窗（消融档：全量量化，等价上一版行为）。
+pub fn kv_fp8_residual_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::flag_val("LINGXI_KV_FP8_RESIDUAL", true))
+}
+
+/// 头 sink 段 token 数（`LINGXI_KV_FP8_SINK`，默认 16）：每个序列前 N token 的
+/// K/V 永不量化（KVSink：attention sink 首 token 被量化直接坏首 token 输出——
+/// K8V4 实测"首 token 1543 应 11751"正是此因）。必须 4 的倍数（4-token 页对齐）。
+pub fn kv_fp8_sink() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LINGXI_KV_FP8_SINK")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|&n| n % 4 == 0)
+            .unwrap_or(16)
+    })
+}
+
+/// 尾窗 token 数（`LINGXI_KV_FP8_RECENT`，默认 128）：最近 N token 的 K/V 保持
+/// bf16（追加零成本），滑出后按 4-token 页惰性量化进压缩平面（KIVI residual
+/// flush）。必须 4 的倍数。
+pub fn kv_fp8_recent() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LINGXI_KV_FP8_RECENT")
+            .ok().and_then(|s| s.parse().ok())
+            .filter(|&n| n % 4 == 0 && n > 0)
+            .unwrap_or(128)
+    })
+}
+
+/// 尾窗环的草稿回卷余量：rewind 后 [q_lo, len) 的 bf16 读依赖环槽未被草稿覆写，
+/// 覆写一行 r 的槽需要追加到 r + rcap ≥ len_rewind + recent + 4 + PAD ⇒ 回卷量
+/// ≤ PAD + 1 恒安全（rewind 里有 debug_assert）。投机草稿长度 ≪ 1024，余量 2 个量级。
+pub(crate) const KV_FP8_RES_DRAFT_PAD: usize = 1024;
 
 /// **gather 稀疏注意力**：把选中块压成升序列表后只遍历列表（每行恒定 = budget token），
 /// 不再逐 key 扫全量 Tk。默认开；`LINGXI_ATTN_GATHER=0` 回"原地跳"路径做 A/B。
@@ -92,16 +153,39 @@ pub struct QsaState {
     pub kn: Option<CudaSlice<bf16>>,
     /// value `[cap, kv_heads*head_dim]`（同上）
     pub v: Option<CudaSlice<bf16>>,
-    /// ㊶ E4M3 量化档（`LINGXI_KV_K8V4=1`，有损、env 门控）：字节 KV + 每 (行, kv头) scale。
+    /// E4M3 量化档（`LINGXI_KV_K8V4=1`，有损、env 门控）：字节 KV + 每 (行, kv头) scale。
     /// 量化后 **bf16 的 kn/v 为 None**（省一半显存：256K 上下文 12 层 6.3GB → 3.15GB）；
     /// `stub_kn/stub_v` 是给量化核包装器的 1 元素占位（内核 q8 分支从不读它们）。
     pub kn_q8: Option<CudaSlice<u8>>,
     pub kn_sc: Option<CudaSlice<f32>>,
     pub v_q8: Option<CudaSlice<u8>>,
     pub v_sc: Option<CudaSlice<f32>>,
+    /// **FP8-G32/int8-G32 档**（`LINGXI_KV_FP8=1`，有损、env 门控）：1B/元素字节 KV
+    /// （数据平面布局与 kn_q8 相同：token-major 行主序、行宽 kv_heads*head_dim 字节
+    /// ——与 QSA 分页的 4-token 块几何兼容，未来分页 gather 可按槽号×行宽直接寻址）
+    /// + 每 32 维一组的 f16 scale 平面（行宽 kv_dim/32 个 f16；E4M3 = amax/448，
+    /// int8 = amax/127，`LINGXI_KV_FP8_MODE`）。**与 K8V4 的 kn_q8/kn_sc 互斥**
+    /// （kn/v/kn_q8 在 FP8 档全为 None）。
+    pub kn_f8: Option<CudaSlice<u8>>,
+    pub kn_f8s: Option<CudaSlice<half::f16>>,
+    pub v_f8: Option<CudaSlice<u8>>,
+    pub v_f8s: Option<CudaSlice<half::f16>>,
+    /// **FP8 残差窗**（KIVI 式，两档共用，`LINGXI_KV_FP8_RESIDUAL` 默认开）：bf16
+    /// 残差平面，各 `kv_sink + kv_rcap` 行——头 sink 段（行 < kv_sink）线性存放、
+    /// 永不量化；尾窗段成环，槽位 = kv_sink + (r-kv_sink) % kv_rcap。追加只写本平面
+    /// （零成本 bf16 直拷），滑出尾窗的 4-token 页由 flush 量化进 kn_f8/v_f8。
+    pub kn_res: Option<CudaSlice<bf16>>,
+    pub v_res: Option<CudaSlice<bf16>>,
+    /// 压缩平面水位：`[kv_sink, kv_qlo)` 已从残差平面量化（rewind 时按
+    /// `max(kv_sink, align_down(len-kv_recent, 4))` 回退，见 rewind）。
+    pub kv_qlo: usize,
+    pub kv_sink: usize,
+    pub kv_recent: usize,
+    /// 尾窗环容量 = kv_recent + 4 + KV_FP8_RES_DRAFT_PAD（4 对齐）。
+    pub kv_rcap: usize,
     pub stub_kn: CudaSlice<bf16>,
     pub stub_v: CudaSlice<bf16>,
-    /// ㊸ indexer 的 `keep`/`scores` 工作缓冲（grow-only 持久复用）：替代每 token 两次
+    /// indexer 的 `keep`/`scores` 工作缓冲（grow-only 持久复用）：替代每 token 两次
     /// `alloc_zeros`——V100 实测 alloc+memset+free ≈500µs/次，12 个 QSA 层 × 2 ≈ decode
     /// 每 token ~10ms 纯 driver 开销（layerprof 实测 QSA 层 bubble ~800µs 的主因）。
     /// rank/scores 核**全量覆写**（rank 对每个 (row,b) 都写 1/0）⇒ 零值无语义，无需 memset。
@@ -160,12 +244,12 @@ pub struct QsaState {
     pub pool_tmp2: CudaSlice<bf16>,
     /// 已缓存 token 数
     pub len: usize,
-    /// **当前已分配**的容量（≤ max_cap；㊿-P1 弹性 KV 起为懒分配，按需几何增长）。
-    /// 设备缓冲恒为 `cap × 对应维度`（增长时全量拷贝）⇒ `kn.len/cap == kv_dim` 不变式保持。
+    /// **当前已分配**的容量（≤ max_cap；弹性 KV 起为懒分配，按需几何增长）。
+    /// 设备缓冲恒为 `cap × 对应维度`（增长时全量拷贝）⇒ `kn.len()/cap == kv_dim` 不变式保持。
     pub cap: usize,
     /// 容量上限（= 建局时的 rope 容量；RoPE 表只建到这么长，不能越界）
     pub(crate) max_cap: usize,
-    /// `kv_heads * head_dim`（= 每行元素数；分页模式下 kn.len/cap 不再等于它，
+    /// `kv_heads * head_dim`（= 每行元素数；分页模式下 kn.len()/cap 不再等于它，
     /// 一律以本字段为准）
     pub kv_dim: usize,
     /// `kv_heads`（K8V4 的 scale 平面增长用）
@@ -180,12 +264,31 @@ impl QsaState {
     pub fn new(k: &Kernels, c: &AttnCfg, ci: &IndexerCfg, cap: usize) -> Result<Self> {
         let kv_dim = c.kv_heads * c.head_dim;
         let q8 = kv_q8_on();
+        let fp8 = kv_fp8_on();
+        // 两套量化档互斥（同时开 = 配置错误，响亮报错而不是猜一个）。
+        anyhow::ensure!(
+            !(q8 && fp8),
+            "LINGXI_KV_K8V4 与 LINGXI_KV_FP8 互斥（两套量化 KV 不能同时开）"
+        );
         // P2 Stage 2：分页模式（host 块池 + 常驻窗口）。硬前提 = gather 路径前提
         // （raw KV 只有 gather 按块读；dense/masked 读全量行，与分页互斥）。
-        let paged = crate::flag("LINGXI_QSA_PAGED") && !q8;
-        if crate::flag("LINGXI_QSA_PAGED") && q8 {
-            anyhow::bail!("LINGXI_QSA_PAGED 与 K8V4 量化 KV（LINGXI_KV_K8V4=1）互斥");
+        let paged = crate::flag("LINGXI_QSA_PAGED") && !q8 && !fp8;
+        if crate::flag("LINGXI_QSA_PAGED") && (q8 || fp8) {
+            anyhow::bail!(
+                "LINGXI_QSA_PAGED 与量化 KV 互斥（LINGXI_KV_K8V4=1 / LINGXI_KV_FP8=1）"
+            );
         }
+        if fp8 {
+            anyhow::ensure!(
+                c.head_dim % 32 == 0,
+                "LINGXI_KV_FP8 需要 head_dim%32==0（FP8-G32 每 32 维一组 scale）"
+            );
+        }
+        // FP8 残差窗（KIVI 式）：sink/recent 必须 4 的倍数（4-token 页对齐）。
+        let fp8_res = fp8 && kv_fp8_residual_on();
+        let kv_sink = kv_fp8_sink();
+        let kv_recent = kv_fp8_recent();
+        let kv_rcap = kv_recent + 4 + KV_FP8_RES_DRAFT_PAD;
         if paged {
             anyhow::ensure!(
                 ci.compress.is_power_of_two() && ci.compress >= 1 && c.head_dim == 256,
@@ -206,17 +309,33 @@ impl QsaState {
         } else {
             nblk_max
         };
-        // ㊿-P1 弹性 KV：只预付 `min(cap, 初始档)`，余量按需 `ensure_cap` 几何增长。
+        // 弹性 KV：只预付 `min(cap, 初始档)`，余量按需 `ensure_cap` 几何增长。
         // 上限仍是 `cap`（RoPE 表口径）；显式 env `LINGXI_KV_NO_LAZY=1` 回全额预付（对照用）。
         let init = if crate::flag("LINGXI_KV_NO_LAZY") { cap } else { cap.min(kv_init_tokens()) };
         let kn_init = if paged { win_blocks * ctok } else { init };
         Ok(Self {
-            kn: if q8 { None } else { Some(k.stream.alloc_zeros::<bf16>(kn_init * kv_dim)?) },
-            v: if q8 { None } else { Some(k.stream.alloc_zeros::<bf16>(kn_init * kv_dim)?) },
+            // bf16 KV 平面：K8V4（q8）与 FP8-G32（fp8）档都必须为 None——否则追加
+            // （step.rs `if state.kn.is_some()`）和注意力分派（同样先匹配 bf16 分支）
+            // 会优先走 bf16，量化平面成了死代码（2026-10-28 判据实测抓到的接线 bug：
+            // FP8 档输出与 bf16 逐位一致竟是"走的还是 bf16"）。
+            kn: if q8 || fp8 { None } else { Some(k.stream.alloc_zeros::<bf16>(kn_init * kv_dim)?) },
+            v: if q8 || fp8 { None } else { Some(k.stream.alloc_zeros::<bf16>(kn_init * kv_dim)?) },
             kn_q8: if q8 { Some(k.stream.alloc_zeros::<u8>(init * kv_dim)?) } else { None },
             kn_sc: if q8 { Some(k.stream.alloc_zeros::<f32>(init * c.kv_heads)?) } else { None },
             v_q8: if q8 { Some(k.stream.alloc_zeros::<u8>(init * kv_dim)?) } else { None },
             v_sc: if q8 { Some(k.stream.alloc_zeros::<f32>(init * c.kv_heads)?) } else { None },
+            // FP8-G32 档：字节平面 + 每 32 维一组 f16 scale 平面（行宽 kv_dim/32）。
+            kn_f8: if fp8 { Some(k.stream.alloc_zeros::<u8>(init * kv_dim)?) } else { None },
+            kn_f8s: if fp8 { Some(k.stream.alloc_zeros::<half::f16>(init * (kv_dim / 32))?) } else { None },
+            v_f8: if fp8 { Some(k.stream.alloc_zeros::<u8>(init * kv_dim)?) } else { None },
+            v_f8s: if fp8 { Some(k.stream.alloc_zeros::<half::f16>(init * (kv_dim / 32))?) } else { None },
+            // FP8 残差窗：bf16 平面大小与上下文无关（sink + 尾窗环，恒定）。
+            kn_res: if fp8_res { Some(k.stream.alloc_zeros::<bf16>((kv_sink + kv_rcap) * kv_dim)?) } else { None },
+            v_res: if fp8_res { Some(k.stream.alloc_zeros::<bf16>((kv_sink + kv_rcap) * kv_dim)?) } else { None },
+            kv_qlo: kv_sink,
+            kv_sink,
+            kv_recent,
+            kv_rcap,
             stub_kn: k.stream.alloc_zeros::<bf16>(1)?,
             stub_v: k.stream.alloc_zeros::<bf16>(1)?,
             // 占位小尺寸，attention_step 里按需长大（长大是冷路径）
@@ -285,10 +404,10 @@ impl QsaState {
         })
     }
 
-    /// ㊿-P1 弹性 KV：按需几何增长（alloc + 全量拷贝 + 换绑）。
+    /// 弹性 KV：按需几何增长（alloc + 全量拷贝 + 换绑）。
     /// - append-only 语义 ⇒ 倍增策略的摊销拷贝 ≈ 2× 最终体积；
     /// - 只在同一条 stream 上排队，顺序由 stream 保证；所有 kernel 按**调用时**指针启动，
-    /// 专家段图用的是独立固定槽、不引用本池 ⇒ 换缓冲对数学与图都不可见（逐位等价）；
+    ///   专家段图用的是独立固定槽、不引用本池 ⇒ 换缓冲对数学与图都不可见（逐位等价）；
     /// - `need > max_cap` 按旧口径报错（RoPE 表只建到 max_cap，越界会读到垃圾）。
 
     pub fn ensure_cap(&mut self, k: &Kernels, need: usize) -> Result<()> {
@@ -363,6 +482,10 @@ impl QsaState {
         grow_opt!(kn_sc, f32, new_cap * nkh);
         grow_opt!(v_q8, u8, new_cap * kv_dim);
         grow_opt!(v_sc, f32, new_cap * nkh);
+        grow_opt!(kn_f8, u8, new_cap * kv_dim);
+        grow_opt!(kn_f8s, half::f16, new_cap * (kv_dim / 32));
+        grow_opt!(v_f8, u8, new_cap * kv_dim);
+        grow_opt!(v_f8s, half::f16, new_cap * (kv_dim / 32));
         // 裸字段（恒存在）：rk_dev / pooled。
         macro_rules! grow_bare {
             ($field:ident, $ty:ty, $elems:expr) => {{
@@ -425,6 +548,22 @@ impl QsaState {
                 self.tab_host[b] = -2;
             }
             self.tab_dirty = true;
+        }
+        // FP8 残差档：压缩水位随回卷回退——rewind 后尾窗重新覆盖 [q_lo, len) 的
+        // bf16 读，这些行的环槽内容必须仍是 accepted 前缀的原文。槽位 r 被草稿覆写
+        // 需要追加到 r + kv_rcap（= r + recent + 4 + DRAFT_PAD），而回卷后仍要从环
+        // 读的行 r ≥ new_len - recent - 3 ⇒ 回卷量 ≤ DRAFT_PAD + 1 时环槽必然完好
+        // （推导见 KV_FP8_RES_DRAFT_PAD 注释）；投机草稿长度 ≪ 1024，debug_assert 兜底。
+        // ⚠️ 必须在 self.len 覆盖前算回卷量。
+        if self.kn_res.is_some() {
+            let overshoot = self.len - new_len;
+            debug_assert!(
+                overshoot <= KV_FP8_RES_DRAFT_PAD + 1,
+                "FP8 残差窗：回卷 {overshoot} token 超过草稿余量 {KV_FP8_RES_DRAFT_PAD}\
+                 （环槽可能已被草稿覆写）",
+            );
+            let q_lo = (new_len.saturating_sub(self.kv_recent) / 4 * 4).max(self.kv_sink);
+            self.kv_qlo = self.kv_qlo.min(q_lo);
         }
         self.len = new_len;
         self.nblocks = new_len / self.idx_compress;
