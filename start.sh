@@ -106,6 +106,24 @@ export LINGXI_ARENA_REPIN="${LINGXI_ARENA_REPIN:-30000}"
 # 值感知默认：显式 LINGXI_QSA_PAGED=0 可关（R5 gate2/gate3 守门）。
 export LINGXI_QSA_PAGED="${LINGXI_QSA_PAGED:-1}"
 export LINGXI_QSA_WIN_TOKENS="${LINGXI_QSA_WIN_TOKENS:-32768}"
+# ★ 2026-10-29 转正：共享专家 W4 档（GPTQ 校准产物）——dense 每 token 参与，bf16 直载是
+# 唯一没进 Q4 的大矩阵。A/B 实测：质量（58K needle 命中）✓ 性能中性（稳态与 bf16 基线在
+# 噪声内）✓ 省 ~470MB 显存（换 ~240 专家槽）。校准产物必须在 Q4 缓存里——缺失时引擎会
+# **静默退 RTN**（质量风险），所以启动前从持久目录补灌缺失缓存（幂等，只拷缺的）。
+export LINGXI_SHARED_Q4="${LINGXI_SHARED_Q4:-1}"
+if [ "$LINGXI_SHARED_Q4" = "1" ]; then
+    _sq4_src="${LINGXI_SHARED_Q4_SRC:-/data/models/lingxi-assets/q4cache-shared}"
+    _sq4_dst="${LINGXI_Q4_CACHE:-/dev/shm/lingxi-q4cache}"
+    if [ -d "$_sq4_src" ]; then
+        mkdir -p "$_sq4_dst"
+        for f in "$_sq4_src"/*.q4; do
+            [ -e "$f" ] || continue
+            b="$(basename "$f")"
+            [ -e "$_sq4_dst/$b" ] || cp "$f" "$_sq4_dst/$b"
+        done
+    fi
+    unset _sq4_src _sq4_dst b f
+fi
 # （暂无默认开启项；LINGXI_MOE_OVERLAP=1 为冷启动场景可选，见 PLAN ㊶）
 
 # ── 有损优化开关（㊶ 用户已批：env 门控 + 质量验证；合格前**保持注释**）───

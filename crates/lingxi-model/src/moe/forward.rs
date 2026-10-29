@@ -187,7 +187,22 @@ pub fn sparse_moe_forward(
         && !crate::flag("LINGXI_NO_SKINNY_ROW")
         && !crate::flag("LINGXI_F32X_PROJ")
         && !crate::flag("LINGXI_NO_SHARED_FUSE");
-    if fuse_shared {
+    if let (Some(gu_q4), Some(dn_q4)) = (&w.shared_gate_up_q4, &w.shared_down_q4) {
+        // ★ W4 共享专家档（2026-10-29，LINGXI_SHARED_Q4）：Q4 侧没有"gu+swiglu 单核"
+        // 融合（那是 bf16 skinny 核族），拆三发走通用 dequant GEMV（与注意力 W4 同核
+        // 族 proj_q4_epi）：gu → swiglu → dn；sg（shared gate 行）照旧 bf16。
+        // 无损判据不适用（有损 W4 注定不逐位）——验收走质量判据（长文档 QA/needle）
+        // + GPTQ 校准产物（gptq_shared.py）。
+        let mut act_full = scratch::bf16(k, rows * 2 * inter)?;
+        crate::gpu::proj_q4_epi(k, x, gu_q4, &mut act_full, 2 * inter, hidden, 0, rows, 0, 0.0, 0.0)?;
+        k.swiglu_bf16(&act_full, &mut act, rows, inter)?;
+        scratch::put_bf16(act_full);
+        crate::gpu::proj_q4_epi(k, &act, dn_q4, &mut shared, hidden, inter, 0, rows, 0, 0.0, 0.0)?;
+        proj_t1_epi(k, x, &sg_row, &mut sg, 1, hidden, rows, 2, 1.0, 1.0)?;
+        scratch::put_bf16(act);
+        k.row_scale_inplace_bf16(&mut shared, &sg, rows, hidden)?;
+        scratch::put_bf16(sg);
+    } else if fuse_shared {
         {
             let (wp, _a) = w.shared_gate_up.device_ptr(&k.stream);
             let (sp, _b) = sg_row.device_ptr(&k.stream);

@@ -482,6 +482,12 @@ pub struct MoeWeights {
     pub shared_gate_up: CudaSlice<bf16>,
     /// [H, I]
     pub shared_down: CudaSlice<bf16>,
+    /// **W4 共享专家档**（`LINGXI_SHARED_Q4=1`，2026-10-29）：两矩阵的 Q4G64 平面；
+    /// `Some` 时前向走 dequant GEMV（bf16 字段退化为 1 元素占位）。
+    /// 共享专家是 dense（每 token 都参与），量化走 **GPTQ 校准**（tools/arena-gen/
+    /// gptq_shared.py 产物，经 LINGXI_Q4_CACHE 名寻址缓存加载），不用 RTN。
+    pub shared_gate_up_q4: Option<crate::q4::Q4W>,
+    pub shared_down_q4: Option<crate::q4::Q4W>,
 }
 
 /// MoE 前向结果（含中间量，便于分段对拍）。

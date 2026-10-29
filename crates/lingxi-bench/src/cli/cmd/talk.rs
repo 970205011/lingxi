@@ -496,6 +496,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     kk, &art, &format!("{canon}shared_gate_up"))?,
                 shared_down: lingxi_model::gpu::upload_any_bf16(
                     kk, &art, &format!("{canon}shared_down"))?,
+                // twopass 直载路径不挂 W4 档（保持 bf16；W4 档走 build_layer）
+                shared_gate_up_q4: None,
+                shared_down_q4: None,
             })
         };
         for l in ls_lo..n_layers {

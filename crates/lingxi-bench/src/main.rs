@@ -1,8 +1,8 @@
 //! `lingxi-bench` — 压测 / 对拍 / 检查工具入口。旁路，不进热路径。
 //!
 //! 当前提供：
-//! `verify <artifact>` — 打开现成 ninfer v2 产物，跑结构自检 + 构建 tensor 目录
-//! `list <artifact>` — 打印目录中的张量（名字/形状/格式/布局/角色）
+//!   `verify <artifact>` — 打开现成 ninfer v2 产物，跑结构自检 + 构建 tensor 目录
+//!   `list   <artifact>` — 打印目录中的张量（名字/形状/格式/布局/角色）
 
 use std::process::Command;
 
@@ -57,10 +57,21 @@ fn run() -> Result<()> {
         print!("{}", lingxi_model::probes::dump());
         return Ok(());
     }
+    // export-tensor <art> <name> <out>：把 artifact 里的 bf16 张量导成裸 LE 字节
+    // （2026-10-29 共享专家 GPTQ 校准链用：离线 numpy 工具读权重，免 torch 依赖）。
+    if args.get(1).map(|s| s.as_str()) == Some("export-tensor") {
+        let art = Artifact::open(std::path::Path::new(&args[2]))?;
+        let (bits, rows, cols) = lingxi_model::gpu::read_bf16_bits(&art, &args[3])?;
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        std::fs::write(&args[4], bytes)?;
+        println!("export-tensor {name}: {rows}x{cols} -> {out}",
+            name = args[3], out = args[4]);
+        return Ok(());
+    }
     match args.get(1).map(|s| s.as_str()) {
         Some("attn-bench") => {
-            // ★ attention 微基准：attn2（每行一块）vs attn3（8 行共享 K/V 读）。
-            // 冷启动单发口径：每 trial 前先写 48MB 脏缓冲驱逐 L2，单次 launch 计时，取 5 trial 的 min。
+            // ★ P15-㊳ attention 微基准：attn2（每行一块）vs attn3（8 行共享 K/V 读）。
+            // 冷启动单发口径（PLAN 纪律）：每 trial 前先写 48MB 脏缓冲驱逐 L2，单次 launch 计时，取 5 trial 的 min。
             let dev: usize = std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
             let heads = 24usize;
@@ -311,7 +322,7 @@ fn run() -> Result<()> {
 
             // 对比 0c：**瘦长 GEMM 随 m 的带宽**（t>1 前向的核心 kernel）。
             // 【本轮改】形状换成 **GR 的两个真形状**（[320,10240] mix_down / [10240,320] mix_up），
-            // 并同时量**新旧两个核** —— 实测 GR 在 t=2 每层要 ~200 µs，而流量只该 ~17 µs/层。
+            // 并同时量**新旧两个核** —— §3.38 实测 GR 在 t=2 每层要 ~200 µs，而流量只该 ~17 µs/层。
             // 判据：权重只读一遍 ⇒ m=1/2/4/8 的时间应几乎相同（FLOPs 白送）；
             // 若随 m 显著变慢，说明 m 路展开有问题，t>1 前向就永远快不起来。
             for &(nn, kk) in &[
@@ -647,7 +658,7 @@ fn run() -> Result<()> {
             }
 
             // ── GDN 层小核总账（36 层都走这条；`LINGXI_SKIP=attn` 拆出来是 292 µs/层，
-            // 而 Q4 投影加起来只有 ~90 µs ⇒ 大头在下面这两个核）──
+            //    而 Q4 投影加起来只有 ~90 µs ⇒ 大头在下面这两个核）──
             {
                 let (conv_dim, kk, heads, hk) = (10240usize, 4usize, 48usize, 128usize);
                 let (val_dim, nk) = (heads * hk, 16usize);
@@ -701,7 +712,7 @@ fn run() -> Result<()> {
 
             // ── 专家槽 Q4 GEMV（decode 每层真正的大头：10 个专家 × 2.61 MB）──
             // 之前从没单独量过它。布局按 arena 契约复刻（见 arena_source.rs）：
-            // blob = gu_bytes + down_bytes；gu=[2*inter,hidden]=[1280,2560]、down=[hidden,inter]=[2560,640]
+            //   blob = gu_bytes + down_bytes；gu=[2*inter,hidden]=[1280,2560]、down=[hidden,inter]=[2560,640]
             {
                 let (s_experts, hidden, inter) = (10usize, 2560usize, 640usize);
                 let kpad = |kk: usize| ((kk + 127) / 128) * 128;
@@ -899,12 +910,12 @@ fn run() -> Result<()> {
                     scan("dn", &yg, &mut yd, hidden, inter, dn_k_pad, inter, gu_bytes as u64, dn_scale as u64, dn_bytes as u64)?;
                 }
                 // **微型 launch 探针**：定位「~14.5 µs 地板」的来源。
-                // S=1,n=8 → 最小 launch（1 block、1 warp）
-                // S=1,n=2560→ 行数拉满但只 1 个专家
-                // S=10,n=8 → 专家数拉满但每专家 1 行
-                // S=10,n=2560 → 真实形状
+                //   S=1,n=8   → 最小 launch（1 block、1 warp）
+                //   S=1,n=2560→ 行数拉满但只 1 个专家
+                //   S=10,n=8  → 专家数拉满但每专家 1 行
+                //   S=10,n=2560 → 真实形状
                 // 若四者都是 ~14.5 µs ⇒ 地板是**每次 launch 的固定 GPU 侧成本**（与 S/n 无关）
-                // ⇒ 正确对策是**减少 launch 次数**（融合 gu+dn / 融合整个 MoE 段），而不是改核内。
+                //   ⇒ 正确对策是**减少 launch 次数**（融合 gu+dn / 融合整个 MoE 段），而不是改核内。
                 for &(ss, nn) in &[(1usize, 8usize), (1, 2560), (10, 8), (10, 2560)] {
                     for _ in 0..3 {
                         k.gemv_q4g64_slots_bf16(
@@ -1340,7 +1351,7 @@ fn run() -> Result<()> {
         }
         Some("f32x-check") => {
             // ★ P15-⑨ 对拍台：`gemm_skinny_row_f32x`（x 预转 fp32）vs `gemm_skinny_row`
-            // 的**输出比特**。随机数据、m=7、GDN 真形状；任何一位不同都打印样本。
+            //   的**输出比特**。随机数据、m=7、GDN 真形状；任何一位不同都打印样本。
             let dev: usize =
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
@@ -1445,17 +1456,17 @@ fn run() -> Result<()> {
         }
         Some("bw-ceiling") => {
             //
-            // ① 纯 memcpy（同字节数） = **硬件上限**
-            // ② bf16 GEMV 真实形状 n=1280 k=2560（专家 gu）与 n=2560 k=640（专家 dn）
-            // ③ bf16 GEMV **大形状** n=39680（= 31 个专家的行拼起来）= 看"网格大小"的影响
-            // ④ bf16 GEMV **高并行度变体**（`gemv_bf16_block_epi_ptr`，一 block 一行）
+            //   ① 纯 memcpy（同字节数）        = **硬件上限**
+            //   ② bf16 GEMV 真实形状 n=1280 k=2560（专家 gu）与 n=2560 k=640（专家 dn）
+            //   ③ bf16 GEMV **大形状** n=39680（= 31 个专家的行拼起来）= 看"网格大小"的影响
+            //   ④ bf16 GEMV **高并行度变体**（`gemv_bf16_block_epi_ptr`，一 block 一行）
             //
-            // Q4 专家 GEMV 不便在这里造布局（要 Q4G64 的 payload/scale 平面），
-            // 所以它的数用**真实 decode 路径的实测**：miss=0 时专家段 78 MB/层 ÷ 0.46 ms
-            // ≈ **170 GB/s**。这样三个数直接可比。
+            //   Q4 专家 GEMV 不便在这里造布局（要 Q4G64 的 payload/scale 平面），
+            //   所以它的数用**真实 decode 路径的实测**：miss=0 时专家段 78 MB/层 ÷ 0.46 ms
+            //   ≈ **170 GB/s**（见 PLAN §P15-②）。这样三个数直接可比。
             //
-            // 口径说明：量的是"权重字节 / 墙钟"，墙钟含入队（rep 次一起排队后同步），
-            // 所以小形状的数字里天然含 launch 开销 —— 那正是我们想看清的一部分。
+            //   口径说明：量的是"权重字节 / 墙钟"，墙钟含入队（rep 次一起排队后同步），
+            //   所以小形状的数字里天然含 launch 开销 —— 那正是我们想看清的一部分。
             let dev: usize =
                 std::env::var("LINGXI_DEVICE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let k = lingxi_kernels::Kernels::load(dev)?;
@@ -1490,7 +1501,7 @@ fn run() -> Result<()> {
             }
             // 伪随机字节（xorshift64）。**权重必须随机**：全零会让"按权重内容索引 shared 表"
             // 的访问退化成全 lane 同地址广播（无 bank 冲突），把带查表的核严重高估
-            //。
+            // （实测假象记录见 PLAN §P15-⑥：slotsm 查表版微基准 +27%、整机 −3%）。
             fn rnd_bytes(n: usize, seed: u64) -> Vec<u8> {
                 let mut v = Vec::with_capacity(n);
                 let mut s = seed | 1;
@@ -1563,11 +1574,11 @@ fn run() -> Result<()> {
             })?;
             eprintln!("  [bf16 dn] 同形状循环 31 次（像一层）      → **{g:7.1} GB/s**");
             // ── ⑤ ★ 我们的 Q4 GEMV：**形状对照**（= "改布局能不能吃满带宽"的判决）──
-            // 同一份 Q4 核（同一个解包路径），只改矩阵行数：
-            // n=1280 = 一个专家的 gu（现状：每专家一个小矩阵）
-            // n=39680 = 31 个专家的 gu **拼成一个连续大矩阵**（用户提的"改布局"）
-            // 字节是 zeros —— 带宽与内容无关，这里只测"几何形状"的影响。
-            // 若 n=39680 明显更高 ⇒ 布局重排（离线做，运行时不付代价）本身就能吃到带宽。
+            //   同一份 Q4 核（同一个解包路径），只改矩阵行数：
+            //     n=1280   = 一个专家的 gu（现状：每专家一个小矩阵）
+            //     n=39680  = 31 个专家的 gu **拼成一个连续大矩阵**（用户提的"改布局"）
+            //   字节是 zeros —— 带宽与内容无关，这里只测"几何形状"的影响。
+            //   若 n=39680 明显更高 ⇒ 布局重排（离线做，运行时不付代价）本身就能吃到带宽。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 for (tag, n) in
@@ -1593,11 +1604,11 @@ fn run() -> Result<()> {
                 }
             }
             // ── ⑥⑦⑧ ★★ 三种喂法隔离（用户指定的判决）：同一个**专家槽核**，同一份字节 ──
-            // (a) s=1, n=39680：全部行当一个"大专家" ⇒ **1D 网格(1240块) + 连续内存**
-            // (b) s=31, n=1280, blob=2.61MB：31 个专家紧挨着（81MB 区内）⇒ **2D 网格(20,31) + 连续**
-            // (c) s=31, n=1280, blob=64MB：31 个专家**散在 2GB 区**里 ⇒ **2D 网格 + 散布**
-            // 比较：(a)vs(b) 隔离"网格形状"；(b)vs(c) 隔离"寻址散布"。
-            // 字节都是 zeros（带宽与内容无关）。
+            //   (a) s=1, n=39680：全部行当一个"大专家" ⇒ **1D 网格(1240块) + 连续内存**
+            //   (b) s=31, n=1280, blob=2.61MB：31 个专家紧挨着（81MB 区内）⇒ **2D 网格(20,31) + 连续**
+            //   (c) s=31, n=1280, blob=64MB：31 个专家**散在 2GB 区**里 ⇒ **2D 网格 + 散布**
+            //   比较：(a)vs(b) 隔离"网格形状"；(b)vs(c) 隔离"寻址散布"。
+            //   字节都是 zeros（带宽与内容无关）。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 let gslots = |k: &lingxi_kernels::Kernels,
@@ -1660,9 +1671,9 @@ fn run() -> Result<()> {
                 }
             }
             // ── ⑨⑩ ★★ 真实路径用的那两个变体，在**真实 s/e_uniq**下测 ──
-            // (d) `slots_rows rpw=1`：t=1 路径（应等于 (b) 的 612）
-            // (e) `slotsm rpw=2`：t=7 批量路径（s=217 对、e_uniq=31、每专家 7 个 token）
-            // —— **这才是 decode 主力**。若它远低于 (b)，瓶颈就在它身上。
+            //   (d) `slots_rows rpw=1`：t=1 路径（应等于 (b) 的 612）
+            //   (e) `slotsm rpw=2`：t=7 批量路径（s=217 对、e_uniq=31、每专家 7 个 token）
+            //       —— **这才是 decode 主力**。若它远低于 (b)，瓶颈就在它身上。
             {
                 use lingxi_artifact::expert_arena::{matrix_layout, BlobFormat};
                 let blob: u64 = 2_611_200;
@@ -1681,7 +1692,7 @@ fn run() -> Result<()> {
                 })?;
                 eprintln!("  [d slots_rows rpw=1] s=31 → **{g:7.1} GB/s**");
                 // (e) slotsm rpw=2：s=217 对、31 个唯一专家、每专家 7 个 token。
-                // ★ bf16 x（现转）vs fp32 预转 x 对照：转换在计时外（提前转化）。
+                //     ★ bf16 x（现转）vs fp32 预转 x 对照：转换在计时外（提前转化）。
                 let s_pairs = 31usize * 7;
                 let group_off: Vec<i32> = (0..=31).map(|i| (i * 7) as i32).collect();
                 let gof = k.stream.clone_htod(&group_off)?;
@@ -1713,7 +1724,7 @@ fn run() -> Result<()> {
                     )
                 })?;
                 eprintln!("  [f slotsm rpw=1]   s=217 e=31 → **{g:7.1} GB/s**（xf32）");
-                // (l)(m) ★ dp4a/int8-x 版（同权重同网格，x 流量 ÷4）：(e)/(i) 的对照新尺子。
+                // (l)(m) ★ P15-㉖ dp4a/int8-x 版（同权重同网格，x 流量 ÷4）：(e)/(i) 的对照新尺子。
                 {
                     let mut xq7 = k.stream.alloc_zeros::<u8>(2560)?;
                     let mut sx7 = k.stream.alloc_zeros::<f32>(1)?;
@@ -1738,9 +1749,9 @@ fn run() -> Result<()> {
                     })?;
                     eprintln!("  [m slotsm dp4a ]  s=62  e=31 (m=2) → **{gl2:7.1} GB/s**（int8-x，真实路由≈此）");
                     // (n)(o) ★ P15-④ 判决：dense 核（带 LUT 解码）在**随机权重**下的大/小形状。
-                    // ⑤ 里的 557 是 alloc_zeros 测的——零权重让 LUT 索引恒定 ⇒ 全 lane
-                    // 同地址广播、零 bank 冲突（P15-⑥ 已证这是假象）。随机权重下若
-                    // dense n=39680 也 ≈ 389 ⇒ "布局重排 557" 的 premise 不成立。
+                    //   ⑤ 里的 557 是 alloc_zeros 测的——零权重让 LUT 索引恒定 ⇒ 全 lane
+                    //   同地址广播、零 bank 冲突（P15-⑥ 已证这是假象）。随机权重下若
+                    //   dense n=39680 也 ≈ 389 ⇒ "布局重排 557" 的 premise 不成立。
                     let wl = k.stream.clone_htod(&rnd_bytes(1280 * 31 * 2560 / 2 * 2, 0xD4))?;
                     let mut yl = k.stream.alloc_zeros::<half::bf16>(1280 * 31)?;
                     for (tag, nn) in [("n=39680", 1280 * 31usize), ("n=1280 ", 1280usize)] {
@@ -1758,9 +1769,9 @@ fn run() -> Result<()> {
                     }
                 }
                 // (g) ★ 判定"是每元素指令多"还是"slotsm 结构本身"：**把 m 降到 1**。
-                // m=1 时每个权重字节只被 1 个 token 用 ⇒ 若 (g) 远高于 (e)，
-                // 说明瓶颈是"每个 (行,列块,token) 那串 转换+FMA"（改嵌套可治）；
-                // 若 (g) 仍 ≈170，说明瓶颈在 slotsm 的结构（加群表/地址算法），另说。
+                //     m=1 时每个权重字节只被 1 个 token 用 ⇒ 若 (g) 远高于 (e)，
+                //     说明瓶颈是"每个 (行,列块,token) 那串 转换+FMA"（改嵌套可治）；
+                //     若 (g) 仍 ≈170，说明瓶颈在 slotsm 的结构（加群表/地址算法），另说。
                 let gof1 = k.stream.clone_htod(&(0..=31i32).collect::<Vec<i32>>())?;
                 let ids1 = k.stream
                     .clone_htod(&(0..31i32).collect::<Vec<i32>>())?;
@@ -1809,7 +1820,7 @@ fn run() -> Result<()> {
                     "  [i slotsm rpw=2]   s=62  e=31 (m=2) → bf16 {g2b:7.1} | **xf32 {g2f:7.1} GB/s**（真实路由≈此形状）"
                 );
                 // (j) ★ rpw 隔离：slots 黄金路径用 rpw=1；slotsm 默认 rpw=2。
-                // 若 rpw=1 追平槽核 b(388)，则差距在行分块而非 x 预取，改默认即可。
+                //     若 rpw=1 追平槽核 b(388)，则差距在行分块而非 x 预取，改默认即可。
                 let gjb = bw(&k, rep, 1280 * 2560 / 2 * 31, || {
                     k.gemv_q4g64_slotsm_rpw_bf16(
                         &w, &ids1, &x, &gof1, &mut y3, 31, 1280, 2560, 2560, 0, blob, 0,
@@ -1882,7 +1893,7 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|_| "/models/pocenv/bin/python".to_string());
             let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/golden/decode_oracle.py");
             let out = Command::new(py)
-                .env("PYTHONPATH", std::env::var("LINGXI_NINFER_PY").unwrap_or_default())
+                .env("PYTHONPATH", "/data14t/ninfer-dev")
                 .arg(script)
                 .arg(path)
                 .arg(name)
@@ -1962,6 +1973,8 @@ fn run() -> Result<()> {
                         routed_down: Some(lingxi_model::gpu::upload_bf16(&k, &art, &format!("{canonical}routed_down"))?),
                         shared_gate_up: lingxi_model::gpu::upload_bf16(&k, &art, &format!("{canonical}shared_gate_up"))?,
                         shared_down: lingxi_model::gpu::upload_bf16(&k, &art, &format!("{canonical}shared_down"))?,
+                        shared_gate_up_q4: None,
+                        shared_down_q4: None,
                     };
                     let dbg_dir = if std::env::var("LINGXI_MOE_DEBUG").is_ok() { Some(dir.as_path()) } else { None };
                     let res = lingxi_model::moe::sparse_moe_forward(
@@ -2383,9 +2396,9 @@ fn run() -> Result<()> {
             // 用法: trunk-ends <artifact> <golden-f32-dir>
             // 省 I/O 版的 T3：把 golden 的层间中间量当作输入，逐段验证主干**两端**
             // （配合 48/48 的 layer-check，即可覆盖整条 `embedding → 48 层 → mixer → lm_head`）：
-            // ① embedding + hc 广播 vs layer0_in
-            // ② 末端 mixer（输入 layer47_out）vs mixer_out
-            // ③ lm_head（输入 golden mixer_out 与 ② 的 mixed 各一遍）vs logits
+            //   ① embedding + hc 广播        vs layer0_in
+            //   ② 末端 mixer（输入 layer47_out）vs mixer_out
+            //   ③ lm_head（输入 golden mixer_out 与 ② 的 mixed 各一遍）vs logits
             let art_path = args.get(2).context("缺少 artifact")?;
             let dir = std::path::PathBuf::from(args.get(3).context("缺少 golden f32 目录")?);
             let meta: serde_json::Value =
@@ -2967,7 +2980,7 @@ fn run() -> Result<()> {
 /// 固化的 Qwen3.8-Flash-Next 全模型超参（值与 golden meta.json 同源，来自 HF
 /// `text_config`）。talk/server 不依赖 golden 目录即可构造 `LayerShape` 与 PLE 配置。
 /// 未来第二个模型出现时，此函数上移为 lingxi-model 的强类型 `ModelSpec` 数据。
-/// 显存预算自动分配（M3 弹性 KV 的第一块砖）：
+/// ㊿-P0 显存预算自动分配（M3 弹性 KV 的第一块砖）：
 /// 从 catalog 逐张量算**每卡权重字节**（角色排除法：`MoeRouted*` 走 arena 不上卡；
 /// `text/layers/{i}/` 按层号归卡，无层号的 embedding/head 归 GPU0），减去
 /// KV(serve_ctx)/GDN/rope/预留/边距，余量全部给专家槽。
@@ -2975,7 +2988,7 @@ fn run() -> Result<()> {
 /// 分配后仍建议看启动账与实际 free VRAM 的差距，逐步收紧 reserve。
 /// MTP 草稿层（`mtp/layer/*` + `mtp/mixer/*`）。
 ///
-/// 结构与主干 QSA 层**同构**（已交叉验证），所以这里只做"命名映射 + 构造"，
+/// 结构与主干 QSA 层**同构**（§3.52 已交叉验证），所以这里只做"命名映射 + 构造"，
 /// 前向直接复用主干的 `layer_step` —— 不另写一份容易写错的注意力 / MoE。
 pub(crate) struct MtpLayer {
     pub(crate) weights: lingxi_model::layer::LayerWeights,
@@ -3011,18 +3024,18 @@ pub(crate) fn build_mtp_layer(
         (up("attention/query_norm")?, up("attention/key_norm")?)
     };
     // ★ 2026-10-25 `LINGXI_MTP_ATTN_Q4=1`（**默认开**，`=0` 回退）：
-    // MTP（草稿）层的 `attention/query_key_gate_value`（68.2 MB bf16）与 `attention/output`
-    // （31.5 MB）在线量化成 W4G64 —— 每步省 ~74 MB 的读，草稿 ~3.79 步/轮 ⇒ 约 −0.46 ms/轮。
-    // 为什么**不损质量**：贪心投机解码里草稿只决定"这一轮能接受几个"，
-    // 被接受的前缀永远是主干自己的 argmax ⇒ **草稿用什么权重都不改变生成文本**
-    // （判据：md5 必须与不开时相同；只有接受率可能微动，损了就把开关关掉）。
-    // 与主干同一套 `upload_q4_named`（带磁盘缓存），W4 形态 ⇒ 也顺带省 ~74 MB 显存。
+    //   MTP（草稿）层的 `attention/query_key_gate_value`（68.2 MB bf16）与 `attention/output`
+    //   （31.5 MB）在线量化成 W4G64 —— 每步省 ~74 MB 的读，草稿 ~3.79 步/轮 ⇒ 约 −0.46 ms/轮。
+    //   为什么**不损质量**：贪心投机解码里草稿只决定"这一轮能接受几个"，
+    //   被接受的前缀永远是主干自己的 argmax ⇒ **草稿用什么权重都不改变生成文本**
+    //   （判据：md5 必须与不开时相同；只有接受率可能微动，损了就把开关关掉）。
+    //   与主干同一套 `upload_q4_named`（带磁盘缓存），W4 形态 ⇒ 也顺带省 ~74 MB 显存。
     // ⚠️ 2026-10-25 **默认已翻回 0（关）**：端到端 2×2 实测（200 token，同 prompt）
-    // 开 = 70.3/68.6 tok/s、49 轮、接受 149（3.04/轮）；关 = 78.4/79.0、47 轮、153（3.26/轮）。
-    // ⇒ 省下的 0.1 ms/轮被"接受率 3.26→3.04"吃成 **−10%**（生成的文本 md5 四跑全同，纯亏吞吐）。
-    // 连带修正一条授权边界：**"草稿权重可以随便量化"只对 head 成立**（head 的舍入只扰动
-    // 最终 argmax ~1e-7）；草稿的**注意力**权重会改变整层 hidden ⇒ 草稿分布漂移、接受率掉。
-    // `=1` 仍可开（代码与缓存都在），只作诊断/省显存用（−74 MB）。
+    //   开 = 70.3/68.6 tok/s、49 轮、接受 149（3.04/轮）；关 = 78.4/79.0、47 轮、153（3.26/轮）。
+    //   ⇒ 省下的 0.1 ms/轮被"接受率 3.26→3.04"吃成 **−10%**（生成的文本 md5 四跑全同，纯亏吞吐）。
+    //   连带修正一条授权边界：**"草稿权重可以随便量化"只对 head 成立**（head 的舍入只扰动
+    //   最终 argmax ~1e-7）；草稿的**注意力**权重会改变整层 hidden ⇒ 草稿分布漂移、接受率掉。
+    //   `=1` 仍可开（代码与缓存都在），只作诊断/省显存用（−74 MB）。
     let mtp_attn_q4 = std::env::var("LINGXI_MTP_ATTN_Q4").map(|v| v == "1").unwrap_or(false);
     let up_m = |n: &str| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
         if mtp_attn_q4 {
@@ -3065,6 +3078,8 @@ pub(crate) fn build_mtp_layer(
             routed_down: if sparse { None } else { Some(upm("routed_down")?) },
             shared_gate_up: upm("shared_gate_up")?,
             shared_down: upm("shared_down")?,
+            shared_gate_up_q4: None,
+            shared_down_q4: None,
         },
         ple: None,
     };

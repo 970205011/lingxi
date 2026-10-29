@@ -10,8 +10,8 @@ use lingxi_artifact::Artifact;
 pub fn pack(args: &[String]) -> Result<()> {
     // **把 `mtp/*` 张量抽出来单独打包**。
     //
-    // 背景：生产产物 `qwen4_exp.ninfer` 里**没有** MTP 张量，
-    // 而 `/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer`（252 GB）里有 27 个。
+    // 背景（docs §3.51）：生产产物 `qwen4_exp.ninfer` 里**没有** MTP 张量，
+    // 而 `/data/models/lingxi-assets/qwen4_exp.q4dense.mtp2.ninfer`（252 GB）里有 27 个。
     // 投机解码只需要那 27 个 ⇒ 把它们抽成一个 ~5 GiB 的小产物，
     // 引擎启动时多开一个小产物即可，**不必去碰那个 252 GB 的大文件**。
     //
@@ -65,7 +65,7 @@ pub fn pack(args: &[String]) -> Result<()> {
 
 /// MTP 接受率测量（投机解码判据工具）。
 pub fn accept(args: &[String]) -> Result<()> {
-    // **接受率测量** —— 投机解码的总闸门（步骤 2）。
+    // **接受率测量** —— 投机解码的总闸门（§3.52 步骤 2）。
     // 主干贪心跑 N 步；每步拿 (h_P, 主干刚预测的 token) 喂 MTP 头出草稿，
     // 与主干**真实的下一个 token** 比对；输出一致率（= 接受率）。
     // MTP 有自己的 KV（1 层），随主干同步推进：prompt 一次性 T 行，之后每步 1 行。
@@ -106,14 +106,14 @@ pub fn accept(args: &[String]) -> Result<()> {
     let arena_path = std::env::var("LINGXI_EXPERT_ARENA")
         .unwrap_or_else(|_| "/dev/shm/qwen4_exp.expert-arena.q4g64.bin".to_string());
     // ★★ **EP（专家并行，`LINGXI_EP=1`）**：两卡各跑**全部** n_layers 层的稠密段，
-    // 专家按 id 二分（卡 0 < half，卡 1 ≥ half），每层交换 MoE 部分和。
-    // 与 layer-split / moe-split 互斥；跨卡 kernel 不能被 CUDA Graph 捕获 ⇒ 强制关图。
+    //    专家按 id 二分（卡 0 < half，卡 1 ≥ half），每层交换 MoE 部分和。
+    //    与 layer-split / moe-split 互斥；跨卡 kernel 不能被 CUDA Graph 捕获 ⇒ 强制关图。
     let ep_on = std::env::var("LINGXI_EP").map(|v| v == "1").unwrap_or(false);
     if ep_on {
         std::env::set_var("LINGXI_NO_GRAPHS", "1");
         lingxi_model::graph::force_disable();
     }
-// 未显式给槽数时走显存预算自动分配。tune_lo 在 ls_lo 定案前先用
+    // ㊿-P0：未显式给槽数时走显存预算自动分配。tune_lo 在 ls_lo 定案前先用
     // env 口径（缺省 24；无 GPU1 时 ls_lo 实为 0，此处按 24 只会**少估**槽数，安全方向）。
     let tune_lo: u32 = std::env::var("LINGXI_LAYER_SPLIT")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
@@ -138,8 +138,8 @@ pub fn accept(args: &[String]) -> Result<()> {
     };
     let moe_split = lingxi_model::flag("LINGXI_MOE_SPLIT");
     // ⚠️ 跨卡 + CUDA Graph 是**危险组合**：图是在 GPU0 的 stream 上捕获/实例化的，
-    // GPU1 的内核一旦落进捕获区间，重放时就会在"图所属的设备"上执行 ⇒ 错乱。
-    // 当前这条路必须关图（`LINGXI_NO_GRAPHS=1`；实测关图本来就快 5%，见）。
+    //    GPU1 的内核一旦落进捕获区间，重放时就会在"图所属的设备"上执行 ⇒ 错乱。
+    //    当前这条路必须关图（`LINGXI_NO_GRAPHS=1`；实测关图本来就快 5%，见 §P13.3）。
     anyhow::ensure!(
         !moe_split || lingxi_model::flag("LINGXI_NO_GRAPHS"),
         "LINGXI_MOE_SPLIT 必须同时设 LINGXI_NO_GRAPHS=1 —— 跨卡内核不能被 GPU0 的 CUDA Graph 捕获"
@@ -151,12 +151,12 @@ pub fn accept(args: &[String]) -> Result<()> {
     let layers_hi_env: u32 = std::env::var("LINGXI_ARENA_LAYERS_HI")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(48);
 
-    // ★★ **全量 layer-split**：
-    // 与 `LINGXI_MOE_SPLIT`（只搬 MoE）互斥。这里必须在建 `Sequence` **之前**把
-    // 两张卡都建好 —— 因为 `[lo, n_layers)` 的**状态**要直接建在 GPU1 上。
-    // ★ 2026-10-17：**双卡时默认自动开 split**（lo=24）——真实语料实测
-    // 20.7 → 54.1 tok/s（+161%：每卡 arena 减半 → 专家 miss 崩塌；bench 英文
-    // 高命中语境 −1%）。显式设 `LINGXI_LAYER_SPLIT=0` 可关（回归对照用）。
+    // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`，PLAN §P15 里程碑 A）：
+    //    与 `LINGXI_MOE_SPLIT`（只搬 MoE）互斥。这里必须在建 `Sequence` **之前**把
+    //    两张卡都建好 —— 因为 `[lo, n_layers)` 的**状态**要直接建在 GPU1 上。
+    // ★ P15-㉜（2026-10-17）：**双卡时默认自动开 split**（lo=24）——真实语料实测
+    //    20.7 → 54.1 tok/s（+161%：每卡 arena 减半 → 专家 miss 崩塌；bench 英文
+    //    高命中语境 −1%）。显式设 `LINGXI_LAYER_SPLIT=0` 可关（回归对照用）。
     let ls_env: Option<u32> = if ep_on {
         Some(0)
     } else {
@@ -177,10 +177,10 @@ pub fn accept(args: &[String]) -> Result<()> {
     );
     if ls_on {
         if auto_split {
-// 不再整体禁图——所录的图全是**单层本地段**（专家段 3 核固定槽），
+            // ㊸：不再整体禁图——所录的图全是**单层本地段**（专家段 3 核固定槽），
             // 层⇄设备一一对应（key=layer*8+7 只在那一台设备上出现），捕获/重放都在
             // 本层自己的 stream 上；跨卡拷贝（cross_copy）在层循环之外，不进图。
-            // 若实测判据翻车，回退 = 恢复 force_disable 一行。
+            // 若实测判据翻车，回退 = 恢复 force_disable() 一行。
             eprintln!(
                 "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%，\
                  bench 语境 −1%；设 LINGXI_LAYER_SPLIT=0 关闭）。单层本地图保持开启。"
@@ -188,12 +188,12 @@ pub fn accept(args: &[String]) -> Result<()> {
         } else {
             if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
                 eprintln!(
-                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS：单层本地图（专家段）\
+                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS。㊸ 起单层本地图（专家段）\
                      在 split 下保持可用；若出现数值异常请先设 LINGXI_NO_GRAPHS=1 对照。"
                 );
             }
         }
-        // ★ 池已 device-aware（键=(设备,长度)）⇒ 不再需要禁池。
+        // ★ P15-㉞：池已 device-aware（键=(设备,长度)）⇒ 不再需要禁池。
         // 禁池正是 split+分块确定性发散的根因（直连 alloc/free 与在飞 kernel 竞争）。
     }
     let ls_k1: Option<lingxi_kernels::Kernels> =
@@ -202,7 +202,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         Some(kk) => Some(crate::cli::common::load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
         None => None,
     };
-// 未显式给槽数时走显存预算自动分配（env 显式值优先）。
+    // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
     // talk 路径 KV 容量 = rope_len+8（prompt+n_new+spec 余量+16）。
     let ls_slots: usize = if ep_on {
         ep_slots
@@ -219,7 +219,7 @@ pub fn accept(args: &[String]) -> Result<()> {
             None => 9600,
         },
     }
-    };  // ★ 工作集≥槽位判决(375/卡层)
+    };  // ★㊲ 工作集≥槽位判决(375/卡层)
     let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
         match ls_k1.as_ref() {
             Some(kk) => {
@@ -290,10 +290,10 @@ pub fn accept(args: &[String]) -> Result<()> {
     };
     let expert_source: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
         Some(Box::new(crate::arena_source::ArenaExpertSource::new(&k, &arena_path, slots, false, gpu0_layers)?));
-    // ★ **跨卡 MoE**：
-    // 把**后一半层**的 MoE 交给目前全空的 GPU1 跑 —— 它只有这些层的槽位，可以给到
-    // 每层 400+ 个（覆盖 ~100%、miss≈0），而 GPU0 的 9000 槽只需伺候前一半层
-    // （每层 375 个 ⇒ ~92%）。跨卡只过 MoE 的输入/输出激活（36 KB×2/层）。
+    // ★ **跨卡 MoE**（`LINGXI_MOE_SPLIT=1`，设计见 `docs/PLAN.md` §P13.1c）：
+    //   把**后一半层**的 MoE 交给目前全空的 GPU1 跑 —— 它只有这些层的槽位，可以给到
+    //   每层 400+ 个（覆盖 ~100%、miss≈0），而 GPU0 的 9000 槽只需伺候前一半层
+    //   （每层 375 个 ⇒ ~92%）。跨卡只过 MoE 的输入/输出激活（36 KB×2/层）。
     let split_lo: u32 = split_lo_env;
     let split_slots: usize = std::env::var("LINGXI_MOE_SPLIT_SLOTS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(11000);
@@ -334,12 +334,15 @@ pub fn accept(args: &[String]) -> Result<()> {
                     kk, &art, &format!("{canon}shared_gate_up"))?,
                 shared_down: lingxi_model::gpu::upload_any_bf16(
                     kk, &art, &format!("{canon}shared_down"))?,
+                // moe-split 直载路径不挂 W4 档（保持 bf16；W4 档走 build_layer）
+                shared_gate_up_q4: None,
+                shared_down_q4: None,
             });
         }
         eprintln!("[moe-split] GPU1 的 MoE 权重装好（{} 层，{:.1}s）", n_layers - split_lo, tl.elapsed().as_secs_f64());
         // ⚠️ cudarc 的错误**粘在上下文上**，要等下一次 `bind_to_thread` 才吐 ⇒
-        // 初始化期（建 context/开 arena/钉页/传权重）如果有错，会一路潜伏到
-        // 后面的某次拷贝才炸、把报错点带偏。这里先清一次，保证后面报错的就是真凶。
+        //    初始化期（建 context/开 arena/钉页/传权重）如果有错，会一路潜伏到
+        //    后面的某次拷贝才炸、把报错点带偏。这里先清一次，保证后面报错的就是真凶。
         kk.ctx.check_err().map_err(|e| {
             anyhow::anyhow!("[moe-split] GPU1 初始化阶段就有报错（见上）：{e}")
         })?;
@@ -360,7 +363,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         _ => None,
     };
     // ★ **EP**：GPU1 的稠密层缓存——**全部** n_layers 层，逐层 build 到 GPU1。
-    // 先预热（`peek` 只读，`run_layers_ep` 每层都要取权重）。
+    //   先预热（`peek` 只读，`run_layers_ep` 每层都要取权重）。
     let mut ep_cache1: Option<crate::cli::common::DeviceLayerCache> = None;
     if ep_on {
         let k1c = ls_k1.as_ref().expect("EP 必须有 GPU1 上下文");
@@ -450,7 +453,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         Box::new(move |layer: u32| -> Result<lingxi_model::trunk::LoadedLayer> {
             eprint!("\r  [load] 层 {layer}/{n_layers}        ");
             // ★ 全量 layer-split：本层的稠密权重必须直接装到**本层要跑的卡**上
-            // （装错了不会报错，只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串）。
+            //   （装错了不会报错，只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串）。
             let dev_k = match (lsb, k1b) {
                 (true, Some(kk)) if layer >= lob => kk,
                 _ => kb,
@@ -517,7 +520,7 @@ pub fn accept(args: &[String]) -> Result<()> {
     // `need_head=false`：**只要层的输出 `o`**（用来刷 MTP 自己的 KV），
     // 不算 head、不 D2H、不做 host 侧的 argmax/top-K/softmax。
     // 这一条是实测出来的大头：host 侧要对 `t×248320` 个 logits 做多趟标量处理
-    // （`clone_dtoh` 同步拷贝 + f32 转换 + argmax + top-K + softmax 的 248K 次 `exp`），
+    // （`clone_dtoh` 同步拷贝 + f32 转换 + argmax + top-K + softmax 的 248K 次 `exp()`），
     // **比主干一整层（0.57 ms）还贵**。而**重放格的 token id 根本没用**（只用来刷 KV）。
     const MTP_KTOP: usize = 20;
     // prompt 相位的 top-K 存档（`mtp_step` 一次给 t 行的 top-K；这里只需要那一次）
@@ -588,7 +591,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         if !need_head {
             return Ok((Vec::new(), Vec::new(), Vec::new(), out));
         }
-        // 【实验 LINGXI_MTP_GMIX=1】：末步该用**全局** mixer
+        // 【实验 LINGXI_MTP_GMIX=1】§3.64：末步该用**全局** mixer
         // (`text/hyper_connection_mixer`，主干喂输出头前的那一站) 还是 MTP 自带的 `mtp/mixer`？
         // Strata（已验证能跑投机的实现）读的是全局那套 ⇒ 开关切换以对拍；默认保持现状。
         let fmix: &lingxi_model::gr::GrWeights = if lingxi_model::flag("LINGXI_MTP_GMIX") {
@@ -705,8 +708,8 @@ pub fn accept(args: &[String]) -> Result<()> {
     // 自洽判据（不需要外部 oracle）：主干自己在位置 i 的 `h`，过「全局 mixer + lm_head」
     // 后的 argmax 必须 == 该位置**真实的下一个 token** `ids_p[i+1]`
     // （主干贪心能逐位复现 prompt 续写，golden 就是这么来的）。
-    // 逐行命中 ⇒ 我们喂 MTP 的 `hyper` 行与位置一一对应，且与主干喂头的那份**同源**；
-    // 错位/系统偏 ⇒ 问题就在 (b)（h 的来源或节奏）。
+    //   逐行命中 ⇒ 我们喂 MTP 的 `hyper` 行与位置一一对应，且与主干喂头的那份**同源**；
+    //   错位/系统偏 ⇒ 问题就在 (b)（h 的来源或节奏）。
     {
         let (mixed_h, injw_h) = lingxi_model::gr::gated_residual_forward(
             &k, &endpoints.mixer, &hyper_p, prompt_len as u32, dim, hidden,
@@ -752,9 +755,9 @@ pub fn accept(args: &[String]) -> Result<()> {
         );
     }
     // h 的"身份"候选（两条线索打架，实测裁）：
-    // `hyper`（默认）：48 层后的**残差栈** [T,10240]（Strata 的 window_R_ 就叫 residual）
-    // `mixed`：层尾 mixer 的产物 [T,2560] **repeat 到 10240**
-    // （llama.cpp 说 h 是"喂 lm_head 的 post-norm hidden"，而本模型无最终 norm）
+    //   `hyper`（默认）：48 层后的**残差栈** [T,10240]（Strata 的 window_R_ 就叫 residual）
+    //   `mixed`：层尾 mixer 的产物 [T,2560] **repeat 到 10240**
+    //            （llama.cpp 说 h 是"喂 lm_head 的 post-norm hidden"，而本模型无最终 norm）
     let mtp_h_mixed =
         std::env::var("LINGXI_MTP_H").map(|v| v == "mixed").unwrap_or(false);
     eprintln!(
@@ -793,8 +796,8 @@ pub fn accept(args: &[String]) -> Result<()> {
     // ── **强核对（真值，无需主干 rollout）** ──
     // prompt 相位：行 i 喂的是 (h_i, emb(ids[i+1]))，语义上应预测 **ids[i+2]**
     // ⇒ 每个 prompt 行的期望值是**已知的**，一次前向可得 ~prompt_len 个独立样本。
-    // 这里命中率高 ⇒ 草稿头本身对，问题在 decode 段的喂法/索引；
-    // 这里也≈0 ⇒ 草稿头本身有问题（与 "必是范畴性错误"一致）。
+    //   这里命中率高 ⇒ 草稿头本身对，问题在 decode 段的喂法/索引；
+    //   这里也≈0    ⇒ 草稿头本身有问题（与 §3.60"必是范畴性错误"一致）。
     {
         let (mut ok, mut tot) = (0usize, 0usize);
         let n = prompt_len.saturating_sub(2);
@@ -820,7 +823,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         // 若 top-1 低而 top-8/top-16 高 ⇒ 草稿**分布是对的**，只是 argmax 差一两位
         // ⇒ 多候选（树）草稿有真收益；若 top-20 也只高一点 ⇒ 分布本身偏了，树也没用。
         // ⚠️ 本轮样本 = 1 个 prompt 的 (prompt_len-2) 行，**统计上很薄**；
-        // 要看"不同专家/上下文"的差异必须换多个 prompt 各跑一遍再合。
+        //    要看"不同专家/上下文"的差异必须换多个 prompt 各跑一遍再合。
         {
             const NS: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
             let mut hit = [0usize; 7];
@@ -889,7 +892,7 @@ pub fn accept(args: &[String]) -> Result<()> {
     if let Ok(ks) = std::env::var("LINGXI_MTP_SPEC") {
         // ── 真实投机环路（MTP 草稿链）──
         // 每轮：① MTP 草稿 k 个（自喂自链）② 主干一次批前向验证 ③ 数出接受前缀
-        // ④ 提交：主干状态回卷 + MTP 的 KV cell 用**主干的 h** 重放（否则下一轮建立在错 KV 上）
+        //      ④ 提交：主干状态回卷 + MTP 的 KV cell 用**主干的 h** 重放（否则下一轮建立在错 KV 上）
         let kd: usize = ks.parse().unwrap_or(6);
         let t_max = kd + 1;
         let n_gen = n_new.max(kd + 1);
@@ -903,11 +906,11 @@ pub fn accept(args: &[String]) -> Result<()> {
         // 分段计时（均值）：草稿链 / 主干验证 / 提交 / MTP 重放
         let (mut t_draft, mut t_chunk, mut t_commit, mut t_resync) = (0f64, 0f64, 0f64, 0f64);
         // ── 链上**逐位**接受率（回答用户提的"长度可能也不一样"）──
-        // reached[j] = 有多少轮**走到了第 j 位**（第 0..j-1 位全接受）
-        // hit1[j] = 其中第 j 位 top-1 命中 ⇒ 条件接受率 = hit1[j]/reached[j]
-        // hitn[j][..] = 其中真值落在该位草稿 **top-N** 里（N=1,2,3,5,8,10,20）
+        //   reached[j] = 有多少轮**走到了第 j 位**（第 0..j-1 位全接受）
+        //   hit1[j]    = 其中第 j 位 top-1 命中 ⇒ 条件接受率 = hit1[j]/reached[j]
+        //   hitn[j][..] = 其中真值落在该位草稿 **top-N** 里（N=1,2,3,5,8,10,20）
         // ⚠️ 条件接受率**天然随 j 递减**（越深越难），所以必须报"分母 = reached"，
-        // 否则第 3 位之后的数字会被分母缩水而看着像"突然崩掉"。
+        //    否则第 3 位之后的数字会被分母缩水而看着像"突然崩掉"。
         const NS_SPEC: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
         let mut reached = vec![0usize; kd];
         let mut hit1 = vec![0usize; kd];
@@ -923,20 +926,20 @@ pub fn accept(args: &[String]) -> Result<()> {
         let mut pb_hit = [0usize; 4];
         let mut pb_n0 = [0usize; 4];
         let mut pb_hit0 = [0usize; 4];
-        // ── ★ 后缀查表草稿（同类开源参考实现的能力，那边默认开）──
+        // ── ★ 后缀查表草稿（Strata `--suffix-draft`，他那边默认开）──
         // 见 `lingxi_model::suffix` 的模块说明与 `probes.rs` 的登记项。
         // `sd_cursor`：历史里已经喂进查表器的位置游标（`seq.ids` 是单调前推的）。
         // ⚠️ **默认 0 = 关**（这是本轮的实测教训，别急着开）：
-        // 查表本身是对的（`LINGXI_SUFFIX_TRACE=1` 实测提议 `[369,11751,13]` vs 真值同、
-        // `[369,44299,13,561,6511,314]` vs 真值同 ⇒ 3/3、3/4、6/6 命中），
-        // 但**接受是前缀式的**：把 lookup 草稿挂在 MTP 链后面，只有整条 MTP 链先被接受
-        // 才轮得到它 ⇒ 实测"提议 7 枚、接受 0 枚"，而且白付了行钱（47.4 → 44.3 tok/s）。
-        // 参考实现用的是 `DraftPolicy`（`spec/draft_policy.hpp`）的**两种策略**，我们都还没做：
-        // ① `choose(t_mtp, lookup_k, match)`：匹配够长时 **用 lookup 顶掉整个 MTP 窗**
-        // （省掉草稿链的时间，且第一枚就高置信）；
-        // ② `chain(t_mtp, p_mtp, k_avail, match)`：**只在 `p_mtp`（整条 MTP 链都成立的概率）
-        // 够高时**才追加，且要用"按匹配长度分桶的历史命中率 c"算期望收益 > 成本才追加。
-        // ⇒ 下一步：实现 ①（`--suffix-draft` 的本命用法）。
+        //   查表本身是对的（`LINGXI_SUFFIX_TRACE=1` 实测提议 `[369,11751,13]` vs 真值同、
+        //   `[369,44299,13,561,6511,314]` vs 真值同 ⇒ 3/3、3/4、6/6 命中），
+        //   但**接受是前缀式的**：把 lookup 草稿挂在 MTP 链后面，只有整条 MTP 链先被接受
+        //   才轮得到它 ⇒ 实测"提议 7 枚、接受 0 枚"，而且白付了行钱（47.4 → 44.3 tok/s）。
+        //   参考实现用的是 `DraftPolicy`（`spec/draft_policy.hpp`）的**两种策略**，我们都还没做：
+        //     ① `choose(t_mtp, lookup_k, match)`：匹配够长时 **用 lookup 顶掉整个 MTP 窗**
+        //        （省掉草稿链的时间，且第一枚就高置信）；
+        //     ② `chain(t_mtp, p_mtp, k_avail, match)`：**只在 `p_mtp`（整条 MTP 链都成立的概率）
+        //        够高时**才追加，且要用"按匹配长度分桶的历史命中率 c"算期望收益 > 成本才追加。
+        //   ⇒ 下一步：实现 ①（`--suffix-draft` 的本命用法），见 PLAN.md §P9.5c。
         let sd_min: usize = std::env::var("LINGXI_SUFFIX_DRAFT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -968,7 +971,7 @@ pub fn accept(args: &[String]) -> Result<()> {
             };
             // ① 草稿链
             // `LINGXI_KTS=1`：**前一个 sync 吃掉"上一段遗留的等待"，尾部 sync 量出本段真 GPU 时间**。
-            // 默认（不叠 KTS）这里只是 CPU 入队时间 —— 段与段会互相借时间。
+            // 默认（不叠 KTS）这里只是 CPU 入队时间 —— 段与段会互相借时间（PLAN §0 测量纪律）。
             let kts_spec = lingxi_model::flag("LINGXI_KTS");
             if kts_spec {
                 k.stream.synchronize()?;
@@ -982,16 +985,16 @@ pub fn accept(args: &[String]) -> Result<()> {
             // ── 【归因诊断】`LINGXI_MTP_CHAIN_DIAG=noh|nokv|…`（数学作废，只为定位）──
             // 链上第 0 位 0.97（≈单步 0.95）但**第 1 位塌到 0.57**，且 top-20 也只 0.89
             // ⇒ 是"自喂那步的状态偏了"。两个嫌疑：
-            // `noh`：自喂的 h（MTP 层的输出）本身不该这么用 ⇒ 每步都沿用第 0 步的 h
-            // `nokv`：第 0 步 append 的那个 KV cell 污染了第 1 步的注意力
-            // ⇒ 每步先把 MTP 的 QSA 回卷到轮前（只留 pre-round 上下文）
+            //   `noh` ：自喂的 h（MTP 层的输出）本身不该这么用 ⇒ 每步都沿用第 0 步的 h
+            //   `nokv`：第 0 步 append 的那个 KV cell 污染了第 1 步的注意力
+            //           ⇒ 每步先把 MTP 的 QSA 回卷到轮前（只留 pre-round 上下文）
             // 若 `noh` 把第 1 位救回 ~0.95 ⇒ 是 h；若 `nokv` 救回 ⇒ 是 KV；都不动 ⇒ 另找。
             let diag = std::env::var("LINGXI_MTP_CHAIN_DIAG").unwrap_or_default();
             let diag_noh = diag.contains("noh");
             let diag_nokv = diag.contains("nokv");
-            // `LINGXI_SPEC_MIN_P`：草稿自己的 top-1 概率低于阈值就**停链**（同类开源参考实现
+            // `LINGXI_SPEC_MIN_P`：草稿自己的 top-1 概率低于阈值就**停链**（参考实现 Strata
             // `generate.cpp:9172` 的 `--spec-min-p`）。实测依据（prob1 vs 实际接受）：
-            // ≥0.90 → 0.988 ｜ 0.70~0.90 → 0.750 ｜ 0.50~0.70 → 0.250 ｜ <0.50 → 0.278
+            //   ≥0.90 → 0.988 ｜ 0.70~0.90 → 0.750 ｜ 0.50~0.70 → 0.250 ｜ <0.50 → 0.278
             // ⇒ 深位的低概率草稿几乎不被接受，砍掉它们**不丢接受数、但省下来的是"行"**。
             let min_p: f32 = std::env::var("LINGXI_SPEC_MIN_P")
                 .ok()
@@ -1013,13 +1016,13 @@ pub fn accept(args: &[String]) -> Result<()> {
             let mut h_in = lingxi_model::scratch::bf16(&k, dim)?;
             k.stream.memcpy_dtod(&h_last, &mut h_in)?;
             // ★ `DraftPolicy::choose`（参考实现 `spec/draft_policy.hpp` 的第一条策略）：
-            // **匹配够长时用 lookup 顶掉整个 MTP 窗**。
-            // 为什么必须有它：查表草稿挂在 MTP 链**后面**是没用的——接受是前缀式的，
-            // 只有整条 MTP 链先被接受才轮得到它（实测"提议 7 枚、接受 0 枚"）。
-            // 当上下文里有长重复时（改代码/引号原文/工具 JSON/枚举），
-            // **lookup 的第 0 枚置信度远高于 MTP 的自喂链**，此时应该整窗换成 lookup，
-            // 还顺带省掉草稿链的时间。
-            // 不设 `LINGXI_SUFFIX_CHOOSE` ⇒ 行为完全不变。
+            //   **匹配够长时用 lookup 顶掉整个 MTP 窗**。
+            //   为什么必须有它：查表草稿挂在 MTP 链**后面**是没用的——接受是前缀式的，
+            //   只有整条 MTP 链先被接受才轮得到它（实测"提议 7 枚、接受 0 枚"）。
+            //   当上下文里有长重复时（改代码/引号原文/工具 JSON/枚举），
+            //   **lookup 的第 0 枚置信度远高于 MTP 的自喂链**，此时应该整窗换成 lookup，
+            //   还顺带省掉草稿链的时间。
+            //   不设 `LINGXI_SUFFIX_CHOOSE` ⇒ 行为完全不变。
             let sd_choose: usize = std::env::var("LINGXI_SUFFIX_CHOOSE")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -1058,7 +1061,7 @@ pub fn accept(args: &[String]) -> Result<()> {
                 // 概率闸门：这一步的草稿自己就不确定 ⇒ 再往下链没意义（省"行"）
                 if min_p > 0.0 && probs_chain.last().copied().unwrap_or(1.0) < min_p {
                     // ⚠️ 必须把 `o` 挂到 `h_in` 上再 break：`h_in` 在上面已经被
-                    // `put_bf16` 移走了，直接 break 会让循环后的 `put_bf16(h_in)` 报 E0382
+                    //    `put_bf16` 移走了，直接 break 会让循环后的 `put_bf16(h_in)` 报 E0382
                     h_in = o;
                     break;
                 }
@@ -1091,10 +1094,10 @@ pub fn accept(args: &[String]) -> Result<()> {
             lingxi_model::scratch::put_bf16(h_step0);
             lingxi_model::scratch::put_bf16(h_in);
             // ★ 后缀查表草稿：把 MTP 被闸门砍掉的空位用"上下文里原样出现过的续写"补上。
-            // 语义与同类开源参考实现的 `--lookup-chain` 一致：查询 = 「历史后缀 + 已产出的草稿」，
+            // 语义与 Strata 的 `--lookup-chain` 一致：查询 = 「历史后缀 + 已产出的草稿」，
             // 命中就从"那个更早的位置之后"取 token。**只改提哪些草稿**，被采纳与否仍由主干验证决定。
             // ⚠️ `chose` 时**不能**把 lookup 草稿记成 MTP 产的（否则 `sd_acc` 恒 0，
-            // 上一版就是这么把自己的成绩单写错的）
+            //    上一版就是这么把自己的成绩单写错的）
             if !chose {
                 mtp_len = drafts.len();
             }
@@ -1145,11 +1148,11 @@ pub fn accept(args: &[String]) -> Result<()> {
             }
             let keep = acc + 1; // 含 chunk[0]（pending 本身，必然保留）
             // ★ `LINGXI_SPEC_TRACE_ARGMAX=1`：逐轮把「主干各行的 argmax + 草稿 + acc/keep」打出来。
-            // 为什么要它（2026-10-16）：**提交的 token 只可能是 `argmax[acc]`**，而 `acc` 由
-            // 「drafts 是否等于 argmax」决定 ⇒ **只要 `argmax` 本身不变，草稿再怎么变，
-            // 提交的 token 流都必须一样**（同一前缀下贪心是唯一的）。
-            // 所以两条配置的 token 流一旦分叉，**必然**是某一轮的 `argmax` 变了 ——
-            // 这条轨迹就是用来把"哪一轮"钉死的（drafts 的差异只是噪声，不是原因）。
+            //   为什么要它（2026-10-16）：**提交的 token 只可能是 `argmax[acc]`**，而 `acc` 由
+            //   「drafts 是否等于 argmax」决定 ⇒ **只要 `argmax` 本身不变，草稿再怎么变，
+            //   提交的 token 流都必须一样**（同一前缀下贪心是唯一的）。
+            //   所以两条配置的 token 流一旦分叉，**必然**是某一轮的 `argmax` 变了 ——
+            //   这条轨迹就是用来把"哪一轮"钉死的（drafts 的差异只是噪声，不是原因）。
             if lingxi_model::flag("LINGXI_SPEC_TRACE_ARGMAX") {
                 eprintln!(
                     "    [argmax] 轮 {n_round:3} mlen0={mlen0} t={} acc={acc} keep={keep} argmax={:?} drafts={:?}",
@@ -1168,8 +1171,8 @@ pub fn accept(args: &[String]) -> Result<()> {
                 }
             }
             // 逐位记账（只记"走到了"的位；见上面 reached 的注释）
-            // ⚠️ 上界必须取 `drafts.len`：开了 `LINGXI_SPEC_MIN_P` 后链会被截短，
-            // 而 `acc` 可以等于 `drafts.len` ⇒ 用 `0..kd` 会在 `drafts[j]` 越界 panic。
+            // ⚠️ 上界必须取 `drafts.len()`：开了 `LINGXI_SPEC_MIN_P` 后链会被截短，
+            //    而 `acc` 可以等于 `drafts.len()` ⇒ 用 `0..kd` 会在 `drafts[j]` 越界 panic。
             for j in 0..kd.min(drafts.len()) {
                 if j > acc {
                     break;
@@ -1202,11 +1205,11 @@ pub fn accept(args: &[String]) -> Result<()> {
             // 实测已排除两个假设：`noh`（不更新自喂 h）让第 1 位**更差**（0.57→0.35）、
             // `nokv`（回卷 MTP KV）只值 +0.06 且 top-20 不变 ⇒ 都不是元凶。
             // 剩下唯一要问的：**自喂的那个 h（MTP 层输出 `o`）到底等不等价于"主干在该位置的 h"？**
-            // oracle 链 = 把 h 换成**主干真值**（滞后一格：j=0 用 h_last，j≥1 用 hyper_rows[j-1]），
-            // 且 tok 也换成真值 chunk[j]。
-            // 判据：oracle 第 1 位回到 ~0.95 而自喂只有 0.57 ⇒ **h 的"身份"错了**
-            // （我们的自喂量不是 MTP 训练时期望的那个）；若 oracle 也 ~0.6 ⇒ 草稿头本身
-            // 只能预测 1 步，2 步是能力上限（那就不用修接线，只能上多候选）。
+            //   oracle 链 = 把 h 换成**主干真值**（滞后一格：j=0 用 h_last，j≥1 用 hyper_rows[j-1]），
+            //               且 tok 也换成真值 chunk[j]。
+            //   判据：oracle 第 1 位回到 ~0.95 而自喂只有 0.57 ⇒ **h 的"身份"错了**
+            //        （我们的自喂量不是 MTP 训练时期望的那个）；若 oracle 也 ~0.6 ⇒ 草稿头本身
+            //        只能预测 1 步，2 步是能力上限（那就不用修接线，只能上多候选）。
             if diag.contains("oracle") {
                 let mut o_hit = vec![0usize; kd];
                 let mut o_runs = 0usize;
@@ -1297,8 +1300,8 @@ pub fn accept(args: &[String]) -> Result<()> {
             t_commit += tc.elapsed().as_secs_f64() * 1e3;
             let td = std::time::Instant::now();
             // ④' MTP：回卷到批前 cell 数，再用（主干 h, 该位置token）推进 keep 个 cell
-            // cell 语义 = `(h_j, tok_{j+1})`；最后一个 cell 的 `tok_{keep}` 就是
-            // **奖励 token**（提交后 ids 末尾那个），不在 chunk 里。
+            //      cell 语义 = `(h_j, tok_{j+1})`；最后一个 cell 的 `tok_{keep}` 就是
+            //      **奖励 token**（提交后 ids 末尾那个），不在 chunk 里。
             if let lingxi_model::layer::AttnState::Qsa(q) = &mut mst.attn {
                 q.rewind(mlen0);
             }
@@ -1307,9 +1310,9 @@ pub fn accept(args: &[String]) -> Result<()> {
             // 逐行重放 = `keep` 次 t=1 的 MTP 前向 ⇒ MTP 那一层的权重被读 `keep` 遍。
             // 批成一次 `t=keep` 的前向：权重只读一遍，行边际只剩专家读。
             // **为什么与逐行等价**：MTP 的注意力是因果的、状态已 `rewind(mlen0)`，
-            // 一次喂 `keep` 行与逐行喂的每行输出逐位同源；
+            //   一次喂 `keep` 行与逐行喂的每行输出逐位同源；
             // 而**对外输出不受影响**：草稿只影响"哪些行被验"，被采纳的 token 始终是
-            // 主干自己的贪心 argmax（主干路径与重放无关）。
+            //   主干自己的贪心 argmax（主干路径与重放无关）。
             if lingxi_model::flag("LINGXI_MTP_REPLAY_1BY1") {
             for j in 0..keep {
                 let mut h1 = lingxi_model::scratch::bf16(&k, dim)?;
@@ -1422,8 +1425,8 @@ pub fn accept(args: &[String]) -> Result<()> {
         eprintln!("  [mtp-spec] 判据：去掉首 token 后应等于固定贪心序列 [13, 561, 6511, 314, 9564, 369, 19241, 13]");
         // ── 链上逐位接受率 × top-N（本轮新增）──
         // 为什么必须这么报：整体"平均接受 2.57/6"会掩盖两件事 ——
-        // ① **第 1 位就低**（草稿头本身弱） vs **只有深位低**（自喂误差累积）；
-        // ② top-1 低但 top-N 高（= 多候选/树草稿有收益）。
+        //   ① **第 1 位就低**（草稿头本身弱） vs **只有深位低**（自喂误差累积）；
+        //   ② top-1 低但 top-N 高（= 多候选/树草稿有收益）。
         eprintln!("  [mtp-spec] 链上**逐位**命中（分母 = 走到该位的轮数，所以是**条件**接受率）：");
         eprintln!(
             "     位 | 走到 | top1 | {}",
@@ -1519,11 +1522,11 @@ pub fn accept(args: &[String]) -> Result<()> {
     if std::env::var("LINGXI_SPEC_CHECK").is_ok() {
         // 把"快照+重放"拆成两半分别判，且用**模型自己的贪心 token**当 chunk（同分布，
         // 避免合成 token 把状态推到退化区）。期望值都是确定的：
-        // p0 = 自然贪心链 ⇒ [t0, t1, t2, ...]
-        // chunk(喂 t0..t5)
-        // a2 = 喂完不 commit ⇒ 应等于 p0[6..] （因果性）
-        // b2 = 喂完 commit(6) ⇒ 应等于 a2 （重放等价）
-        // b0 = 喂完 commit(0)（全拒）⇒ 应等于 p0 （快照/恢复完整）
+        //   p0 = 自然贪心链            ⇒ [t0, t1, t2, ...]
+        //   chunk(喂 t0..t5)
+        //   a2 = 喂完不 commit          ⇒ 应等于 p0[6..]      （因果性）
+        //   b2 = 喂完 commit(6)         ⇒ 应等于 a2           （重放等价）
+        //   b0 = 喂完 commit(0)（全拒）⇒ 应等于 p0            （快照/恢复完整）
         let t = 6usize;
         let prompt_ids = prompt_ids.clone();
         let run = |eng: &lingxi_driver::Engine,
@@ -1579,7 +1582,7 @@ pub fn accept(args: &[String]) -> Result<()> {
         let mut sb = seq.spec_prepare(&eng, provider, t)?;
         // ── A/B（同进程、同状态、同 env）：顺序 tok/s vs 投机 tok/s ──
         // 1) 先顺序解码 N 个 token = 顺序基线，同时拿到**自然 token 链**
-        // （用自然链当草稿 = 模拟 100% 接受；MTP 的草稿成本 ~1 层 ≈ 1~2 ms/轮，可忽略）
+        //    （用自然链当草稿 = 模拟 100% 接受；MTP 的草稿成本 ~1 层 ≈ 1~2 ms/轮，可忽略）
         let n_seq: usize = std::env::var("LINGXI_SPEC_N")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1638,17 +1641,17 @@ pub fn accept(args: &[String]) -> Result<()> {
     let mut hits = 0usize;
     let mut total = 0usize;
     // **单步 top-N 命中**（这一路是最好的样本：n_new 步、每步一个"真值 vs 草稿 top-N"）
-    // 判据：主干这一步真实吐的 `tok_next`，是否落在**上一步草稿**的 top-N 里。
-    // 为什么要它：`hits/total` 只是 top-1；若 top-8/top-20 明显更高，
-    // 说明草稿**分布是对的**（可以做多候选/树草稿），只是 argmax 差一两位。
+    //   判据：主干这一步真实吐的 `tok_next`，是否落在**上一步草稿**的 top-N 里。
+    //   为什么要它：`hits/total` 只是 top-1；若 top-8/top-20 明显更高，
+    //   说明草稿**分布是对的**（可以做多候选/树草稿），只是 argmax 差一两位。
     const NS_ACC: [usize; 7] = [1, 2, 3, 5, 8, 10, 20];
     let mut acc_hitn = [0usize; 7];
     let mut acc_last_top: Vec<u32> = Vec::new(); // 上一步草稿的 top-N
     let mut acc_rows = 0usize;
     let mut acc_reach = 0usize; // 有草稿可比的总步数
     // 对齐假设：MTP 的 token 分支喂**哪个** token？
-    // `next`（默认）：喂主干**刚预测出**的 token（predict 它后面那个）
-    // `last`：喂主干**刚吃进**的 token
+    //  `next`（默认）：喂主干**刚预测出**的 token（predict 它后面那个）
+    //  `last`：喂主干**刚吃进**的 token
     // 两个都试，一次跑清 —— 输入语义是 0/64 的最大嫌疑。
     let align_last = std::env::var("LINGXI_MTP_ALIGN").map(|v| v == "last").unwrap_or(false);
     let mut prev_tok: i64 = trunk_next; // 第一个 decode 步吃进去的就是它
@@ -1719,7 +1722,7 @@ pub fn accept(args: &[String]) -> Result<()> {
 pub fn dump(args: &[String]) -> Result<()> {
     // **白盒对拍用**：把 MTP stem 的输入 / 权重 / 输出全部落成 f32 —— 交给
     // `tools/golden/mtp_stem_oracle.py` 在 numpy 里复算，**逐步**比中间量。
-    // 黑盒已经试不出东西了（记着全部被否的假设），必须白盒。
+    // 黑盒已经试不出东西了（§3.52 记着全部被否的假设），必须白盒。
     // 用法: lingxi-bench mtp-dump <mtp.ninfer> <outdir>
     let path = args.get(2).context("用法: lingxi-bench mtp-dump <mtp.ninfer> <outdir>")?;
     let outdir = args.get(3).context("缺 outdir")?;

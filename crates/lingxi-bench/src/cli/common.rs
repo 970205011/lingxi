@@ -89,21 +89,22 @@ pub fn load_endpoints(
 
 /// MTP 草稿产物路径（投机链路）。
 ///
-/// 顺序：`LINGXI_MTP_ARTIFACT` 显式 → 常见部署口径 `/models/...` → 当前目录 `./...`。
-/// 为什么要两个口径：不同机器的挂载点叫法不一（容器 `/models` 常是宿主数据盘的 bind）；
-/// 写死一个会在换机器/重启后直接报"打开产物失败"。两个都不在时回 `/models` 口径（报错一致）。
+/// 顺序：`LINGXI_MTP_ARTIFACT` 显式 → 宿主口径 `/data/models/...` → 容器口径 `/models/...`。
+/// 为什么要两个口径：容器的 `/models` 就是宿主的 `/data/models`（同一块盘 bind 进来），
+/// **两种叫法在不同机器上各出现过**；写死一个会在换机器/重启后直接报"打开产物失败"。
+/// 两个都不在时仍回宿主口径（报错信息与历史一致）。
 pub fn mtp_artifact_path() -> String {
+    const HOST: &str = "/data/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer";
     const CT: &str = "/models/lingxi-assets/qwen4_exp.mtp.fixed.ninfer";
-    const LOCAL: &str = "./qwen4_exp.mtp.fixed.ninfer";
     if let Ok(p) = std::env::var("LINGXI_MTP_ARTIFACT") {
         return p;
     }
-    for p in [CT, LOCAL] {
+    for p in [HOST, CT] {
         if std::path::Path::new(p).exists() {
             return p.to_string();
         }
     }
-    CT.to_string()
+    HOST.to_string()
 }
 
 /// 生成 RoPE 表并上传（device bf16 + host f32 各一份），`len` 需覆盖 prefill+decode。
@@ -191,6 +192,14 @@ pub fn build_layer(
     let hc = u("hc");
     let eps = meta["eps"].as_f64().unwrap() as f32;
     let p = format!("text/layers/{layer}/");
+    // 共享专家 W4 档（LINGXI_SHARED_Q4=1，2026-10-29）：dense 每 token 参与、误差无
+    // 稀疏平均机会 ⇒ 量化必须走 GPTQ 校准（tools/arena-gen/gptq_shared.py 灌
+    // LINGXI_Q4_CACHE），RTN 质量风险不接受。bf16 字段退化为占位（与 W4 注意力同构）。
+    // 独立加载器：不绑 DENSE_Q4（那是注意力/GDN 投影的开关）。
+    let shared_q4 = lingxi_model::flag_val("LINGXI_SHARED_Q4", false);
+    let q4shared = |name: &str| -> Result<lingxi_model::q4::Q4W> {
+        Ok(lingxi_model::gpu::upload_q4_named(k, art, name)?)
+    };
     // dense 权重：有 host cache 走常驻缓存（未命中同步填、后台预读提前一层），
     // 无 cache（对拍命令）走原始产物直读。
     let up = |n: &str| -> Result<_> {
@@ -227,8 +236,26 @@ pub fn build_layer(
             Some(up("moe/routed_gate_up")?)
         },
         routed_down: if sparse { None } else { Some(up("moe/routed_down")?) },
-        shared_gate_up: up("moe/shared_gate_up")?,
-        shared_down: up("moe/shared_down")?,
+        shared_gate_up: if shared_q4 {
+            unsafe { k.stream.alloc::<half::bf16>(1) }?
+        } else {
+            up("moe/shared_gate_up")?
+        },
+        shared_down: if shared_q4 {
+            unsafe { k.stream.alloc::<half::bf16>(1) }?
+        } else {
+            up("moe/shared_down")?
+        },
+        shared_gate_up_q4: if shared_q4 {
+            Some(q4shared(&format!("{p}moe/shared_gate_up"))?)
+        } else {
+            None
+        },
+        shared_down_q4: if shared_q4 {
+            Some(q4shared(&format!("{p}moe/shared_down"))?)
+        } else {
+            None
+        },
     };
 
     // `LINGXI_DENSE_Q4=1`：把最大的几块稠密矩阵在线量化成 W4G64（decode 走融合反量化 GEMV）。
@@ -322,10 +349,10 @@ pub fn build_layer(
             conv_kernel: u("ple_conv_kernel_size"),
             eps,
             // PLE 表路径（**不写死，四级解析，兜底响亮警告不静默**）：
-            // 1. `LINGXI_PLE_TABLE` 显式指定（最高优先）；
-            // 2. /dev/shm 官方 IQ4_NL 表（26.8GB，量化器 quantize_ple_iq4nl.py 产出）；
-            // 3. /dev/shm 官方 FP8 表（51.2GB，extract_ple_fp8.py 产出）；
-            // 4. 兜底 lingxi-assets bf16（102GB 机械盘）——**打响亮横幅**（慢 5×，不许静默）。
+            //   1. `LINGXI_PLE_TABLE` 显式指定（最高优先）；
+            //   2. /dev/shm 官方 IQ4_NL 表（26.8GB，量化器 quantize_ple_iq4nl.py 产出）；
+            //   3. /dev/shm 官方 FP8 表（51.2GB，extract_ple_fp8.py 产出）；
+            //   4. 兜底 lingxi-assets bf16（102GB 机械盘）——**打响亮横幅**（慢 5×，不许静默）。
             // 格式自动识别：`.iq4nl` sidecar ⇒ IQ4_NL；`.scale` sidecar ⇒ FP8；否则 bf16。
             table_path: std::env::var("LINGXI_PLE_TABLE").unwrap_or_else(|_| {
                 // 优先级：shm iq4nl（26.8G）> shm fp8（51.2G）> 磁盘 bf16 兜底（102G，慢！）
@@ -351,7 +378,7 @@ pub fn build_layer(
                      ║     （或 quantize_ple_iq4nl.py），或显式 LINGXI_PLE_TABLE=...     ║\n\
                      ╚══════════════════════════════════════════════════════════════════╝"
                 );
-                "/models/lingxi-assets/qwen4_exp.ple-table.bin".to_string()
+                "/data/models/lingxi-assets/qwen4_exp.ple-table.bin".to_string()
             }),
         };
         let derived = lingxi_model::plet::PleDerived::new(&cfg, 0);
@@ -503,7 +530,7 @@ impl<'a> lingxi_driver::LayerProvider for StreamingProvider<'a> {
 }
 
 /// 只读 peek 供给（**多会话并发**共用一份已预热的 DeviceLayerCache）：
-/// `layer` 退化为 `peek`，要求全部层已预热（契约见 `DeviceLayerCache` 的 `unsafe impl Sync`）。
+/// `layer()` 退化为 `peek`，要求全部层已预热（契约见 `DeviceLayerCache` 的 `unsafe impl Sync`）。
 pub struct PeekProvider<'a> {
     pub cache: &'a dyn lingxi_driver::LayerCache,
 }
@@ -538,8 +565,8 @@ impl<'a> lingxi_driver::LayerProvider for DeviceLayerCache<'a> {
     }
 }
 
-/// SAFETY：**只允许在全部层预热之后、且不再调用 `layer` 的前提下跨线程读**。
-/// `build` 只在 `&mut self` 的 `layer` 里访问；`peek` 只读 `slots`。
+/// SAFETY：**只允许在全部层预热之后、且不再调用 `layer()` 的前提下跨线程读**。
+/// `build` 只在 `&mut self` 的 `layer()` 里访问；`peek` 只读 `slots`。
 unsafe impl<'a> Sync for DeviceLayerCache<'a> {}
 
 impl<'a> lingxi_driver::LayerCache for DeviceLayerCache<'a> {
