@@ -108,7 +108,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let tables = crate::cli::common::load_rope_tables(&k, rope_len, shape.attn.rot_dim)?;
 
     let n_layers = lingxi_model::DIMS.n_layers as u32;
-    // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`）。
+    // ★★ **全量 layer-split**（`LINGXI_LAYER_SPLIT=<lo>`，PLAN §P15 里程碑 A）。
     //    这套接线必须建在 `Sequence` **之前**：`[lo, n_layers)` 的跨 token 状态
     //    （QSA KV/indexer、GDN 的 S+卷积史、PLE 史）要**直接建在 GPU1 上**，
     //    建错卡不报错、只会在第一次 kernel 时 ILLEGAL_ADDRESS 或静默写串。
@@ -122,7 +122,7 @@ pub fn run(args: &[String]) -> Result<()> {
         std::env::set_var("LINGXI_NO_GRAPHS", "1");
         lingxi_model::graph::force_disable();
     }
-    // ★ 双卡默认自动 split（同 mtp-accept 分支的口径）。EP 模式下必须关掉。
+    // ★ P15-㉜：双卡默认自动 split（同 mtp-accept 分支的口径）。EP 模式下必须关掉。
     let ls_env: Option<u32> = if ep_on {
         Some(0)
     } else {
@@ -134,12 +134,12 @@ pub fn run(args: &[String]) -> Result<()> {
         && ls_arena_path.is_some();
     let ls_lo: u32 = ls_env.unwrap_or(if auto_split { 24 } else { 0 });
     let ls_on = !ep_on && ls_lo > 0 && ls_lo < n_layers;
-    // ★ 路线 A two-pass（值感知）：token 区间切半的双卡并行 prefill。
+    // ★ §AQ 路线 A two-pass（值感知）：token 区间切半的双卡并行 prefill。
     //    需要双卡全层镜像（权重镜像缓存在 provider 建立后构建，见下）+ 双卡专家源全域服务。
     let twopass_on = lingxi_model::flag_val("LINGXI_PREFILL_TWOPASS", false);
     if ls_on {
         if auto_split {
-            // 单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
+            // ㊸：单层本地图在 split 下保持开启（专家段 3 核固定槽、层⇄设备一一对应、
             // 跨卡拷贝在层循环外不进图）。判据翻车则恢复 force_disable()。
             eprintln!(
                 "[layer-split] 检测到双卡：自动启用整层切分 lo={ls_lo}（真实语料 +161%；\
@@ -148,12 +148,12 @@ pub fn run(args: &[String]) -> Result<()> {
         } else {
             if !lingxi_model::flag("LINGXI_NO_GRAPHS") {
                 eprintln!(
-                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS；单层本地图 split 下可用，\
+                    "[layer-split] 警告：未设 LINGXI_NO_GRAPHS；㊸ 起单层本地图 split 下可用，\
                      数值异常先设它对拍。"
                 );
             }
         }
-        // ★ 池已 device-aware，不再需要禁池（见 mtp-accept 分支同款注释）。
+        // ★ P15-㉞：池已 device-aware，不再需要禁池（见 mtp-accept 分支同款注释）。
     }
     let ls_k1: Option<lingxi_kernels::Kernels> =
         if ls_on || ep_on { Some(lingxi_kernels::Kernels::load(1)?) } else { None };
@@ -161,7 +161,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(kk) => Some(crate::cli::common::load_rope_tables(kk, rope_len, shape.attn.rot_dim)?),
         None => None,
     };
-    // 未显式给槽数时走显存预算自动分配（env 显式值优先）。
+    // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
     // ★ EP：两卡各装**全部** 48 层稠密权重，显存比 layer-split 更紧 ⇒ 每卡槽数默认
     //   8000（`LINGXI_EP_SLOTS` 可覆盖），不走 autotune（那是按半场层数算的）。
     let ep_slots: usize = std::env::var("LINGXI_EP_SLOTS")
@@ -186,7 +186,7 @@ pub fn run(args: &[String]) -> Result<()> {
             None => 9600,
         },
     };
-    // two-pass：双卡镜像权重（~3.8GB/卡）+ 远程 MoE 表 + 影子状态共吃 ~4.5GB/卡，
+    // §AQ two-pass：双卡镜像权重（~3.8GB/卡）+ 远程 MoE 表 + 影子状态共吃 ~4.5GB/卡，
     // 20.8K 长 prompt 实测把 GPU1 顶到 32.5GB OOM。无显式覆盖时把槽位压到 9500
     // （= 396/层 > 每层工作集 ~300 ⇒ PRELOAD_ALL 下命中率不变；数值不受影响：同权重字节）。
     if twopass_on && std::env::var("LINGXI_LAYER_SPLIT_SLOTS").is_err() {
@@ -194,7 +194,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         base
     }
-    };  // ★工作集≥槽位判决(375/卡层)
+    };  // ★㊲ 工作集≥槽位判决(375/卡层)
     let ls_experts: Option<Box<dyn lingxi_model::moe::ExpertSource + '_>> =
         match (ls_k1.as_ref(), ls_arena_path.as_deref()) {
             (Some(kk), Some(ap)) => {
@@ -274,7 +274,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let inter = meta["inter"].as_u64().unwrap() as usize;
         let hidden = meta["hidden"].as_u64().unwrap() as usize;
         if let Ok(ap) = std::env::var("LINGXI_EXPERT_ARENA") {
-            // 未显式给槽数时走显存预算自动分配（env 显式值优先）。
+            // ㊿-P0：未显式给槽数时走显存预算自动分配（env 显式值优先）。
             let slots: usize = if ep_on {
                 ep_slots
             } else {
@@ -290,7 +290,7 @@ pub fn run(args: &[String]) -> Result<()> {
                         None => 4000,
                     },
                 };
-                // two-pass：同 GPU1 的槽位压缩理由（镜像 + 远程 MoE 表的显存余量）。
+                // §AQ two-pass：同 GPU1 的槽位压缩理由（镜像 + 远程 MoE 表的显存余量）。
                 if twopass_on && std::env::var("LINGXI_ARENA_SLOTS").is_err() {
                     base.min(9500)
                 } else {
@@ -304,7 +304,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 false,
                 // ★ 全量 layer-split：GPU0 这份只服务 `0..ls_lo`（后一半层的槽位
                 //   全部留给 GPU1 那份，否则一半的槽白占）。
-                // ★ two-pass 也保持这个口径：两个 pass 各自跑全 48 层时，落在
+                // ★ §AQ two-pass 也保持这个口径：两个 pass 各自跑全 48 层时，落在
                 //   非本命半场的层 MoE 走 RemoteMoe 远程回**专家的本命卡**执行
                 //   （槽容量/直方图钉表与 OFF 完全一致，跨卡只过激活，逐位不变）。
                 if ls_on { 0..ls_lo } else { 0..u32::MAX },
@@ -312,7 +312,7 @@ pub fn run(args: &[String]) -> Result<()> {
         } else {
             // ⚠️ **不允许静默回退**：这条 host LRU ↔ device LRU 的路实测
             // decode **488~714 ms/token**（比 arena 慢 15~20 倍），而且以前毫无提示。
-            // 历史上"忘了设 LINGXI_EXPERT_ARENA"就掉进来，被误判成代码回归）。
+            // 历史上"忘了设 LINGXI_EXPERT_ARENA"就掉进来，被误判成代码回归（§3.45）。
             // 要用它必须显式开 `LINGXI_ALLOW_MMAP_FALLBACK=1`。
             if std::env::var("LINGXI_ALLOW_MMAP_FALLBACK").is_err() {
                 anyhow::bail!(
@@ -406,7 +406,7 @@ pub fn run(args: &[String]) -> Result<()> {
              ╚══════════════════════════════════════════════════════════════════════╝"
         );
     }
-    // ★ two-pass：双卡全层权重镜像缓存——
+    // ★ §AQ two-pass：双卡全层权重镜像缓存——
     //   pass1 在 GPU0 跑全部 48 层（主缓存的 [lo, n) 部分建在 GPU1 上，镜像一份到 GPU0），
     //   pass2 在 GPU1 跑全部 48 层（主缓存的 [0, lo) 部分建在 GPU0 上，镜像一份到 GPU1）。
     //   Q4 权重走内容寻址缓存（LINGXI_Q4_CACHE）⇒ 第二次构建基本是 H2D，字节与主缓存逐位相同。
@@ -574,7 +574,7 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     // `LINGXI_TALK_SPEC=1`：把 serve 的 MTP 投机环路接到 talk 上，让权威尺子
-    // （talk/bench.sh）直接量到投机吞吐（speedup-audit）。默认关 = 纯自回归不变。
+    // （talk/bench.sh）直接量到投机吞吐（speedup-audit §6 #7）。默认关 = 纯自回归不变。
     let talk_spec = std::env::var("LINGXI_TALK_SPEC").map(|v| v == "1").unwrap_or(false);
     let (first, hyper_first) = if talk_spec {
         // 投机要整段 prompt 的 hyper 行（MTP prime 用），走 prefill_with_hyper。
@@ -585,7 +585,7 @@ pub fn run(args: &[String]) -> Result<()> {
     };
     eprintln!("\nprefill 用时 {:.1}s，首 token = {first}", t0.elapsed().as_secs_f64());
 
-    // ══ 双会话相位重叠判决原型（`LINGXI_TALK_SPEC_BATCH=1`）══
+    // ══ 双会话相位重叠判决原型（`LINGXI_TALK_SPEC_BATCH=1`，docs §四十六 R）══
     //
     // 两个 host 线程各驱动一套 (Sequence, SpecRuntime)：重叠不靠调度器，靠的是
     // "每线程阻塞在自己那条 stream 的同步上" —— A.verify.hi 阻塞在 k1 期间，B 的
@@ -652,7 +652,7 @@ pub fn run(args: &[String]) -> Result<()> {
         // ★ 反相位 PLL（`LINGXI_TALK_SPEC_PHASE=<Δ_ms>`，默认 36；0 = 关）：
         // A 自由跑（master），B（slave）的每轮锚在 **A 的实际轮起点 + Δ** —— A 快 B 跟、
         // A 慢 B 等，相位锁不滑。固定网格（v1）实测会滑出同步（轮长 40~90ms 不均，
-        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据（复扫判决）：
+        // 一过格就自由漂移 ⇒ 双模式 61~105 乱跳）。调度依据（§四十六 R/S）：
         // k0 是瓶颈卡（2×38.7ms/轮对），A 的 verify.hi（23.4ms 纯 k1）应与 B 的
         // 草稿+lo（33.4ms 纯 k0）对齐 ⇒ Δ ≈ A 的 pre-hi 段长。
         let offset_ns = std::env::var("LINGXI_TALK_SPEC_PHASE")
@@ -782,7 +782,7 @@ pub fn run(args: &[String]) -> Result<()> {
         if talk_spec {
             let mp = crate::cli::common::mtp_artifact_path();
             // 第二张卡（层切分的 GPU1）交给 SpecRuntime：草稿相位它整段空闲，
-            // 用来把 lm_head 按 vocab 行二分（`LINGXI_DRAFT_HEAD_SPLIT`）。
+            // 用来把 lm_head 按 vocab 行二分（`LINGXI_DRAFT_HEAD_SPLIT`，docs §三十三 F）。
             let mut rt = crate::spec::SpecRuntime::load(
                 &k, ls_k1.as_ref(), &mp, &tables, &endpoints, &shape, rope_len,
             )?;
@@ -835,11 +835,10 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         if let Some((mut rt, mut st, mut sb, mut h_last, mut queue, ar_ms)) = spec_state {
             // 专家槽统计：`去重` = 本请求**装入过**的不同 (层, 专家) 数（设备快路只上报 miss，
-            // 所以它是"装入去重"，不是"路由去重"——双卡镜像验收已实测）。
+            // 所以它是"装入去重"，不是"路由去重"——见 docs §四十一 E/G）。
             // 判据：它一旦接近该卡槽位总数，就会进入淘汰螺旋，专家段会从 ~0.4 ms/层 涨到 3+ ms/层。
             crate::arena_source::expert_track_reset();
             let mut accepted = 0usize;
-            let mut verified = 0usize;
             let mut rounds = 0usize;
             let mut eff: Vec<f64> = Vec::new(); // 每轮 ms/产出tok（墙上时钟）
             let t_gen = std::time::Instant::now();
@@ -851,7 +850,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     gen_ids.push(t);
                     continue;
                 }
-                // ★ 2026-10-25：**关闸①已删**。它是个「产出/验证行 < 0.5」
+                // ★ 2026-10-25（docs §四十六 U）：**关闸①已删**。它是个「产出/验证行 < 0.5」
                 // 代理判据，原注释自称"安全网（默认不会触发）"；kd=7 下它**数学上就是错的**：
                 // 验证 8 行/轮 ⇒ 盈亏平衡接受率 = 3.0/轮，而中文暖机后 1.9/轮、投机比 AR
                 // 快 1.6× 也会被判死（实测 42 vs 66 tok/s）。它当初防的 875-token 文档场景
@@ -881,7 +880,6 @@ pub fn run(args: &[String]) -> Result<()> {
                 let ms = tr.elapsed().as_secs_f64() * 1e3;
                 rounds += 1;
                 accepted += r.accepted;
-                verified += r.verified;
                 eff.push(ms / (r.tokens.len().max(1) as f64));
                 eprint!(
                     "\r  [talk-spec] 轮 {rounds:>3}: 提交 {} 枚｜验证 {} 行｜{ms:>6.1} ms/轮｜{:.1} ms/tok        ",
@@ -962,11 +960,11 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     eprintln!("-- 生成 {} tokens，解码文本 --", gen_ids.len());
     println!("{}", tok.decode(&gen_ids)?);
-    // decode 后再 dump 一次 ⇒ 逐段数字 = **最后一个 decode token** 的真 GPU 分解
+    // ㊸：decode 后再 dump 一次 ⇒ 逐段数字 = **最后一个 decode token** 的真 GPU 分解
     if let Some(p) = k.evprof.as_ref() {
         p.dump(eng.n_layers);
     }
-    // GPU1 的账单独打（split 下 wall = max(两卡) + 跨卡手递手，只看 GPU0 会误判瓶颈侧）
+    // ㊸：GPU1 的账单独打（split 下 wall = max(两卡) + 跨卡手递手，只看 GPU0 会误判瓶颈侧）
     if let Some(kk) = ls_k1.as_ref() {
         if let Some(p) = kk.evprof.as_ref() {
             p.dump(eng.n_layers);

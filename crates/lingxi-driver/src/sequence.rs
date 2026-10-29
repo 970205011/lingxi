@@ -39,7 +39,7 @@ pub struct Sequence {
 
 /// `LINGXI_GDN_DUMP_S=1`：提交完一层后，把该层 GDN 的 `s_all`/`k_hist` **头两三个值**打到 stderr。
 ///
-/// 用途：定位"快速重放 vs 老重放"那 1 ulp 到底**从第几轮、哪一层**开始分叉。
+/// 用途（PLAN §P15-F-2）：定位"快速重放 vs 老重放"那 1 ulp 到底**从第几轮、哪一层**开始分叉。
 /// 只读几个元素（每次一层 8~12 字节），对时间几乎无影响；格式固定，便于两条路的日志直接 diff。
 fn dump_gdn_state(
     k: &Kernels,
@@ -87,7 +87,7 @@ fn dump_gdn_state(
 /// `LINGXI_GDN_DUMP_FULL=<dir>`：把**层 0 的整个 `s_all`**（约 2 MB f32）按 `tag` 写成
 /// `<dir>/<tag>.bin`（**只留第 0 轮**：文件已存在就跳过）。
 ///
-/// 为什么要按 tag 存盘而不是只打头几个值：
+/// 为什么要按 tag 存盘而不是只打头几个值（PLAN §P15-F-2 的"新异常"）：
 /// 头 3 个值显示"老路提交后 == 快照恢复后"（9 位有效数字全同），但光看 3 个数分不清
 /// **(a) 老路的重放真的没推进 `s_all`** 还是 **(b) 那 3 个元素恰好不动**。
 /// 存全量再逐字节 diff 一次就能定性。
@@ -145,36 +145,10 @@ fn dump_bf16_head(
     Ok(())
 }
 
-/// 组装某层的 **GDN 录像槽**（`replay=false`：录）。
-///
-/// 为什么不用"每次现建"以外的做法：`GdnRec` 要同时持有 4 个 `&mut` 缓冲，
-/// 只能在同一个函数里从 `SpecBuffers` 的**不相交字段**借出来。
-fn build_gdn_rec<'a>(
-    sb: Option<&'a mut SpecBuffers>,
-    li: usize,
-    off: usize,
-) -> Option<lingxi_model::gdn::GdnRec<'a>> {
-    // ⚠️ **只有真要走快速重放时才录**：录制本身是 4 次 memcpy/层 × 36 层/轮，
-    //    不开 `LINGXI_GDN_REPLAY_FAST` 时它纯属白付（实测默认会因此从 51.3 掉到 45.3 tok/s）。
-    // ⚠️ **默认录**（配合默认走快速重放，见 `spec_commit`）；`LINGXI_GDN_REPLAY_LEGACY=1`
-    //    才回退到"不录 + 重算"的老路。录制本身是 4 次 memcpy/层 × 36 层/轮（约 5 MB/轮）。
-    if lingxi_model::flag("LINGXI_GDN_REPLAY_LEGACY") {
-        return None;
-    }
-    let sb = sb?;
-    let (qkv, z, a, b) = (
-        sb.gdn_qkv[li].as_mut()?,
-        sb.gdn_z[li].as_mut()?,
-        sb.gdn_a[li].as_mut()?,
-        sb.gdn_b[li].as_mut()?,
-    );
-    Some(lingxi_model::gdn::GdnRec { qkv, z, a, b, off, replay: false })
-}
-
-/// **按层区间切片的录像视图**：顺序路径给**全表**视图（`base = 0`），
+/// **按层区间切片的录像视图**（docs §四十一 A）：顺序路径给**全表**视图（`base = 0`），
 /// 行为与原来的 `Option<&mut SpecBuffers>` 逐字等价（端到端 81.3 tok/s、md5 一致）。
 /// 之所以留成"可切片"的形状：两线程分卡那条路要两边各持 `split_at_mut` 的一半、
-/// 互不重叠才可能并发 —— 但那条路实测**零重叠**已删除，现在只有全表视图。
+/// 互不重叠才可能并发 —— 但那条路实测**零重叠**（§四十一 A）已删除，现在只有全表视图。
 pub(crate) struct GdnRecView<'a> {
     pub gdn_in: &'a mut [Option<CudaSlice<bf16>>],
     pub gdn_qkv: &'a mut [Option<CudaSlice<bf16>>],
@@ -199,7 +173,9 @@ impl SpecBuffers {
     }
 }
 
-/// 同 [`build_gdn_rec`]，但从**按层切片**的视图借（`li - view.base` 定位）。
+/// 组装某层的 **GDN 录像槽**（`replay=false`：录），从**按层切片**的视图借
+/// （`li - view.base` 定位）。为什么不用"每次现建"以外的做法：`GdnRec` 要同时持有
+/// 4 个 `&mut` 缓冲，只能在同一个函数里从**不相交字段**借出来。
 fn build_gdn_rec_view<'a>(
     v: Option<&'a mut GdnRecView<'_>>,
     li: usize,
@@ -233,7 +209,7 @@ fn build_gdn_replay_rec<'a>(
     Some(lingxi_model::gdn::GdnRec { qkv, z, a, b, off: 0, replay: true })
 }
 
-/// 同 [`build_gdn_rec`]，但从**分离的四个槽向量**借（EP 下同一 `SpecBuffers` 里
+/// 同 [`build_gdn_rec_view`]，但从**分离的四个槽向量**借（EP 下同一 `SpecBuffers` 里
 /// 主卡/第二卡各有一套录像槽，必须按字段分别借才不打架）。槽缺失 ⇒ `None`（自动退回重算）。
 fn build_gdn_rec_fields<'a>(
     qkv_v: &'a mut Vec<Option<CudaSlice<bf16>>>,
@@ -285,7 +261,7 @@ impl Sequence {
         Self::new_split(k, None, n_layers, shape, cap, ple_layer)
     }
 
-    /// 同上，但 `[lo, n_layers)` 层的**状态建在第二张卡上**（`LINGXI_LAYER_SPLIT`）。
+    /// 同上，但 `[lo, n_layers)` 层的**状态建在第二张卡上**（`LINGXI_LAYER_SPLIT`，PLAN §P15）。
     ///
     /// 为什么必须在这里分设备：整个 `Sequence` 的跨 token 可变状态（QSA 的 KV/indexer cache、
     /// GDN 的 S + 卷积历史、PLE 历史）都挂在 `states[i]` 上，而 `layer_step` 只认自己那张卡的
@@ -671,7 +647,7 @@ impl Sequence {
 
 #[allow(clippy::too_many_arguments)]
 /// 自由函数版：**不借 `&mut Sequence`**，只借本卡负责的那段 `states`（`states[li - base]`）
-/// 与只读 `ids`。这是"按卡分线程"的第一步：GPU0/GPU1 各持一段 `states`
+/// 与只读 `ids`。这是"按卡分线程"（㊿-①）的第一步：GPU0/GPU1 各持一段 `states`
 /// （`split_at_mut(lo)`），互不重叠。
 fn run_layers_range_parts(
     states: &mut [LayerStates],
@@ -796,7 +772,7 @@ fn run_layers_range_parts(
                     n = eng.n_layers
                 );
             }
-            // `LINGXI_LAYER_PROF=1` 每层的 **host wall**（含内部所有同步的等待）。
+            // ㊸：`LINGXI_LAYER_PROF=1` 每层的 **host wall**（含内部所有同步的等待）。
             // GPU busy vs wall 的差就是它——定位"GPU 闲置 20ms/token"挂在哪些层。
             if lingxi_model::flag("LINGXI_LAYER_PROF") {
                 eprintln!(
@@ -989,8 +965,8 @@ fn twopass_run_layers(
             ids,
             experts,
         };
-        // 两个 pass 都走池化：池键自 device-aware 改造起含设备号（scratch.rs 头部），跨卡安全。
-        // （既有 split 的 GPU1 侧禁池是该改造之前的历史遗留，BACKLOG 记载 A/B 开池无差异；
+        // 两个 pass 都走池化：池键自 P15-㉞ 起含设备号（scratch.rs 头部），跨卡安全。
+        // （既有 split 的 GPU1 侧禁池是 ㉞ 之前的历史遗留，BACKLOG 记载 A/B 开池无差异；
         //   two-pass 下池化省掉每 (chunk,层) 的 cudaMalloc/free 风暴。）
         let st = if i < lo {
             &mut lo_states[i]
@@ -1006,7 +982,7 @@ fn twopass_run_layers(
     Ok(hyper)
 }
 
-/// **跨卡交接单层跨 token 状态**（逐位条件①：全程纯字节拷贝，不经任何运算）。
+/// **跨卡交接单层跨 token 状态**（§AP 逐位条件①：全程纯字节拷贝，不经任何运算）。
 /// 同层种类必须一致（GDN↔GDN、QSA↔QSA）；PLE 史两边都有才拷。
 /// 全部走 `cross_copy_raw`（裸指针区间拷贝）——`CudaSlice::slice` 返回的是 View，
 /// 类型化的 `cross_copy` 不收。
@@ -1174,7 +1150,7 @@ fn twopass_xfer_states_staged(
     fn head_argmax(&self, eng: &Engine, hyper: &CudaSlice<bf16>, t: usize) -> Result<i64> {
         let k = eng.k;
         // `LINGXI_EVPROF*`：head 计时段（伪层 = n_layers、段 6）。mixer 也在头内
-        //（GR 收尾是主干最后一层的 gr_write，与头之间还有跨段状态交接，全记进 head 段）。
+        //（GR 收尾是主干最后一层的 gr_write，与头之间还有跨段 handoff，全记进 head 段）。
         if let Some(ep) = k.evprof.as_ref() {
             ep.begin(eng.n_layers, lingxi_kernels::evprof::HEAD_SEG, &k.stream);
         }
@@ -1263,7 +1239,7 @@ fn twopass_xfer_states_staged(
         Ok(best as i64)
     }
 
-    /// ★ 诊断：`LINGXI_DUMP_PREFILL_STATE=1` 时 prefill 后 dump 探针层状态
+    /// ★ P15-㉞ 诊断：`LINGXI_DUMP_PREFILL_STATE=1` 时 prefill 后 dump 探针层状态
     /// （GDN s_all / QSA KV 校验和 / hyper 末行）——定位 split+分块的跨卡边界发散。
     /// 只读、只打印，不影响数值。
     fn dump_prefill_state(&self, eng: &Engine, hyper: &CudaSlice<bf16>, tag: &str) {
@@ -1286,7 +1262,7 @@ fn twopass_xfer_states_staged(
                 }
                 AttnState::Qsa(q) => {
                     // clone_dtoh 不收 view ⇒ 整片拷（诊断用途，几 MB 无所谓），
-                    // 只累计前 len 行参与校验和。K8V4 量化档 kn/v 为 None ⇒ 跳过（诊断无此需求）。
+                    // 只累计前 len 行参与校验和。㊶ 量化档 kn/v 为 None ⇒ 跳过（诊断无此需求）。
                     // P2 分页：池布局≠逻辑行 ⇒ 用块表装配后的逻辑行做校验和。
                     if q.paged {
                         if let Ok((kn, v)) = q.paged_kv_to_host(k, q.len) {
@@ -1325,14 +1301,14 @@ fn twopass_xfer_states_staged(
     }
 
     /// prefill 的**分块粒度**（`LINGXI_PREFILL_CHUNK`，默认 2048；0/1 = 不分块走老路）。
-    ///（2026-10-17）长 prompt 整段前向的激活（t×MoE f32 scratch + GR 图缓冲）
+    /// P15-㉝（2026-10-17）：长 prompt 整段前向的激活（t×MoE f32 scratch + GR 图缓冲）
     /// 随 t 线性涨 ⇒ ~2-4K token 就顶爆 32GB VRAM。分块后峰值显存 O(chunk)，
     /// 状态逐 chunk 推进（GDN 递推天然按序、QSA/PLE 按绝对位置）。
     ///
     /// ✅ **逐位等价性（2026-10-18 定案）**：**单卡分块 ≡ 不分块**；**split+分块 ≡ 单卡**
     /// ——23,673 token / 47 个 chunk 的双卡+线程流水与单卡**首 token 完全一致（95835）**。
     /// 旧版"split+分块会发散（chunk 尺寸相关）"的病根是专家核每组只算前 8 个对
-    /// 脏值随 chunk 边界/命中态变化，看起来像"状态结转 bug"。
+    /// （见 docs/PLAN.md §㊿-②）：脏值随 chunk 边界/命中态变化，看起来像"状态结转 bug"。
     /// 修好后**不再需要"split 下不分块"这条纪律**。
     fn prefill_chunk_of(&mut self, t: usize, split: bool) -> usize {
         let env = std::env::var("LINGXI_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok());
@@ -1345,14 +1321,14 @@ fn twopass_xfer_states_staged(
                         static WARN: std::sync::Once = std::sync::Once::new();
                         WARN.call_once(|| {
                             eprintln!(
-                                "[prefill-chunk] split+分块逐位等价已认证——显式指定生效"
+                                "[prefill-chunk] split+分块逐位等价已认证（㉞）——显式指定生效"
                             );
                         });
                     }
                     n.min(t)
                 }
             }
-            // ★ split+分块的确定性发散已修复（device-aware 池）⇒ split 下也分块。
+            // ★ P15-㉞：split+分块的确定性发散已修复（device-aware 池）⇒ split 下也分块。
             // ★ 但粒度分档：split 时 GPU1 显存余量小（槽位占大头），chunk=2048 的 MoE
             // scratch ~2-3GB 会 OOM（17K 实测 CUDA_ERROR_OUT_OF_MEMORY）⇒ split 默认 512。
             None => {
@@ -1361,7 +1337,7 @@ fn twopass_xfer_states_staged(
         }
     }
 
-    /// two-pass 的**子块粒度**：固定 512（避开 chunk≥2048 的 OOM 前科；
+    /// two-pass 的**子块粒度**：固定 512（§AP：避开 AO-证 3 的 chunk≥2048 OOM 前科；
     /// 同时 512 对齐是「chunk 行组成与派发序列和默认路径逐字相同」这一逐位条件的前提）。
     const TWOPASS_CHUNK: usize = 512;
 
@@ -1677,7 +1653,7 @@ fn twopass_xfer_states_staged(
 
     /// prefill：吃 prompt，推进全部层状态，返回最后一个位置贪心出的下一 token
     /// （已自动追加进 `ids`）。只能在空序列上调用一次。
-    /// ★ 长 prompt 自动分块（`prefill_chunk_of`），短 prompt 行为不变。
+    /// ★ P15-㉝：长 prompt 自动分块（`prefill_chunk_of`），短 prompt 行为不变。
     pub fn prefill(
         &mut self,
         eng: &Engine,
@@ -1691,7 +1667,7 @@ fn twopass_xfer_states_staged(
 
     /// **前缀续跑**（C2 前缀缓存，2026-10-18）：`prompt` 必须以**当前 `ids`** 为精确前缀，
     /// 只把 `prompt[ids.len()..]` 喂进去。数学上与"整段重新 prefill"逐位相同
-    /// （分块不变性已证；状态全部按绝对位置推进）。
+    /// （分块不变性 §㊿-② 已证；状态全部按绝对位置推进）。
     ///
     /// ⚠️ 使用前提：`ids` 必须正好等于**已经喂进 KV 的那些 token**。`decode_token` 会把
     /// 新产生的 token 也 push 进 `ids`（它还没被喂）⇒ 调用方要先 [`Self::truncate_unfed`]。
@@ -1751,10 +1727,10 @@ fn twopass_xfer_states_staged(
         if Self::layer_major_enabled() {
             return self.prefill_layer_major(eng, prompt, provider, start, collect, chunk);
         }
-        // ★ 路线 A two-pass 生产集成：token 区间切半的双卡并行 prefill。
+        // ★ §AQ（路线 A two-pass 生产集成）：token 区间切半的双卡并行 prefill。
         //   切半点取 512 对齐 ⇒ 每个 chunk 的行组成与派发序列和默认路径**逐字相同**，
         //   唯一区别是状态交接（GDN 末态 f32 字节拷贝 + QSA KV 纯字节拼接 + PLE 卷积史），
-        //   （逐位三条件见下文 two-pass 分发器注释）优先级高于 THREADS/PIPE（下面分支的预设条件都不变）。
+        //   逐位三条件见 §AP。优先级高于 THREADS/PIPE（下面分支的预设条件都不变）。
         if Self::twopass_enabled() {
             anyhow::ensure!(
                 eng.split_active() && eng.ep.is_none(),
@@ -1784,7 +1760,7 @@ fn twopass_xfer_states_staged(
         #[allow(clippy::let_and_return)]
         let t0 = std::time::Instant::now();
         let _ = &t0;
-        // ★ **outer chunk 成对流水**（split 时）：chunk i 的后半（lo..n，GPU1）与
+        // ★ P15-㊿：**outer chunk 成对流水**（split 时）：chunk i 的后半（lo..n，GPU1）与
         // chunk i+1 的前半（0..lo，GPU0）并行。chunk 之间没有数据依赖（每个 chunk 是独立的
         // token 区间），所以这是**无损的调度重排**：每个 chunk 的层区间/ids 可见性/PLE 尾部
         // 都完全相同 ⇒ 判据 = 首 token 不变。
@@ -1794,7 +1770,7 @@ fn twopass_xfer_states_staged(
         //    根因假设：MoE 每层路由都要 `stream.synchronize()`（见 moe.rs），host 在层间
         //    被反复排空 ⇒ 两卡的重叠被 host 串行化吃掉（这正是 A2 设备路由想解决的问题）。
         //    因此当前仅作**opt-in**（`LINGXI_PREFILL_PIPE=1`），默认走原顺序路径。
-        // ★ 线程版：GPU0/GPU1 各一线程（全部层预热后 provider 只读 peek）。
+        // ★ ㊿-① 线程版：GPU0/GPU1 各一线程（全部层预热后 provider 只读 peek）。
         //   每个 chunk：A 跑 0..lo 并跨卡搬到 GPU1 → mpsc 交给 B 跑 lo..n。
         if eng.split_active() && lingxi_model::flag("LINGXI_PREFILL_THREADS") {
             let k1 = eng.k1.expect("split_lo 有效时 k1 必存在");
@@ -2029,7 +2005,7 @@ fn twopass_xfer_states_staged(
             off += c;
             last_c = c;
             self.dump_prefill_state(eng, &h, &format!("chunk@{off}"));
-            // ★ 长上下文诊断：逐 chunk 计时（scaling 曲线：ms/行 随上下文增长 ⇒ O(T)  culprit）
+            // ★ P15-㉟ 长上下文诊断：逐 chunk 计时（scaling 曲线：ms/行 随上下文增长 ⇒ O(T)  culprit）
             if lingxi_model::flag("LINGXI_PREFILL_TIMING") {
                 let el = t0.elapsed().as_secs_f64();
                 eprintln!(
@@ -2053,8 +2029,8 @@ fn twopass_xfer_states_staged(
         }
     }
 
-    /// **路线 A two-pass**（`LINGXI_PREFILL_TWOPASS=1`）分发器：
-    /// `LINGXI_TWOPASS_PIPE=1` 且诊断开关干净时走**层间流水**
+    /// **P4：路线 A two-pass**（`LINGXI_PREFILL_TWOPASS=1`，§AP 设计 / §AQ 生产集成）分发器：
+    /// `LINGXI_TWOPASS_PIPE=1` 且诊断开关干净时走**层间流水**（§AQ-2
     /// [`Self::prefill_twopass_pipelined`]，两 pass 并发、B 落后 A 约一层）；
     /// 否则走 AQ 的保守两段式（[`Self::prefill_twopass_serial`]）。
     fn prefill_twopass(
@@ -2096,7 +2072,7 @@ fn twopass_xfer_states_staged(
             && !lingxi_model::flag("LINGXI_LAYER_PROF")
     }
 
-    /// **保守两段式**：
+    /// **P4 保守两段式**（§AQ 生产集成）：
     /// ```text
     /// pass 1   卡 A(GPU0) 独占：跑前半 [0, half) 的**全部** 48 层（512 子块，chunk 行组成
     ///          与默认路径逐字相同）⇒ 每层末态 = GDN s_all/k_hist + QSA KV[0..half) + PLE 史
@@ -2105,7 +2081,7 @@ fn twopass_xfer_states_staged(
     /// 归位     0..lo 层的最终态（在 GPU1 影子上）拷回 GPU0 的真身 ⇒ decode 续跑状态逐位不变
     /// ```
     ///
-    /// **逐位三条件如何满足**：
+    /// **逐位三条件（§AP）如何满足**：
     /// ① 交接全程 `cross_copy`/`cross_copy_raw` 纯字节拷贝（D2H+锁页+H2D），不经运算；
     /// ② 切半点取 **512 对齐** ⇒ 两个 pass 的每个子块行组成与派发序列（t=512 的核分派、
     ///    chunk 尾形状）与默认路径**逐字相同**，同内核同 env 派发天然成立；
@@ -2375,7 +2351,7 @@ fn twopass_xfer_states_staged(
     /// ④ 无死锁：host 的等待只有「事件等待」与「对方流上**已入队**工作的完成」，
     ///    GPU 工作的完成不需要另一线程的 host 参与 ⇒ 依赖图无环。
     ///
-    /// 逐位三条件：① 交接全程 `cross_copy_raw_staged` 纯字节拷贝；② 每 (chunk,层)
+    /// 逐位三条件（§AP）：① 交接全程 `cross_copy_raw_staged` 纯字节拷贝；② 每 (chunk,层)
     /// 派发序列与串行 two-pass 逐字相同（chunk 行组成、切半点 512 对齐不变）；③ t28 已证。
     fn prefill_twopass_pipelined(
         &mut self,
@@ -2541,13 +2517,11 @@ fn twopass_xfer_states_staged(
                 // 单层体（`l` 层：等 A → 交接 → 本层全部子块 → record ev_b[l]）。
                 // 出错即返回，由外层负责记录剩余 ev_b 放行 A 的回压等待。
                 let mut b_layer = |l: usize| -> Result<()> {
-                    let t_prof = std::time::Instant::now();
                     // 1) 等 A 的第 l 层全部子块算完（落后约一层的节奏由此保证）。
                     ev_a[l].synchronize()?;
                     if a_failed.load(std::sync::atomic::Ordering::Relaxed) {
                         anyhow::bail!("[twopass-pipe] A 线程已出错，B 中止");
                     }
-                    let t_wait = t_prof.elapsed();
                     // 2) 逐层交接（事件化 staged 裸拷贝；stage 按层奇偶轮转）。
                     let stage = l % lingxi_model::scratch::RAW_STAGES;
                     if l < lo {
@@ -2762,7 +2736,7 @@ fn twopass_xfer_states_staged(
 
     /// 与 [`Self::prefill`] 同步的一步，但**额外交出"层尾 mixer 之前的残差栈"**（`hyper[T, hc*H]`）。
     ///
-    /// MTP 草稿头的 `h` 输入就是它（post-norm hidden 同时喂 lm_head 与 MTP 头）。
+    /// MTP 草稿头的 `h` 输入就是它（§3.52：post-norm hidden 同时喂 lm_head 与 MTP 头）。
     pub fn prefill_with_hyper(
         &mut self,
         eng: &Engine,
@@ -3023,7 +2997,7 @@ fn twopass_xfer_states_staged(
         self.ids.truncate(fed);
         sb.pending = tokens[0];
         self.ids.extend_from_slice(tokens);
-        // ★ 2026-10-25：**验证相位内的三段计时**（`LINGXI_SPEC_PROF=1`，
+        // ★ 2026-10-25（docs §四十一 K）：**验证相位内的三段计时**（`LINGXI_SPEC_PROF=1`，
         //   只在整段 > 200 ms 时打一行）。为什么要它：实测有 ~40% 的跑会出现**一轮 1.5~3.2 s
         //   的软卡**，而四相位探针只把它记在 `verify` 里，看不出是"层前向"还是"head"。
         //   口径：`embed`/`layers` 只是**发牌**（异步），`head` 末尾要读回 argmax ⇒ 真等待落在 head。
@@ -3031,23 +3005,23 @@ fn twopass_xfer_states_staged(
         let x = self.embed(eng, tokens)?;
         let t_dbg_emb = t_dbg0.elapsed().as_secs_f64() * 1e3;
         let t_dbg = std::time::Instant::now();
-        // ⚠️⚠️ 2026-10-25：**"不录像"这条路是坏的，不是"慢一点"**。
+        // ⚠️⚠️ 2026-10-25（docs §四十）：**"不录像"这条路是坏的，不是"慢一点"**。
         //   `gdn_rec_ok=false` ⇒ `spec_commit` 走 legacy 重放（按 `t=accept` 重算投影），
         //   而实测该路径**数值不对**：基线 + `LINGXI_SPEC_NOREC=1` ⇒ 接受率 3.26→0.67、
         //   文本 md5 直接变（33.9 tok/s 也是假象）。同理 `LINGXI_GDN_REPLAY_LEGACY=1`
-        //   会让 `build_gdn_rec` 返回 None ⇒ 同一后果。
+        //   会让 `build_gdn_rec_view` 返回 None ⇒ 同一后果。
         //   所以这两个开关在投机链路上**直接拒绝启动**，免得有人拿它做"少录像的开销"对照
         //   而悄悄跑出错误文本。
         if lingxi_model::flag("LINGXI_SPEC_NOREC") {
             anyhow::bail!(
                 "LINGXI_SPEC_NOREC=1 会走坏的 legacy 重放（接受率 3.26→0.67、文本错），\
-                 已禁用"
+                 已禁用；见 docs/spec-verify-kernel-campaign.md §四十"
             );
         }
         if lingxi_model::flag("LINGXI_GDN_REPLAY_LEGACY") {
             anyhow::bail!(
                 "LINGXI_GDN_REPLAY_LEGACY=1 在投机链路上等价于不录像（同上，数值不对），已禁用；\
-                 "
+                 见 docs §四十"
             );
         }
         sb.gdn_rec_ok = true;
@@ -3058,7 +3032,7 @@ fn twopass_xfer_states_staged(
                 let t_dbg_lay = t_dbg.elapsed().as_secs_f64() * 1e3;
                 // 诊断：把"批处理之后"的 GDN 状态也 dump 一份。
                 // **判据**：当 `keep == t`（本轮全接受）时，"提交后的状态"**必须**等于"批处理后的状态"
-                // ⇒ 用它判"快速重放 / 老重放"哪一条是**对**的。
+                // ⇒ 用它判"快速重放 / 老重放"哪一条是**对**的（见 PLAN §P15-F-2）。
                 if lingxi_model::flag("LINGXI_GDN_DUMP_S") {
                     for i in 0..eng.n_layers as usize {
                         let kk = eng.k_of(i as u32);
@@ -3066,7 +3040,7 @@ fn twopass_xfer_states_staged(
                             dump_gdn_state(kk, i, &g.s_all, &g.k_hist, "postbatch")?;
                             dump_gdn_full(kk, i, &g.s_all, "postbatch")?;
                             // 顺便把**录像本身**也打一份：用来判"录制不稳定"还是"读取不稳定"
-                            //
+                            // （见 PLAN §P15-F-2 的下一步 1）
                             if sb.gdn_rec_ok {
                                 if let Some(q) = sb.gdn_qkv[i].as_ref() {
                                     dump_bf16_head(kk, i, q, "rec.qkv")?;
@@ -3476,7 +3450,7 @@ fn twopass_xfer_states_staged(
                 (cp.qsa[i].as_ref(), &mut self.states[i].attn)
             {
                 anyhow::ensure!(len <= qh.len, "恢复长度 {len} > 检查点 QSA 长度 {}", qh.len);
-                // 弹性 KV：懒分配下恢复前先把池子扩到检查点长度（几何增长，冷路径）。
+                // ㊿-P1 弹性 KV：懒分配下恢复前先把池子扩到检查点长度（几何增长，冷路径）。
                 // 必须先扩再借 kn/v（ensure_cap 换绑缓冲，借用会拦住 &mut）。
                 q.ensure_cap(k, qh.len)?;
                 let (kn, v) = match (&q.kn, &q.v) {
@@ -3594,7 +3568,7 @@ fn twopass_xfer_states_staged(
                 let AttnWeights::Gdn(gw) = &loaded.weights.attn else {
                     bail!("层 {i} 号称为 GDN 但权重不是 Gdn");
                 };
-                // ★ **只重跑「卷积 + 递推」两个小核**：`gdn_step` 的三步
+                // ★ **只重跑「卷积 + 递推」两个小核**（PLAN §P15-F）：`gdn_step` 的三步
                 //   （投影 / 卷积 / 递推）全是 `mixed` 的纯函数，而投影的输出（`qkv/z/a/b`）
                 //   验证明时已录下来了 ⇒ 重放时**跳过投影那笔最大的权重读**（~30 MB/层）。
                 //   比"逐行快照整个 GDN 状态"（500 MB）省 99% 内存，也不用改 `.cu`。
@@ -3602,7 +3576,7 @@ fn twopass_xfer_states_staged(
                 //   `cout[0..accept]` 与批量时逐位相同 ⇒ 状态逐位相同。
                 //   ⚠️ PLE 自己的**卷积历史**仍要推进（它是跨 token 状态、喂给下一轮）。
                 // ★ **默认走快速重放**（`LINGXI_GDN_REPLAY_LEGACY=1` 一键回退到"重算"老路）。
-                //   依据：快速重放喂给递推核的是**批处理当时的投影字节**
+                //   依据（PLAN §P15-F-2 的元更正）：快速重放喂给递推核的是**批处理当时的投影字节**
                 //   ⇒ 前 `accept` 行的 `cout/z/a/b` 与批量逐位相同 ⇒ 状态精确等于批量的行串行结果；
                 //   而"全接受(`keep==t`)时提交态必须 == 批后态"这条硬判据，实测**通过**
                 //   （整块拷贝读 + 逐字节比：`fast.bin == postbatch`，同二进制 3 跑全同）。
@@ -3628,7 +3602,7 @@ fn twopass_xfer_states_staged(
                     let rec = build_gdn_replay_rec(sb, i);
                     // ★ 诊断（`LINGXI_GDN_REPLAY_NOPOOL=1`）：整段重放**绕开 scratch 池**。
                     //   用途：判定"同长度缓冲在池里被复用"是不是那处 run-to-run 竞态的元凶
-                    //   （录制确定、重放输出在飘）。
+                    //   （见 PLAN §P15-F-2(c)：录制确定、重放输出在飘）。
                     let mut gdn_once = |rc: Option<lingxi_model::gdn::GdnRec<'_>>| {
                         lingxi_model::gdn::gdn_step_rec(k, gw, &x_unused, accept, &s.gdn, g, rc)
                     };
@@ -3664,7 +3638,7 @@ fn twopass_xfer_states_staged(
                     // 原来这里用的是分配版 `gated_residual_forward`（`gkey = NO_CAPTURE`），
                     // 与批量（`gbase+1` 命名空间 + `graph::take_fixed` 的固定缓冲）**不是同一套**，
                     // 于是重算出来的 `mixed` 与批量的**不逐位相同** ⇒ 全接受（`keep == t`）时
-                    // "提交后的状态"复现不了"批处理后的状态"（实测判决如此）。
+                    // "提交后的状态"复现不了"批处理后的状态"（实测见 PLAN §P15-F-2 的判决）。
                     let gbase = (i as u64) * 8;
                     let mut mixed = lingxi_model::graph::take_fixed(k, gbase, 0, accept * self.hidden)?;
                     let mut injw =
@@ -3812,7 +3786,7 @@ fn twopass_xfer_states_staged(
         Ok(())
     }
 
-    /// 验证批 head 的**词表行二分**（`LINGXI_VERIFY_HEAD_SPLIT`）。
+    /// 验证批 head 的**词表行二分**（docs §四十二 D，`LINGXI_VERIFY_HEAD_SPLIT`）。
     ///
     /// `lo` 半（全局行 `[0, vocab/2)`）在 GPU0、`hi` 半（`[vocab/2, vocab)`）在 GPU1
     /// （`alt.wq_hi` 是那张尾半权重，加载期已常驻 GPU1）。两半各做 part+fin argmax，
@@ -3906,9 +3880,10 @@ fn twopass_xfer_states_staged(
             lingxi_model::scratch::put_bf16(j);
         }
         // `LINGXI_VERIFY_HEAD_SPLIT` 走分卡时不分配整表 logits（省 3 MB 往返）。
-        let mut logits_slot: Option<CudaSlice<bf16>> = None;
+        // 两个分支都各赋一次值 ⇒ 声明不给初值（给 None 会被 unused_assignments 警告）。
+        let logits_slot: Option<CudaSlice<bf16>>;
         if let Some(wq) = &eng.endpoints.output_head_q4 {
-            // ★ 2026-10-25 `LINGXI_VERIFY_HEAD_SPLIT`：词表行二分到两卡。
+            // ★ 2026-10-25（docs §四十二 D）`LINGXI_VERIFY_HEAD_SPLIT`：词表行二分到两卡。
             //   GPU1 这时空闲（刚跑完最后一层），两半各读 ~169 MB ⇒ verify 段少 ~0.9 ms。
             if let Some(a) = alt {
                 match self.head_argmax_split(k, wq, a, &mixed, t, eng.vocab) {

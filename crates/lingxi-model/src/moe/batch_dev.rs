@@ -1,19 +1,19 @@
 //! A 方案（t>1，`LINGXI_ROUTE_FULLDEV=1`）：**整条路由与 pair/CSR 构建留在设备**。
 //!
-//! 动机：投机验证批每层在
-//! `router logits D2H + stream.synchronize` 处把 host 钉死在单层，随后 ~0.27ms 的
+//! 动机（docs/spec-verify-kernel-campaign.md §K0b/§K0c 实测）：投机验证批每层在
+//! `router logits D2H + stream.synchronize()` 处把 host 钉死在单层，随后 ~0.27ms 的
 //! host 簿记（softmax/top-k/查槽/pair/CSR/H2D）与 GPU 完全串行 ⇒ 轮 wall 80ms 里
 //! ~13ms 是这条链。这里把同一批决策搬上 GPU，host 只读**映射内存**里的计数（零 sync），
 //! 只在真未命中时补槽（`load_missing`）再重跑一次。
 //!
 //! 逐位等价的三块：
 //! ① router 投影用 legacy rows>1 **同一条核**（`gemm_skinny_row_bf16_ptr`），
-//! softmax+插入式 top-k 用 `route_topk_rows_bf16`（已与 host 逐位对拍过）；
+//!    softmax+插入式 top-k 用 `route_topk_rows_bf16`（已与 host 逐位对拍过）；
 //! ② pair 表/组表/行 CSR 的**次序**由设备核按 host 遍历序重建（专家升序 → 行升序 →
-//! j 升序）——`moe_combine_add_csr_bf16` 的累加次序因此不变；
+//!    j 升序）——`moe_combine_add_csr_bf16` 的累加次序因此不变；
 //! ③ 专家段仍用同一批核、同一参数体系（TC/SIMT 按 legacy 同规则择一）；
-//! 混档双视图各发**自己格式的组**（`pri_gidx`/`alt_gidx` 压缩下标 + `ng = npri/nalt`，
-//! 见 2026-10-24 的组压缩，`LINGXI_NO_GROUP_COMPACT=1` 回退到全 `u` + `-1` 哨兵直通）。
+//!    混档双视图各发**自己格式的组**（`pri_gidx`/`alt_gidx` 压缩下标 + `ng = npri/nalt`，
+//!    见 2026-10-24 的组压缩，`LINGXI_NO_GROUP_COMPACT=1` 回退到全 `u` + `-1` 哨兵直通）。
 
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -57,7 +57,7 @@ fn sync_mark(k: &Kernels, label: &str) -> Result<()> {
 /// 一个事件对里（层均 ~0.49 ms），只看总数分不出主次。
 ///
 /// **口径**：与 evprof 同款——每个边界在**流内**记一个带计时的事件（不排空流水），
-/// 层末统一 sync 一次读出 9 段。为什么不照 `s3` 那样每个边界 `synchronize`：
+/// 层末统一 sync 一次读出 9 段。为什么不照 `s3` 那样每个边界 `synchronize()`：
 /// 实测（2026-10-23）那样会把 gather/swiglu/combine 这种 ~3 µs 的小核量成 12~17 µs
 /// （空队列下的 launch 唤醒延迟全算进去了），份额被放大 4 倍；小核的绝对值请看
 /// `crates/lingxi-kernels/tests/t5_seg4_shape_bw.rs` 的 `t5_seg4_small_kernels`。
@@ -328,11 +328,11 @@ pub(crate) fn route_dev_batch_attempt(
     rows: usize,
 ) -> Result<Option<CudaSlice<bf16>>> {
     // rows 上限：默认 16（投机验证批形态）；`LINGXI_ROUTE_FULLDEV_BIG=1` 扩到 512
-    // （prefill 形态，）。设备核 rows-敏感性勘察结论：topk 核 grid.x=rows、smem/寄存器
+    // （prefill 形态，§AH）。设备核 rows-敏感性勘察结论：topk 核 grid.x=rows、smem/寄存器
     // 布局只随 E；pair 核单块 512 线程、循环上界 S=rows·top_k（计数 O(E·S) 扫描变
     // 4096 次/线程，~10-20µs/层，可接受）；router 投影 m>6 自动回落行核（grid.y 行分块
     // 无上限）；slotsm 组大小动态（group_off）、a_stride i32 容 s=4096；combine CSR
-    // grid.y=rows——**全部无需改 CUDA**。有损档：验收 = 首 token 链 + md5 链（先例 PLAN_NEXT）。
+    // grid.y=rows——**全部无需改 CUDA**。有损档：验收 = 首 token 链 + md5 链（先例 PLAN_NEXT §3）。
     let big = crate::flag_val("LINGXI_ROUTE_FULLDEV_BIG", true);
     let rows_max = if big { 512 } else { 16 };
     if rows < 2 || rows > rows_max || num_experts > 512 {
@@ -356,9 +356,9 @@ pub(crate) fn route_dev_batch_attempt(
     // ── 1) router 投影 + 设备 top-k（与 legacy rows>1 同核同参）──
     let ht = htime::on();
     let dev = k.ctx.ordinal();
-    // ★：`LINGXI_ROUTE_FULLDEV_BIG=1`（prefill 形态）时，层内 scratch 走
-    // `scratch::*_keep` 常驻复用——bench/serve 入口的全局 `disable_pool_forever`
-    // 下原本每层 ~110MB 直连 VMM 分配/释放全暴露在 pair 核后的 GPU 空窗（+1.35s
+    // ★ §AJ：`LINGXI_ROUTE_FULLDEV_BIG=1`（prefill 形态）时，层内 scratch 走
+    // `scratch::*_keep` 常驻复用——bench/serve 入口的全局 `disable_pool_forever()`
+    // 下原本每层 ~110MB 直连 VMM 分配/释放全暴露在 pair 核后的 GPU 空窗（§AH +1.35s
     // 的主嫌疑）；池键已含设备号，split 安全。`fo` 要移交所有权给调用方，**不**走 keep。
     // BIG 关（含 rows≤16 已验证档）时下方宏全部退化为原 `scratch::*`，一字不动。
     macro_rules! tk_bf16 {
@@ -412,15 +412,15 @@ pub(crate) fn route_dev_batch_attempt(
         && num_experts <= 512
         && rows <= 16
         && top_k <= 64;
-    // ★ 处方 A（**乐观发射**，仅 BIG=1）：rows>16 且**全视图都走 TCP 档**时，
+    // ★ §AN 处方 A（**乐观发射**，仅 BIG=1）：rows>16 且**全视图都走 TCP 档**时，
     // pair 建表核入队后不自旋，按组数上界 min(E, s) 立即发射整个专家段（dyn 核的
     // 组数守卫/行块循环全在设备侧，见 q4_tcp.cu / q3_tcp.cu 的 `_dyn` 档与 pair 核的
     // 尾部清零）——CPU 不再钉在 pair 完成上。
-    // ⚠ **实测负结果（保留档注记）**：双 V100 测试机 12 对成对 A/B（开/关交错）干净档位墙钟无差异
+    // ⚠ **实测负结果（§AN）**：ct141 12 对成对 A/B（开/关交错）干净档位墙钟无差异
     // （开 10.2~10.4 / 关 10.1~10.4，均众数 ~10.3s；decode md5 开=关=BIG0 逐位同）——
-    // 估的 pair 0.41ms×432 ≈ 0.18s 是**串行 GPU 时间本身**不是发射空窗（CPU 层均
+    // §AJ 估的 pair 0.41ms×432 ≈ 0.18s 是**串行 GPU 时间本身**不是发射空窗（CPU 层均
     // ~1ms 对 GPU 层均 ~25ms 始终领先 ≥20ms，spin 只节流 CPU 不制造 GPU 空窗）。
-    // 保留为 `LINGXI_ROUTE_OPT=1` 显式开启的实验路径（默认关 = 行为一字不变）。
+    // 保留为 `LINGXI_ROUTE_OPT=1` 显式开启的实验路径（默认关 = §AJ 行为一字不变）。
     let opt_ok = big && rows > 16
         && crate::flag("LINGXI_ROUTE_OPT")
         && crate::flag("LINGXI_MOE_TC") && hidden % 64 == 0 && inter % 64 == 0;
@@ -464,7 +464,7 @@ pub(crate) fn route_dev_batch_attempt(
     let mut pair_rows = tk_i32!(s)?;
     let mut pair_wts = tk_f32!(s)?;
     let mut group_slots = tk_i32!(num_experts)?;
-    let mut group_slots_alt = tk_i32!(num_experts)?;
+    let group_slots_alt = tk_i32!(num_experts)?;
     let mut group_off = tk_i32!(num_experts + 1)?;
     // 按格式压缩的**组下标表**（建表核顺手写，零额外 launch）：`pri_gidx[k]`/`alt_gidx[k]`
     // 是该格式第 k 组的全表组下标（升序）。GEMV 用它们间接取 group_off/slot_ids ⇒ 真实组
@@ -485,7 +485,7 @@ pub(crate) fn route_dev_batch_attempt(
     let mut us_spin = 0.0f64;
     let mut us_read = 0.0f64;
     // `LINGXI_PREP_PROF=1`：把 prep（6 次 `device_ptr` + 1 次 volatile 写）**逐步**计时。
-    // 背景：`[htime-spike]` 的 prep 加起来 1192 层 132 ms ⇒ **4.4 ms/轮**，
+    // 背景（docs §四十三 E）：`[htime-spike]` 的 prep 加起来 1192 层 132 ms ⇒ **4.4 ms/轮**，
     // 而这段只有 5~6 次 `device_ptr` —— 物理上讲不通，必须量到具体是哪一步。
     let pp = crate::flag("LINGXI_PREP_PROF");
     let mut us = [0f64; 8];
@@ -551,7 +551,7 @@ pub(crate) fn route_dev_batch_attempt(
         us_spin = t_s.elapsed().as_secs_f64() * 1e6;
         if ht {
             // ★ 2026-10-23 修：此前**从没累加过自旋项**（只 add 了 0/1/3），所以汇总行永远打
-            // 「自旋 0.0」——那是探针漏计，不是实测为 0。实测自旋常在 300~900 µs。
+            //   「自旋 0.0」——那是探针漏计，不是实测为 0。实测自旋常在 300~900 µs。
             htime::add(dev, 2, t_s);
         }
         let t_c = std::time::Instant::now();
@@ -623,7 +623,7 @@ pub(crate) fn route_dev_batch_attempt(
     // 只接了 bf16 GEMV、没有把 gather 后的 `xs` 量化成 int8 —— 不是 pair/哨兵格式不兼容。
     // 现在在同一份 `xs`/`act_all` 上补 `convert_bf16_q8_rs`（与 legacy 同核同参）即可。
     // 约束：dp4a 核只有 8 宽 acc ⇒ 需要 `tmax ≤ 8`；混档（alt 视图）与 legacy 一样不接 dp4a。
-    // ★：rows>16（prefill）+ `LINGXI_MOE_TC`（start.sh 默认 1）⇒ 专家段与 legacy
+    // ★ §AH：rows>16（prefill）+ `LINGXI_MOE_TC`（start.sh 默认 1）⇒ 专家段与 legacy
     // prefill **同款 TCP 大 tile 张量核**（有损档 ~2^-11，判据同 q4_tcp：首 token 相等 +
     // 质量抽检）。缺了这一档时 SIMT slotsm 在 s=5120 上实测 3.5× 慢（gu_q3 10.3ms vs
     // legacy TCP 合计 3.2ms），是 FULLDEV_BIG 第一版 prefill +4s 的全部差额。
@@ -733,8 +733,8 @@ pub(crate) fn route_dev_batch_attempt(
     let mut gu_all = tk_bf16!(s * 2 * inter)?;
     let mut act_all = tk_bf16!(s * inter)?;
     let mut o_all = tk_bf16!(s * hidden)?;
-    // ★：rows>16（prefill 形态，FULLDEV_BIG）用 legacy 批量同款 `slotsm_rpw`（默认 2）——
-    // batch_dev 历史上沿用 decode 的 `slots_rpw`（默认 1），prefill 形状实测慢 ~2×（专家段
+    // ★ §AH：rows>16（prefill 形态，FULLDEV_BIG）用 legacy 批量同款 `slotsm_rpw()`（默认 2）——
+    // batch_dev 历史上沿用 decode 的 `slots_rpw()`（默认 1），prefill 形状实测慢 ~2×（专家段
     // k 窄、每 warp 行数翻倍摊访存延迟，判据见 forward.rs 的 slotsm_rpw 注记）；rows≤16 档
     // 一字不动（保持已验证行为）。
     let sm_rpw = if rows > 16 { slotsm_rpw() } else { slots_rpw() };
@@ -782,8 +782,8 @@ pub(crate) fn route_dev_batch_attempt(
     let (gp_a, _ga_g) = alt_gidx.device_ptr(&k.stream);
     let mut views: Vec<ViewSel> = Vec::new();
     // ★ 2026-10-25：主视图的格式**不能写死 Q4**。单格式全 Q3 arena（`q3g128.bin` 等）的
-    // 主格式就是 Q3G128，旧代码把它按 Q4 核跑 ⇒ 直接吐垃圾（实测输出一长串 `!!!!`、
-    // 接受率 0、被关闸 ① 打回 AR）。判据用 `Q4Consts.bits`（4=Q4G64 / 3=Q3G128）。
+    //   主格式就是 Q3G128，旧代码把它按 Q4 核跑 ⇒ 直接吐垃圾（实测输出一长串 `!!!!`、
+    //   接受率 0、被关闸 ① 打回 AR）。判据用 `Q4Consts.bits`（4=Q4G64 / 3=Q3G128）。
     let pri_q3 = dv.consts.bits == 3;
     if compact {
         views.push(ViewSel { slots: dv.slots, ssel: ssel_pri, gsel: pri_gsel, consts: dv.consts, q3: pri_q3, ng: npri, gidx: gp_p });
@@ -987,14 +987,14 @@ pub(crate) fn route_dev_batch_attempt(
     Ok(Some(fo))
 }
 
-/// 处方 A：**pair 核组数上界乐观发射**（仅 `LINGXI_ROUTE_FULLDEV_BIG=1` 且全视图
+/// §AN 处方 A：**pair 核组数上界乐观发射**（仅 `LINGXI_ROUTE_FULLDEV_BIG=1` 且全视图
 /// TCP 档由 [`route_dev_batch_attempt`] 的 gate 分流进来）。
 ///
 /// 与默认路径的差异只有**发射时序**：pair 建表核入队后**不自旋**，立即按 host 上界
 /// `ng_ub = min(E, s)` 发射 gather → 预转 → gu → swiglu → 预转 → dn → combine；
 /// `*_tcp_bf16_dyn` 核的组数守卫（group_off 尾部清零 ⇒ t<=0 早退）与行块循环
 /// （按本组大小，免 host 的 tmax）全在设备侧，同流序保证读到建成后的表。全部发射完
-/// 才自旋读计数——CPU 不再钉在 pair 完成上， 残留的 post-spin ~10 发 launch 空窗
+/// 才自旋读计数——CPU 不再钉在 pair 完成上，§AJ 残留的 post-spin ~10 发 launch 空窗
 /// 被 GPU 流水吃掉。逐位性：dyn 核与旧 TCP 核每 (组, 行块) 的算术逐字相同（同一
 /// body），其余核同核同参；网格只多"算不出任何东西"的空块。
 ///
@@ -1047,7 +1047,7 @@ fn route_dev_batch_attempt_opt(
     let mut pair_rows = scratch::i32_keep(k, s)?;
     let mut pair_wts = scratch::f32_keep(k, s)?;
     let mut group_slots = scratch::i32_keep(k, num_experts)?;
-    let mut group_slots_alt = scratch::i32_keep(k, num_experts)?;
+    let group_slots_alt = scratch::i32_keep(k, num_experts)?;
     let mut group_off = scratch::i32_keep(k, num_experts + 1)?;
     let mut col = scratch::i32_keep(k, s)?;
     let mut roff = scratch::i32_keep(k, rows + 1)?;

@@ -29,8 +29,8 @@ pub(crate) use router::route_dev_attempt;
 /// **seg3 段内三分探针**（`LINGXI_SEG3_SYNC=1`，默认关）。
 ///
 /// 为什么要有它：evprof 的 seg3（路由+host）把「shared 专家 / router+topk / 设备端建 pair 表」
-/// 全包在一起，而这段在跨运行之间会从 0.28 跳到 0.85 ms，
-/// 用两次不同运行的差值去归因是**不可信**的（旧口径的 0.19 ms 就是这么来的，已作废）。
+/// 全包在一起，而这段在跨运行之间会从 0.28 跳到 0.85 ms（见 docs §十二 B），
+/// 用两次不同运行的差值去归因是**不可信**的（§十一 D 的 0.19 ms 就是这么来的，已作废）。
 /// 这里在每个边界插一次流同步，用**同一次运行内**的主机钟量出三段的真耗时。
 ///
 /// ⚠️ 同步会显著拖慢整轮 ⇒ **只在归因时开**，不要用它跑吞吐。
@@ -166,7 +166,7 @@ pub trait ExpertSource: Sync {
     /// 且 `LINGXI_ARENA_PREFETCH_SIGNAL=router_logits`）：在 **router GEMV 已入队、
     /// 首个同步尚未发生**的窗口调用。实现方登记本层 router 权重的设备地址，并在
     /// **独立流**上异步发起"层 L+1 的 router 权重 × 本层 router 输入 x"的预测
-    /// GEMV（真 logits），预测结果在同一层随后的
+    /// GEMV（真 logits，radiance GUIDE §4.3），预测结果在同一层随后的
     /// `load_hits`（pf_issue）里消费、发起 stream2 预取 DMA。因为发射点在同步前，
     /// 本调用不得含任何流同步。默认空实现 = 非 arena 源（/ 旧信号档）零开销。
     fn pf_predict_enqueue(
@@ -178,13 +178,13 @@ pub trait ExpertSource: Sync {
         Ok(())
     }
 
-    /// 设备路由：设备侧 Q4 直读视图（槽区 + 每层槽位表 + 段几何常量）。
+    /// ㊺ A2 设备路由：设备侧 Q4 直读视图（槽区 + 每层槽位表 + 段几何常量）。
     /// `Some` = 支持设备端 top-k 直查（免 host 同步决策）；`None` = 回退 host 路径。
     fn q4_dev(&self) -> Option<Q4DevView<'_>> {
         None
     }
 
-    /// 把 `experts` 里**尚未入槽**的搬进设备槽（已在槽里的是空操作），并保证
+    /// ㊺ A2：把 `experts` 里**尚未入槽**的搬进设备槽（已在槽里的是空操作），并保证
     /// `prot_pri`/`prot_alt`（本批已在用的槽，按 cache 分开）以及本批新分配的槽不会被
     /// `victim()` 选中。实现方**必须**让槽位表的改动对设备可见（含被淘汰的**其它层**的槽位行）。
     /// 混档 arena 按各专家自己的格式落到对应 cache；`prot_alt` 在单格式实现里忽略。
@@ -198,7 +198,7 @@ pub trait ExpertSource: Sync {
         Ok(())
     }
 
-    /// 把 `layer` 这一层的槽位表（E 项）同步上卡。**只在 legacy（miss 回退）
+    /// ㊺ A2：把 `layer` 这一层的槽位表（E 项）同步上卡。**只在 legacy（miss 回退）
     /// load_hits 之后调用**——设备路由快路径全中时 load_hits 根本不被调用，表无需改动。
     fn slot_map_sync_layer(&self, _layer: u32) -> Result<()> {
         Ok(())
@@ -331,7 +331,7 @@ pub fn build_ep_expert_assign(
     out
 }
 
-/// 设备路由用的 Q4 常量（`Q4Slots` 里不随命中变化的部分）。
+/// ㊺ A2 设备路由用的 Q4 常量（`Q4Slots` 里不随命中变化的部分）。
 #[derive(Clone, Copy)]
 pub struct Q4Consts {
     pub blob: u64,
@@ -345,7 +345,7 @@ pub struct Q4Consts {
     pub bits: u32,
 }
 
-/// 设备路由视图：`slot_map` 是 `[层, E]` 的 i32 表（存 slot+1、0=未缓存）。
+/// ㊺ A2 设备路由视图：`slot_map` 是 `[层, E]` 的 i32 表（存 slot+1、0=未缓存）。
 /// 混档 arena（Q4G64+Q3G128）再给 `alt`（次格式 cache 的槽区/表/几何）与 `fmt`
 /// （`[层, E]`：0=主视图、1=次视图）——批量设备路由据此一次建两组槽号（互斥 -1 哨兵）。
 pub struct Q4DevView<'a> {
@@ -364,13 +364,13 @@ pub struct Q4DevAlt<'a> {
 }
 
 /// `LINGXI_MOE_OVERLAP` 是否**真的生效**：它依赖"专家段不受 CUDA Graph 捕获"（跨流 + 事件
-/// 在捕获里是另一套语义）。所以要求同时设 `LINGXI_NO_GRAPHS=1`（实测关图本来就更快）。
+/// 在捕获里是另一套语义）。所以要求同时设 `LINGXI_NO_GRAPHS=1`（实测关图本来就更快，§P13.3）。
 /// 只设了本开关却没关图时**大声告警并自动退回老路径**（宁可慢，也不静默错）。
 pub fn moe_overlap_on() -> bool {
     if !crate::flag("LINGXI_MOE_OVERLAP") {
         return false;
     }
-    // ★ 判定从"env 设了 NO_GRAPHS"改成"graph 真的启用"。原判定有洞：
+    // ★ P15-㊶：判定从"env 设了 NO_GRAPHS"改成"graph 真的启用"。原判定有洞：
     // 双卡自动 layer-split 时图是被 force_disable() 关掉的（不要求用户设 env），
     // 于是 overlap 在生产默认配置下被误报"失效"——其实图根本没开。
     if crate::graph::enabled() {
@@ -387,7 +387,7 @@ pub fn moe_overlap_on() -> bool {
     true
 }
 
-// ─────────────────────── 设备路由：辅助 + 快路径 ───────────────────────
+// ─────────────────────── ㊺ A2 设备路由：辅助 + 快路径 ───────────────────────
 
 /// 诊断对拍用：FNV-1a 64 位哈希（`LINGXI_PAIR_DUMP` 比较 host/设备构建的 pair/CSR 表）。
 pub(crate) fn hash_i32(v: &[i32]) -> u64 {
@@ -531,12 +531,14 @@ pub fn expert_acquire(m: &std::sync::Mutex<()>) -> Option<ExpertGuard<'_>> {
     }
     let g = m.lock().unwrap_or_else(|e| e.into_inner());
     EXPERT_HELD.with(|c| c.set(true));
-    Some(ExpertGuard { g })
+    Some(ExpertGuard { _g: g })
 }
 
 /// [`expert_acquire`] 的守卫（Drop 清线程级持有标记）。
 pub struct ExpertGuard<'a> {
-    g: std::sync::MutexGuard<'a, ()>,
+    // 下划线前缀：字段本体只为持有 MutexGuard（RAII 解锁），从不显式读——
+    // 不叫 `_g` 的话 release 构建会报 dead_code。
+    _g: std::sync::MutexGuard<'a, ()>,
 }
 
 impl<'a> Drop for ExpertGuard<'a> {
@@ -547,7 +549,7 @@ impl<'a> Drop for ExpertGuard<'a> {
 
 /// `x[n, H] → out[n, H]`。
 #[allow(clippy::too_many_arguments)]
-/// **跨卡跑 MoE**（`LINGXI_MOE_SPLIT`，跨卡 MoE 设计见仓库设计文档）。
+/// **跨卡跑 MoE**（`LINGXI_MOE_SPLIT`，设计见 `docs/PLAN.md` §P13.1c）。
 ///
 /// 为什么：真语料下**整轮 43% 的时间**花在"专家 miss 的 PCIe 搬运"上（603 MB/轮 @10 GB/s），
 /// 根因是 GPU0 的专家槽位不够（9000 槽 / 每层 183 个 ⇒ 覆盖 88%，而 9200 就 OOM）。

@@ -104,7 +104,7 @@ struct HeadBufs {
 /// 切出来的两段在新缓冲里必须重新排布）。
 ///
 /// 走 host（D2H → H2D）而不是 device-to-device：一是 cudarc 的跨卡 D2D 需要 P2P 上下文，
-/// 二是本项目对 x8 链路上的持续跨卡流量有明确禁令（PCIe 跨卡流量的事故教训）。
+/// 二是本项目对 x8 链路上的持续跨卡流量有明确禁令（见 HANDOVER 的 PCIe 事故记录）。
 /// 一次性 ~170 MB，之后每步只有 5 KB。
 fn q4_tail_to(
     k_src: &Kernels, wq: &lingxi_model::q4::Q4W, k_dst: &Kernels, lo: usize,
@@ -153,7 +153,7 @@ impl<'a> SpecRuntime<'a> {
         tables: &'a lingxi_driver::RopeTables,
         endpoints: &'a lingxi_model::trunk::TrunkWeights,
         shape: &'a lingxi_model::layer::LayerShape,
-        rope_len: usize,
+        _rope_len: usize,
     ) -> Result<Self> {
         let mtp_art = Artifact::open(mtp_path)?;
         let g = lingxi_model::mtp::load(k, &mtp_art)?;
@@ -163,7 +163,7 @@ impl<'a> SpecRuntime<'a> {
         let q4 = std::env::var("LINGXI_MTP_Q4_EXPERTS").map(|v| v != "0").unwrap_or(true);
         let ml = crate::build_mtp_layer(k, &mtp_art, q4)?;
         let arena = if q4 { Some(crate::mtp_arena::MtpArena::build(k, &mtp_art)?) } else { None };
-        // ★ 2026-10-25：**kd 默认 5 → 7**。
+        // ★ 2026-10-25：**kd 默认 5 → 7**（docs §四十六）。
         //   最优点右移是因为**每步边际成本从 5.1 掉到 3.5 ms**（全驻留专家 + 草稿 head 二分），
         //   而"多提交一枚"的边际接受率还有 0.49 ⇒ 续投划算了。实测（200 tok，交替 A/B）：
         //   容器档 91.9 → **96.0 tok/s**（44→39 轮、接受 3.55→4.08、轮 p50 52→58 ms），
@@ -187,7 +187,7 @@ impl<'a> SpecRuntime<'a> {
         //   `lm_head` 按 vocab 行二分到两张卡。草稿相位只有 GPU0 在跑（`SpecRuntime` 一直只拿
         //   `k`），另一张卡在草稿的 ~8 ms 里整段空转 —— 这是那份空闲显存/带宽唯一的用法。
         //   逐位不变：同一个核、同一行、同一归约次序；top-K 的全序是 (值降序, 下标升序)，
-        //   两半各取 top-20 再按同一全序归并 ≡ 全局 top-20。
+        //   两半各取 top-20 再按同一全序归并 ≡ 全局 top-20（§三十三 F.1）。
         let split_on = std::env::var("LINGXI_DRAFT_HEAD_SPLIT").map(|v| v != "0").unwrap_or(true);
         let head_q4_hi = match (k1, endpoints.output_head_q4.as_ref()) {
             (Some(k1), Some(wq)) if split_on && wq.rows > 1 && wq.rows % 2 == 0 => {
@@ -480,6 +480,7 @@ impl<'a> SpecRuntime<'a> {
     ///
     /// 成本：每步一次 5 KB 的 D2H→H2D（激活）与 160 B×2 的回传；一次性 170 MB 权重搬迁在 `load`。
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_assignments)] // lap! 宏：最后一次调用后的 `t0 = now` 不会再被读
     fn head_split(
         &self, k: &Kernels, wq: &lingxi_model::q4::Q4W, k1: &Kernels,
         wq_hi: &lingxi_model::q4::Q4W, ids1: &CudaSlice<i32>, go1: &CudaSlice<i32>,
@@ -643,7 +644,7 @@ impl<'a> SpecRuntime<'a> {
         // 投机轮成本结构诊断用。
         let prof = lingxi_model::flag("LINGXI_SPEC_PROF");
         let tp = std::time::Instant::now();
-        let mut lap = |tag: &str, t0: std::time::Instant| -> std::time::Instant {
+        let lap = |tag: &str, t0: std::time::Instant| -> std::time::Instant {
             if prof {
                 eprintln!("    [spec-prof] {tag}: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
             }
@@ -686,7 +687,7 @@ impl<'a> SpecRuntime<'a> {
         // ② 主干一次批前向验证
         t = lap("draft", t);
         let chunk: Vec<i64> = std::iter::once(pending).chain(drafts.iter().copied()).collect();
-        // `LINGXI_VERIFY_HEAD_SPLIT`（默认开）：verify head 的词表行二分到两卡。
+        // `LINGXI_VERIFY_HEAD_SPLIT`（默认开，docs §四十二 D）：verify head 的词表行二分到两卡。
         // 判据见 lib.rs 的 `VerifyHeadAlt`：`gemm_q4_skinny_bf16` 无 split-k ⇒ 逐位等价；
         // 端到端 md5 与不开时相同。GPU1 的尾半权重已由 `head_q4_hi` 常驻。
         let head_alt = match (self.k1, self.head_q4_hi.as_ref()) {
