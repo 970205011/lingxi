@@ -93,11 +93,15 @@ export LINGXI_ARENA_PREWARM_N=${LINGXI_ARENA_PREWARM_N:-200}
 #   实测：decode 期首触 DMA 摊 4.4 ms/轮（`unique` 713 个 × 2.6 MB，30~44 轮里还完），
 #   全驻留后 miss 713 → **18**、轮 p50 55→50 ms、**200 token 84~87 → 94.6~95.3 tok/s（+12%）**，
 #   文本 md5 逐位不变；代价只是启动每卡 +1.8~2.9 s（tok/s 口径不含启动）。
-#   分页（paged）档必须关掉它：`LINGXI_ARENA_PRELOAD_ALL=0`。
+#   与分页（paged）档共存无冲突（2026-10-29 生产实证：serve 分页 ON + preload 全驻留
+#   同时跑，R5 门禁与 58K needle 全过）：槽装得下就全驻留，装不下灌满即停（幂等）。
 export LINGXI_ARENA_PRELOAD_ALL="${LINGXI_ARENA_PRELOAD_ALL:-1}"
 # ★ 2026-10-29 转正：在线自适应重钉（f394fd0 实测真语料 +17%：38.1 vs 32.5 tok/s、
 #   命中率 84.8→88.2%、逐位判据过）。窗口 30000 = 实测最优档（60000 略退 +14%）。
 #   值感知默认：显式 LINGXI_ARENA_REPIN=0 可关。
+#   2026-10-29 A/B 补充：全驻留档（PRELOAD_ALL=1 全部专家已驻留）下 on/off 无差
+#   （90.8~94.0 vs 94.0~94.9 tok/s，噪声内；重钉只剩"解钉+回钉"空转）。REPIN 的
+#   价值在槽位受压档（serve 256K ctx 只给 8400 槽、装不下全部 12288 专家）——那里保留默认开。
 export LINGXI_ARENA_REPIN="${LINGXI_ARENA_REPIN:-30000}"
 # ★ 2026-10-29 prefill 许可模式转正：QSA 分页默认开——prefill 期弹性全驻留（读时尖峰
 # 不可避免：O(N²) 注意力读取必须走 HBM），全部喂完"封印"整体下沉 host 锁页池（显存
